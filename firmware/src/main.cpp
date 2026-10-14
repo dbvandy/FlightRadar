@@ -9,6 +9,11 @@
 #include "app/net_client.h"
 #include "app/ui.h"
 
+#ifdef BOARD_CROWPANEL_P4
+#include <esp_ldo_regulator.h>
+#include "board_config.h"
+#endif
+
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
 
@@ -343,6 +348,35 @@ static void net_task(void *arg) {
     }
 }
 
+#ifdef BOARD_CROWPANEL_P4
+static bool crowpanel_enable_panel_power() {
+    // MIPI D-PHY needs LDO3 @ 2.5V; touch/IO pullups need LDO4 @ 3.3V (Elecrow docs).
+    esp_ldo_channel_handle_t ldo3 = nullptr;
+    esp_ldo_channel_handle_t ldo4 = nullptr;
+    esp_ldo_channel_config_t ldo3_cfg = {
+        .chan_id = 3,
+        .voltage_mv = 2500,
+    };
+    esp_ldo_channel_config_t ldo4_cfg = {
+        .chan_id = 4,
+        .voltage_mv = 3300,
+    };
+    if (esp_ldo_acquire_channel(&ldo3_cfg, &ldo3) != ESP_OK) {
+        Serial.println("LDO3 2.5V failed");
+        return false;
+    }
+    if (esp_ldo_acquire_channel(&ldo4_cfg, &ldo4) != ESP_OK) {
+        Serial.println("LDO4 3.3V failed");
+        return false;
+    }
+    // Active-low panel power rail (ESPHome CrowPanel V1.2).
+    pinMode(LCD_GPIO_POWER, OUTPUT);
+    digitalWrite(LCD_GPIO_POWER, LOW);
+    delay(20);
+    return true;
+}
+#endif
+
 void setup() {
     Serial.begin(115200);
     delay(200);
@@ -353,6 +387,15 @@ void setup() {
     config_load(&g_state.cfg);
     // Grab DRAM for ADS-B before RGB bounce + LVGL eat internal heap.
     net_init_buffers();
+
+#ifdef BOARD_CROWPANEL_P4
+    if (!crowpanel_enable_panel_power()) {
+        Serial.println("Panel power init failed");
+        while (true) {
+            delay(1000);
+        }
+    }
+#endif
 
     g_board = new Board();
     g_board->init();
@@ -374,6 +417,7 @@ void setup() {
     }
     if (auto *bl = g_board->getBacklight()) {
         bl->on();
+        bl->setBrightness(100);
     }
 #ifndef BOARD_CROWPANEL_P4
     if (auto *exp = g_board->getIO_Expander()) {

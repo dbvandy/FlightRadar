@@ -18,6 +18,9 @@
 
 #define LCD_GPIO_RST        (41)
 
+// Panel power enable (active low on CrowPanel Advanced V1.2)
+#define LCD_GPIO_POWER      (29)
+
 #define V_size              (600)
 #define H_size              (1024)
 #define LCD_CLK_MHZ         (51)
