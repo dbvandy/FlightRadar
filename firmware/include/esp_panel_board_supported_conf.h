@@ -18,7 +18,11 @@
  *
  * Set to `1` to enable supported board configuration, `0` to disable
  */
+#ifdef BOARD_CROWPANEL_P4
+#define ESP_PANEL_BOARD_DEFAULT_USE_SUPPORTED       (0)
+#else
 #define ESP_PANEL_BOARD_DEFAULT_USE_SUPPORTED       (1)
+#endif
 
 #if ESP_PANEL_BOARD_DEFAULT_USE_SUPPORTED
 /**

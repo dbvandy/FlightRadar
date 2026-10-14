@@ -184,8 +184,8 @@ static void handle_traffic() {
         snprintf(g_state.status, sizeof(g_state.status), "ADS-B: %s", net_last_error());
     }
     xSemaphoreGive(g_state.mutex);
-    // Single coalesced UI refresh (labels + PPI) after fetch settles.
-    ui_schedule_radar_redraw(120);
+    // Coalesced labels+PPI after fetch; short settle so RGB DMA is idle.
+    ui_schedule_radar_redraw(180);
 }
 
 static void handle_airports() {
@@ -375,11 +375,13 @@ void setup() {
     if (auto *bl = g_board->getBacklight()) {
         bl->on();
     }
+#ifndef BOARD_CROWPANEL_P4
     if (auto *exp = g_board->getIO_Expander()) {
         auto *ch422 = static_cast<esp_expander::CH422G *>(exp->getBase());
         ch422->enableAllIO_Output();
         ch422->digitalWrite(2, 1);
     }
+#endif
 
     lvgl_port_init(g_board->getLCD(), g_board->getTouch());
     lvgl_port_lock(-1);

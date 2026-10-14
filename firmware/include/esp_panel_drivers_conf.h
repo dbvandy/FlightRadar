@@ -65,7 +65,11 @@
 #if !ESP_PANEL_DRIVERS_LCD_USE_ALL
     #define ESP_PANEL_DRIVERS_LCD_USE_AXS15231B         (0)
     #define ESP_PANEL_DRIVERS_LCD_USE_EK9716B           (0)
+#ifdef BOARD_CROWPANEL_P4
+    #define ESP_PANEL_DRIVERS_LCD_USE_EK79007           (1)
+#else
     #define ESP_PANEL_DRIVERS_LCD_USE_EK79007           (0)
+#endif
     #define ESP_PANEL_DRIVERS_LCD_USE_GC9A01            (0)
     #define ESP_PANEL_DRIVERS_LCD_USE_GC9B71            (0)
     #define ESP_PANEL_DRIVERS_LCD_USE_GC9503            (0)
@@ -77,7 +81,11 @@
     #define ESP_PANEL_DRIVERS_LCD_USE_NV3022B           (0)
     #define ESP_PANEL_DRIVERS_LCD_USE_SH8601            (0)
     #define ESP_PANEL_DRIVERS_LCD_USE_SPD2010           (0)
+#ifdef BOARD_CROWPANEL_P4
+    #define ESP_PANEL_DRIVERS_LCD_USE_ST7262            (0)
+#else
     #define ESP_PANEL_DRIVERS_LCD_USE_ST7262            (1)
+#endif
     #define ESP_PANEL_DRIVERS_LCD_USE_ST7701            (0)
     #define ESP_PANEL_DRIVERS_LCD_USE_ST7703            (0)
     #define ESP_PANEL_DRIVERS_LCD_USE_ST7789            (0)
@@ -209,7 +217,11 @@
  */
 #define ESP_PANEL_DRIVERS_EXPANDER_USE_ALL                      (0)
 #if !ESP_PANEL_DRIVERS_EXPANDER_USE_ALL
+#ifdef BOARD_CROWPANEL_P4
+    #define ESP_PANEL_DRIVERS_EXPANDER_USE_CH422G               (0)
+#else
     #define ESP_PANEL_DRIVERS_EXPANDER_USE_CH422G               (1)
+#endif
     #define ESP_PANEL_DRIVERS_EXPANDER_USE_HT8574               (0)
     #define ESP_PANEL_DRIVERS_EXPANDER_USE_TCA95XX_8BIT         (0)
     #define ESP_PANEL_DRIVERS_EXPANDER_USE_TCA95XX_16BIT        (0)
