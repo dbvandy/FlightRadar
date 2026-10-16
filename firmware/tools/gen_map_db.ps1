@@ -1,4 +1,5 @@
 # Generate map_db.h from Natural Earth GeoJSON (coastline, lakes, country borders, US states).
+# Major roads (range <= 25 nm) are generated separately: python firmware/tools/gen_road_db.py
 $ErrorActionPreference = "Stop"
 $outPath = Join-Path $PSScriptRoot "..\src\app\map_db.h"
 $cacheDir = Join-Path $PSScriptRoot "ne_cache"

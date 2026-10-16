@@ -25,8 +25,8 @@ The wiki lists an ESP32-S3-WROOM-1-**N16R8** (16 MB flash, 8 MB OPI PSRAM). If y
 
 | Data | Source | Notes |
 | --- | --- | --- |
-| Aircraft | [adsb.lol](https://api.adsb.lol/docs) | Primary, no API key, radius up to 250 nm |
-| Aircraft fallback | [OpenSky Network](https://opensky-network.org) | Used if adsb.lol fails; anonymous rate limits apply |
+| Aircraft | [adsb.lol](https://api.adsb.lol/docs) | Primary community ADS-B, no API key, radius up to 250 nm |
+| Aircraft fallback | [adsb.fi](https://opendata.adsb.fi) | Same readsb/tar1090 JSON; used if adsb.lol fails |
 | Airports / METAR / TAF | [NOAA Aviation Weather Center](https://aviationweather.gov/data/api/) | Free JSON API |
 | ZIP lookup | [Zippopotam.us](https://www.zippopotam.us/) | US 5-digit ZIP |
 | Address / city | [Nominatim](https://nominatim.org/) | Identify this app; be polite with search rate |

@@ -520,48 +520,6 @@ static int parse_adsblol(const char *body, size_t body_len, Aircraft *out, size_
     return n;
 }
 
-static int parse_opensky(const char *body, size_t body_len, Aircraft *out, size_t out_max) {
-    JsonDocument doc;
-    if (deserializeJson(doc, body, body_len)) {
-        return -1;
-    }
-    if (!doc["states"].is<JsonArray>() && !doc["states"].isNull()) {
-        return -1;
-    }
-    JsonArray states = doc["states"].as<JsonArray>();
-    if (states.isNull()) {
-        // OpenSky uses null states when empty; treat as empty list.
-        return 0;
-    }
-    int n = 0;
-    for (JsonArray s : states) {
-        if ((size_t)n >= out_max) {
-            break;
-        }
-        if (s[6].isNull() || s[5].isNull()) {
-            continue;
-        }
-        Aircraft &dst = out[n];
-        memset(&dst, 0, sizeof(dst));
-        copy_trunc(dst.hex, sizeof(dst.hex), s[0] | "");
-        copy_trunc(dst.flight, sizeof(dst.flight), s[1] | "");
-        copy_trunc(dst.squawk, sizeof(dst.squawk), s[14] | "");
-        dst.lon = s[5].as<float>();
-        dst.lat = s[6].as<float>();
-        dst.on_ground = s[8] | false;
-        const float alt_m = s[7].isNull() ? 0.0f : s[7].as<float>();
-        dst.alt_ft = alt_m * 3.28084f;
-        const float vel = s[9].isNull() ? 0.0f : s[9].as<float>();
-        dst.gs_kts = vel * 1.94384f;
-        dst.track_deg = s[10].isNull() ? 0.0f : s[10].as<float>();
-        const float vr = s[11].isNull() ? 0.0f : s[11].as<float>();
-        dst.vrate_fpm = vr * 196.85f;
-        dst.valid = true;
-        n++;
-    }
-    return n;
-}
-
 int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size_t out_max) {
     if (range_nm > 250.0f) {
         range_nm = 250.0f;
@@ -574,14 +532,15 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
     int best_empty = 0;
     bool any_ok = false;
 
+    // Community readsb/tar1090 aggregators (real ADS-B). No OpenSky — anonymous
+    // OpenSky returns HTTP 429 under credit limits. airplanes.live requires prior approval (403).
     struct AdsbSrc {
         const char *name;
         const char *fmt;
     };
     static const AdsbSrc kSrc[] = {
-        {"adsb.fi", "https://opendata.adsb.fi/api/v2/lat/%.4f/lon/%.4f/dist/%d"},
-        {"airplanes.live", "https://api.airplanes.live/v2/point/%.4f/%.4f/%d"},
         {"adsb.lol", "https://api.adsb.lol/v2/lat/%.4f/lon/%.4f/dist/%d"},
+        {"adsb.fi", "https://opendata.adsb.fi/api/v2/lat/%.4f/lon/%.4f/dist/%d"},
     };
     const int nsrc = (int)(sizeof(kSrc) / sizeof(kSrc[0]));
     if (g_adsb_pref < 0 || g_adsb_pref >= nsrc) {
@@ -612,24 +571,6 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
         }
     }
 
-    status_msg("ADS-B OpenSky...");
-    float lamin, lomin, lamax, lomax;
-    const float os_range = range_nm > 100.0f ? 100.0f : range_nm;
-    bbox_from_range(lat, lon, os_range, &lamin, &lomin, &lamax, &lomax);
-    snprintf(url, sizeof(url),
-             "https://opensky-network.org/api/states/all?lamin=%.4f&lomin=%.4f&lamax=%.4f&lomax=%.4f",
-             lamin, lomin, lamax, lomax);
-    if (https_get(url, nullptr, kUa, 5000, 10000)) {
-        size_t blen = 0;
-        const char *buf = http_body_buf(&blen);
-        const int n = parse_opensky(buf, blen, out, out_max);
-        if (n > 0) {
-            return n;
-        }
-        if (n == 0) {
-            any_ok = true;
-        }
-    }
     if (any_ok) {
         return best_empty;
     }

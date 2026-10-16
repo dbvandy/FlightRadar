@@ -4,8 +4,10 @@
 #include "lvgl_v8_port.h"
 #include "map_db.h"
 #include "net_client.h"
+#include "road_db.h"
 
 #include <ctype.h>
+#include <esp_heap_caps.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -60,6 +62,7 @@ static const lv_color_t COL_APT_LG = lv_color_hex(0x4DA6FF);
 static const lv_color_t COL_APT_MD = lv_color_hex(0xD45CFF);
 static const lv_color_t COL_APT_SM = lv_color_hex(0x8A9A84);
 static const lv_color_t COL_MAP = lv_color_hex(0x4A554E);  // dark gray area sketch (behind traffic)
+static const lv_color_t COL_ROAD = lv_color_hex(0x6A7568);  // major roads (range <= 25 nm)
 
 static void style_screen(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, COL_BG, 0);
@@ -230,33 +233,66 @@ static void draw_airplane_icon(lv_draw_ctx_t *ctx, lv_coord_t x, lv_coord_t y, f
     lv_draw_rect(ctx, &fill, &dot);
 }
 
-static void draw_area_sketch(lv_draw_ctx_t *ctx, lv_coord_t ox, lv_coord_t oy, lv_coord_t w, lv_coord_t h,
-                             lv_coord_t cx, lv_coord_t cy, lv_coord_t R, float olat, float olon, float range,
-                             lv_color_t color) {
-    // map_db uses degrees * 50. ~1.2 nm per unit at mid latitudes.
-    const int pad = (int)lroundf(range / 1.1f) + 3;
-    const int lat0 = (int)lroundf(olat * 50.0f);
-    const int lon0 = (int)lroundf(olon * 50.0f);
-    const int64_t R2 = (int64_t)R * (int64_t)R;
+// Geographic sketch is rasterized into PSRAM off the RGB framebuffers so heavy
+// coastline drawing does not contend with panel DMA (flicker/hop on redraw).
+static lv_color_t *s_map_cache = nullptr;
+static lv_coord_t s_map_cw = 0;
+static lv_coord_t s_map_ch = 0;
+static float s_map_clat = 1e9f;
+static float s_map_clon = 1e9f;
+static float s_map_crange = -1.0f;
+static bool s_map_ready = false;
+static lv_img_dsc_t s_map_img{};
 
-    lv_draw_line_dsc_t line;
-    lv_draw_line_dsc_init(&line);
-    line.color = color;
-    line.width = 1;
-    line.opa = LV_OPA_COVER;
-    line.round_start = 0;
-    line.round_end = 0;
+static inline void cache_put(lv_color_t *buf, int w, int h, int x, int y, lv_color_t c) {
+    if ((unsigned)x >= (unsigned)w || (unsigned)y >= (unsigned)h) {
+        return;
+    }
+    buf[y * w + x] = c;
+}
 
-    for (uint16_t pi = 0; pi < kMapPolyCount; pi++) {
-        const MapPoly &poly = kMapPolys[pi];
+static void cache_line(lv_color_t *buf, int w, int h, int x0, int y0, int x1, int y1, int cx, int cy, int64_t R2,
+                       lv_color_t c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        const int64_t ddx = (int64_t)x0 - cx;
+        const int64_t ddy = (int64_t)y0 - cy;
+        if (ddx * ddx + ddy * ddy <= R2) {
+            cache_put(buf, w, h, x0, y0, c);
+        }
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        const int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+static void map_cache_mark_dirty() {
+    s_map_ready = false;
+}
+
+template <typename PtT, typename PolyT>
+static void cache_draw_polys(lv_color_t *buf, int w, int h, float olat, float olon, float range, int cx, int cy,
+                             int64_t R2, int pad, int lat0, int lon0, const PtT *pts, const PolyT *polys,
+                             uint16_t poly_count, lv_color_t ink) {
+    for (uint16_t pi = 0; pi < poly_count; pi++) {
+        const PolyT &poly = polys[pi];
         if (poly.count < 2) {
             continue;
         }
-        // Cheap reject: skip polys whose first point is far (most NE polys).
-        // Still walk if any point may fall in range — check bbox of poly via first/mid/last.
-        const MapPt &a0 = kMapPts[poly.start];
-        const MapPt &a1 = kMapPts[poly.start + poly.count / 2];
-        const MapPt &a2 = kMapPts[poly.start + poly.count - 1];
+        const PtT &a0 = pts[poly.start];
+        const PtT &a1 = pts[poly.start + poly.count / 2];
+        const PtT &a2 = pts[poly.start + poly.count - 1];
         const int near0 = (abs((int)a0.lat_q - lat0) <= pad + 20 && abs((int)a0.lon_q - lon0) <= pad + 20);
         const int near1 = (abs((int)a1.lat_q - lat0) <= pad + 20 && abs((int)a1.lon_q - lon0) <= pad + 20);
         const int near2 = (abs((int)a2.lat_q - lat0) <= pad + 20 && abs((int)a2.lon_q - lon0) <= pad + 20);
@@ -265,32 +301,98 @@ static void draw_area_sketch(lv_draw_ctx_t *ctx, lv_coord_t ox, lv_coord_t oy, l
         }
 
         bool have_prev = false;
-        lv_point_t prev{};
+        lv_coord_t px = 0, py = 0;
         bool prev_in = false;
         for (uint16_t k = 0; k < poly.count; k++) {
-            const MapPt &pt = kMapPts[poly.start + k];
+            const PtT &pt = pts[poly.start + k];
             if (abs((int)pt.lat_q - lat0) > pad + 8 || abs((int)pt.lon_q - lon0) > pad + 8) {
                 have_prev = false;
                 continue;
             }
-            const float lat = pt.lat_q / 50.0f;
-            const float lon = pt.lon_q / 50.0f;
             lv_coord_t x, y;
-            map_point_ll(lat, lon, olat, olon, range, w, h, &x, &y);
-            x = (lv_coord_t)(x + ox);
-            y = (lv_coord_t)(y + oy);
+            map_point_ll(pt.lat_q / 50.0f, pt.lon_q / 50.0f, olat, olon, range, w, h, &x, &y);
             const int64_t dx = (int64_t)x - cx;
             const int64_t dy = (int64_t)y - cy;
             const bool inside = (dx * dx + dy * dy) <= R2;
-            lv_point_t cur = {x, y};
             if (have_prev && (inside || prev_in)) {
-                lv_draw_line(ctx, &line, &prev, &cur);
+                cache_line(buf, w, h, px, py, x, y, cx, cy, R2, ink);
             }
-            prev = cur;
+            px = x;
+            py = y;
             prev_in = inside;
             have_prev = true;
         }
     }
+}
+
+static bool map_cache_ensure(lv_coord_t w, lv_coord_t h, float olat, float olon, float range) {
+    if (w < 8 || h < 8) {
+        return false;
+    }
+    if (s_map_ready && s_map_cache && s_map_cw == w && s_map_ch == h && fabsf(s_map_clat - olat) < 1e-5f &&
+        fabsf(s_map_clon - olon) < 1e-5f && fabsf(s_map_crange - range) < 0.05f) {
+        return true;
+    }
+
+    const size_t bytes = (size_t)w * (size_t)h * sizeof(lv_color_t);
+    if (!s_map_cache || s_map_cw != w || s_map_ch != h) {
+        if (s_map_cache) {
+            heap_caps_free(s_map_cache);
+            s_map_cache = nullptr;
+        }
+        s_map_cache = (lv_color_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_map_cache) {
+            s_map_ready = false;
+            return false;
+        }
+        s_map_cw = w;
+        s_map_ch = h;
+    }
+
+    const lv_color_t bg = COL_BG;
+    const lv_color_t disk = lv_color_hex(0x031208);
+    const int n = (int)w * (int)h;
+    for (int i = 0; i < n; i++) {
+        s_map_cache[i] = bg;
+    }
+
+    const int cx = w / 2;
+    const int cy = h / 2;
+    const int R = (LV_MIN(w, h) / 2) - 6;
+    const int64_t R2 = (int64_t)R * (int64_t)R;
+    for (int y = cy - R; y <= cy + R; y++) {
+        for (int x = cx - R; x <= cx + R; x++) {
+            const int64_t dx = (int64_t)x - cx;
+            const int64_t dy = (int64_t)y - cy;
+            if (dx * dx + dy * dy <= R2) {
+                cache_put(s_map_cache, w, h, x, y, disk);
+            }
+        }
+    }
+
+    const int pad = (int)lroundf(range / 1.1f) + 3;
+    const int lat0 = (int)lroundf(olat * 50.0f);
+    const int lon0 = (int)lroundf(olon * 50.0f);
+    cache_draw_polys(s_map_cache, w, h, olat, olon, range, cx, cy, R2, pad, lat0, lon0, kMapPts, kMapPolys,
+                     kMapPolyCount, COL_MAP);
+    // Major roads only when zoomed in to 25 nm or closer.
+    if (range <= 25.5f) {
+        cache_draw_polys(s_map_cache, w, h, olat, olon, range, cx, cy, R2, pad, lat0, lon0, kRoadPts, kRoadPolys,
+                         kRoadPolyCount, COL_ROAD);
+    }
+
+    memset(&s_map_img, 0, sizeof(s_map_img));
+    s_map_img.header.always_zero = 0;
+    s_map_img.header.w = w;
+    s_map_img.header.h = h;
+    s_map_img.header.cf = LV_IMG_CF_TRUE_COLOR;
+    s_map_img.data_size = bytes;
+    s_map_img.data = (const uint8_t *)s_map_cache;
+    s_map_clat = olat;
+    s_map_clon = olon;
+    s_map_crange = range;
+    s_map_ready = true;
+    return true;
 }
 
 static void snapshot_radar() {
@@ -509,13 +611,25 @@ static void radar_draw(lv_event_t *e) {
     const lv_coord_t cy = (coords.y1 + coords.y2) / 2;
     const lv_coord_t R = (LV_MIN(w, h) / 2) - 6;
 
-    lv_draw_rect_dsc_t fill;
-    lv_draw_rect_dsc_init(&fill);
-    fill.bg_color = lv_color_hex(0x031208);
-    fill.bg_opa = LV_OPA_COVER;
-    fill.radius = LV_RADIUS_CIRCLE;
-    lv_area_t circle = {(lv_coord_t)(cx - R), (lv_coord_t)(cy - R), (lv_coord_t)(cx + R), (lv_coord_t)(cy + R)};
-    lv_draw_rect(ctx, &fill, &circle);
+    if (!g_state) {
+        return;
+    }
+
+    snapshot_radar();
+    // Prefer a pre-rasterized map blit (built off-FB). Fall back to a solid disk.
+    if (map_cache_ensure(w, h, s_olat, s_olon, s_range) && s_map_ready) {
+        lv_draw_img_dsc_t id;
+        lv_draw_img_dsc_init(&id);
+        lv_draw_img(ctx, &id, &coords, &s_map_img);
+    } else {
+        lv_draw_rect_dsc_t fill;
+        lv_draw_rect_dsc_init(&fill);
+        fill.bg_color = lv_color_hex(0x031208);
+        fill.bg_opa = LV_OPA_COVER;
+        fill.radius = LV_RADIUS_CIRCLE;
+        lv_area_t circle = {(lv_coord_t)(cx - R), (lv_coord_t)(cy - R), (lv_coord_t)(cx + R), (lv_coord_t)(cy + R)};
+        lv_draw_rect(ctx, &fill, &circle);
+    }
 
     lv_draw_line_dsc_t ring;
     lv_draw_line_dsc_init(&ring);
@@ -541,18 +655,10 @@ static void radar_draw(lv_event_t *e) {
     lv_draw_line(ctx, &ring, &n1, &n2);
     lv_draw_line(ctx, &ring, &e1, &e2);
 
-    if (!g_state) {
-        return;
-    }
-
     lv_draw_label_dsc_t lab;
     lv_draw_label_dsc_init(&lab);
     lab.font = &lv_font_montserrat_12;
     lab.color = COL_TEXT;
-
-    snapshot_radar();
-    // Geographic sketch under traffic/airports (coastlines, borders, lakes).
-    draw_area_sketch(ctx, coords.x1, coords.y1, w, h, cx, cy, R, s_olat, s_olon, s_range, COL_MAP);
 
     if (s_show_airports) {
         for (int i = 0; i < s_apt_n; i++) {
@@ -785,8 +891,12 @@ static void set_range(float nm) {
         return;
     }
     g_state->cfg.range_nm = nm;
+    s_olat = g_state->cfg.location.lat;
+    s_olon = g_state->cfg.location.lon;
     xSemaphoreGive(g_state->mutex);
     s_range = nm;
+    map_cache_mark_dirty();
+    map_cache_ensure(470, 470, s_olat, s_olon, s_range);
     char buf[32];
     snprintf(buf, sizeof(buf), "%.0f nm", nm);
     lv_label_set_text(radar_range_lbl, buf);
@@ -979,6 +1089,7 @@ static void toggle_airports(lv_event_t *e) {
     s_show_airports = g_state->cfg.show_airports;
     xSemaphoreGive(g_state->mutex);
     update_apt_toggle_label();
+    // Airports are drawn live; map disk cache unchanged.
     if (radar_plot) {
         lv_obj_invalidate(radar_plot);
     }
@@ -1543,6 +1654,9 @@ static void apply_traffic_ui(bool redraw_radar) {
         s_status_lv_ms = millis();
     }
     if (redraw_radar && radar_plot && lv_scr_act() == scr_radar && !radar_overlay_open()) {
+        // Rebuild map in PSRAM before the FB refresh so DRAW_MAIN stays a fast blit.
+        snapshot_radar();
+        map_cache_ensure(470, 470, s_olat, s_olon, s_range);
         lv_obj_invalidate(radar_plot);
     }
 }
@@ -1561,7 +1675,7 @@ void ui_notify_traffic_labels() {
 
 void ui_notify_traffic() {
     // One deferred paint: labels + PPI together (avoids double-refresh flicker).
-    ui_schedule_radar_redraw(80);
+    ui_schedule_radar_redraw(120);
 }
 
 void ui_schedule_radar_redraw(uint32_t delay_ms) {
