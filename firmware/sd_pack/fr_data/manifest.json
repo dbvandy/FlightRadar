@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "path": "airports.bin",
+      "size": 211508
+    },
+    {
+      "path": "runways.bin",
+      "size": 249704
+    },
+    {
+      "path": "waypoints.bin",
+      "size": 60218
+    },
+    {
+      "path": "plates/KATL.frpl",
+      "size": 156816
+    },
+    {
+      "path": "plates/KBNA.frpl",
+      "size": 156816
+    },
+    {
+      "path": "plates/KGNV.frpl",
+      "size": 156816
+    },
+    {
+      "path": "plates/KINF.frpl",
+      "size": 156816
+    },
+    {
+      "path": "plates/KJAX.frpl",
+      "size": 156816
+    },
+    {
+      "path": "plates/KMCO.frpl",
+      "size": 156816
+    },
+    {
+      "path": "plates/KX60.frpl",
+      "size": 156816
+    }
+  ]
+}
