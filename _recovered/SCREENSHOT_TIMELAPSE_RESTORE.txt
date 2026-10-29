@@ -1,0 +1,40 @@
+Restore Screen Grab + Timelapse (after Wi‑Fi/radar basics are solid)
+====================================================================
+
+1) firmware/include/fr_features.h
+   Set:
+     FR_ENABLE_SD 1
+     FR_ENABLE_SCREENSHOT 1
+     FR_ENABLE_TIMELAPSE 1
+
+2) Screen grab flow (ui.cpp / main.cpp / net_client.cpp)
+   - UI button "Screen Shot" → begin_screenshot_email()
+   - Captures LVGL snapshot to BMP in PSRAM (g_state.screenshot_bmp)
+   - Sets UI_REQ_EMAIL_SCREENSHOT → net_task handle_email_screenshot()
+   - net_send_screenshot_email() / net_send_email_attachment() SMTP SSL:465
+   - Optional SD save via sd_write_grab_bmp() under /sdcard/fr_data/grabs/...
+
+3) Timelapse flow
+   - Settings "Screen Grab Setup" checkbox enables Timelapse button mode
+   - timelapse_start_from_button() records cropped follow-view JPEG frames on SD
+   - On land (alt < 600) + 5 min OR press again → timelapse_finalize_and_email()
+   - timelapse_avi.cpp builds AVI; emailed as attachment (same SMTP path)
+   - Sources: firmware/src/app/timelapse_avi.cpp/.h, sd_store grab helpers
+
+4) SD databases
+   - ui_load_sd_databases() mounts SD and loads fr_data (airports/runways/etc.)
+   - net_install_fr_data() downloads pack from GitHub to SD
+
+5) Do NOT re-enable heap_caps_malloc_extmem_enable(64) or a large pre-WiFi
+   DMA reserve — those starved ESP-Hosted WiFi (Req_WifiInit timeout).
+
+6) Post-WiFi DMA park is OK: net_arm_tls_dma_after_wifi() after STA join.
+   TLS path releases that slab only for the handshake (esp-aes DMA).
+
+7) Traffic/airport scratch: keep in PSRAM (ensure_net_scratch), not BSS.
+
+8) HTTP chunk pushback must stay in PSRAM (was a 16 KB static BSS buffer that
+   starved esp-aes DMA → TLS handshake OK but body/header timeouts).
+
+9) After WiFi: heap_caps_malloc_extmem_enable(4096) is OK (large→PSRAM).
+   Never use enable(64) — that broke Req_WifiInit.

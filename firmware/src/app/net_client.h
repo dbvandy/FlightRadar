@@ -1,9 +1,13 @@
 #pragma once
 
+#include <time.h>
+
 #include "types.h"
 
 // Call once early in setup() before RGB/LVGL init so the body buffer lands in DRAM.
 void net_init_buffers();
+/** Call once Wi‑Fi is up — parks internal DMA for the next TLS handshake. */
+void net_arm_tls_dma_after_wifi();
 /** Drop any sticky TLS session (call before a heavy FA fetch / after abort). */
 void net_tls_reset();
 
@@ -14,6 +18,10 @@ bool https_get(const char *url, String *body, const char *user_agent = nullptr,
                bool force_close = false, bool (*early_ok)(const char *buf, size_t len) = nullptr);
 const char *net_last_error();
 void net_set_status_callback(void (*cb)(const char *msg));
+
+/** Civil TZ offset seconds east of UTC from lat/lon, with US/Canada + EU DST.
+ *  when_utc==0 uses current time. */
+int net_tz_offset_for_ll(float lat, float lon, time_t when_utc = 0);
 
 int net_geocode(const char *query, GeoFix *out, size_t out_max);
 /** Airport homes: rewrite label to "CODE - City". Returns true if label changed. */
@@ -53,8 +61,16 @@ bool net_fetch_flight_plan(const char *flight_key, FlightInfo *fi, FlightTrackPt
 int net_search_airports(const char *query, AptSearchHit *out, size_t out_max);
 /** Fill cities[i] for each ICAO (28-char buffers). Returns how many resolved. */
 int net_fetch_airport_cities(const char icaos[][8], char cities[][28], int n);
+/** Build arr/dep columns from already-loaded traffic (instant — no HTTPS). */
+bool net_build_airport_board_from_traffic(const char *icao, const Aircraft *ac, int ac_n,
+                                          AirportBoardRow *arr, int arr_max, int *arr_n,
+                                          AirportBoardRow *dep, int dep_max, int *dep_n, char *label,
+                                          size_t label_len, float *out_lat = nullptr,
+                                          float *out_lon = nullptr);
+/** Arrivals/departures: prefer live ADS-B fetch around the airport (FA HTML is blocked on-device). */
 bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max, int *arr_n,
-                             AirportBoardRow *dep, int dep_max, int *dep_n, char *label, size_t label_len);
+                             AirportBoardRow *dep, int dep_max, int *dep_n, char *label, size_t label_len,
+                             float *out_lat = nullptr, float *out_lon = nullptr);
 bool net_fetch_route_flights(const char *dep_icao, const char *arr_icao, AirportBoardRow *rows, int rows_max,
                              int *rows_n, char *label, size_t label_len);
 

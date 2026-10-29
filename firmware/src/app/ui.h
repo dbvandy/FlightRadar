@@ -59,6 +59,9 @@ struct SharedState {
     // Airport arrivals / departures board.
     char board_icao[8];
     char board_label[48];
+    float board_lat;  // airport LL for local clock (0 if unknown)
+    float board_lon;
+    bool board_ll_ok;
     AirportBoardRow board_arr[FR_MAX_BOARD_ROWS];
     AirportBoardRow board_dep[FR_MAX_BOARD_ROWS];
     int board_arr_n;

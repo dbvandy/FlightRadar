@@ -1,5 +1,7 @@
 #include "timelapse_avi.h"
 
+#if FR_ENABLE_TIMELAPSE
+
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
@@ -416,3 +418,5 @@ bool tl_build_avi_to_file(const char *path, int fps, size_t *out_len) {
     }
     return true;
 }
+
+#endif  // FR_ENABLE_TIMELAPSE

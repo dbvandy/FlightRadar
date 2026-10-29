@@ -12,6 +12,7 @@
 #include <time.h>
 
 #include "board_config.h"
+#include "fr_features.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -66,6 +67,10 @@ void sd_unmount(void) {
 }
 
 bool sd_mount(void) {
+#if !FR_ENABLE_SD
+    strncpy(s_status, "SD: disabled", sizeof(s_status) - 1);
+    return false;
+#else
     if (s_mounted && s_card) {
         strncpy(s_status, "SD: ready", sizeof(s_status) - 1);
         return true;
@@ -109,6 +114,7 @@ bool sd_mount(void) {
     }
     Serial.printf("[sd] %s\n", s_status);
     return true;
+#endif
 }
 
 bool sd_remount(void) {

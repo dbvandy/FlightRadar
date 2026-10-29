@@ -4,7 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 
-#define FR_VERSION_STR "0.11 Beta"
+#define FR_VERSION_STR "1.1.1"
 
 #define FR_MAX_AIRCRAFT 64
 #define FR_TRACK_NEARBY_MAX 40  // when following with Show Ac: closest N to tracked

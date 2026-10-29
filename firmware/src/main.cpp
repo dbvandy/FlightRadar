@@ -15,6 +15,7 @@
 #include "app/net_client.h"
 #include "app/sd_db.h"
 #include "app/ui.h"
+#include "fr_features.h"
 
 #ifdef BOARD_CROWPANEL_P4
 #include <esp_ldo_regulator.h>
@@ -56,6 +57,9 @@ static void set_status_unlocked(const char *msg) {
     g_state.status[sizeof(g_state.status) - 1] = 0;
 }
 
+// Forward — defined with PSRAM scratch helpers below.
+static bool ensure_net_scratch();
+
 static bool wifi_connect_sta(const char *ssid, const char *pass, uint32_t timeout_ms) {
     WiFi.mode(WIFI_STA);
     WiFi.setHostname("flight-radar");
@@ -65,8 +69,16 @@ static bool wifi_connect_sta(const char *ssid, const char *pass, uint32_t timeou
         delay(200);
     }
     if (WiFi.status() == WL_CONNECTED) {
+        // Keep DHCP address; pin public DNS (Hosted stack sometimes wedges on ISP DNS).
+        WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), IPAddress(8, 8, 8, 8),
+                    IPAddress(1, 1, 1, 1));
+        // After WiFi is up: only LARGE allocs prefer PSRAM. Small TLS/AES DMA
+        // buffers must stay internal. enable(64) broke WiFi; enable(4096) is safe.
+        heap_caps_malloc_extmem_enable(4096);
         // Multiple servers — clocks stay blank until time(nullptr) passes ~2023.
         configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+        ensure_net_scratch();
+        net_arm_tls_dma_after_wifi();
     }
     return WiFi.status() == WL_CONNECTED;
 }
@@ -154,8 +166,33 @@ static void handle_geocode() {
     ui_notify_geo_done();
 }
 
-static Aircraft g_traffic_tmp[FR_MAX_AIRCRAFT];
-static Airport g_airport_tmp[FR_MAX_AIRPORTS];
+// Traffic/airport scratch in PSRAM — leave internal DMA free for WiFi + TLS AES.
+static Aircraft *g_traffic_tmp = nullptr;
+static Airport *g_airport_tmp = nullptr;
+
+static bool ensure_net_scratch() {
+    if (!g_traffic_tmp) {
+        g_traffic_tmp = (Aircraft *)heap_caps_malloc(sizeof(Aircraft) * FR_MAX_AIRCRAFT,
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_traffic_tmp) {
+            g_traffic_tmp = (Aircraft *)heap_caps_malloc(sizeof(Aircraft) * FR_MAX_AIRCRAFT, MALLOC_CAP_8BIT);
+        }
+        if (g_traffic_tmp) {
+            memset(g_traffic_tmp, 0, sizeof(Aircraft) * FR_MAX_AIRCRAFT);
+        }
+    }
+    if (!g_airport_tmp) {
+        g_airport_tmp = (Airport *)heap_caps_malloc(sizeof(Airport) * FR_MAX_AIRPORTS,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_airport_tmp) {
+            g_airport_tmp = (Airport *)heap_caps_malloc(sizeof(Airport) * FR_MAX_AIRPORTS, MALLOC_CAP_8BIT);
+        }
+        if (g_airport_tmp) {
+            memset(g_airport_tmp, 0, sizeof(Airport) * FR_MAX_AIRPORTS);
+        }
+    }
+    return g_traffic_tmp && g_airport_tmp;
+}
 
 static void handle_save_range() {
     float range;
@@ -270,6 +307,7 @@ static void handle_save_email() {
 }
 
 static void handle_email_screenshot() {
+#if FR_ENABLE_SCREENSHOT || FR_ENABLE_TIMELAPSE
     uint8_t *bmp = nullptr;
     size_t bmp_len = 0;
     char fname[40] = {0};
@@ -305,6 +343,10 @@ static void handle_email_screenshot() {
         snprintf(msg, sizeof(msg), "%s", err && err[0] ? err : "Email failed");
     }
     ui_notify_email_result(ok, msg);
+#else
+    ui_notify_email_result(false, "Screen grab disabled");
+    ui_release_screenshot_bmp();
+#endif
 }
 
 // Do not hold the LVGL lock across HTTPS — that freezes touch (zoom feels
@@ -410,6 +452,10 @@ static void handle_traffic() {
         return;
     }
 
+    if (!ensure_net_scratch()) {
+        ui_set_status("No traffic scratch RAM");
+        return;
+    }
     Aircraft *tmp = g_traffic_tmp;
     int n = -1;
     const bool want_solo = follow_active && follow_solo && (follow_hex[0] || follow_flight[0]);
@@ -554,6 +600,10 @@ static void handle_airports() {
         return;
     }
     ui_set_status(class_b_only ? "Loading Class B airports..." : "Loading airports...");
+    if (!ensure_net_scratch()) {
+        ui_set_status("No airport scratch RAM");
+        return;
+    }
     Airport *tmp = g_airport_tmp;
     net_begin_psram_safe();
     const int n = net_fetch_airports(lat, lon, range, tmp, FR_MAX_AIRPORTS, class_b_only);
@@ -769,13 +819,33 @@ static void handle_airport_board() {
     memset(s_dep, 0, sizeof(s_dep));
 
     ui_set_status("Loading airport board...");
-    ui_set_board_status("Loading FlightAware board...");
-    // Match GitHub flow: mute status spam during HTTPS (avoids LVGL lock fights).
-    net_begin_psram_safe();
-    const bool ok = net_fetch_airport_board(icao, s_arr, FR_MAX_BOARD_ROWS, &an, s_dep,
-                                            FR_MAX_BOARD_ROWS, &dn, label, sizeof(label));
-    net_end_psram_safe();
-    net_tls_reset();
+    ui_set_board_status("Loading board…");
+    float board_lat = 0, board_lon = 0;
+
+    // Instant path: classify aircraft already on the PPI (no extra HTTPS).
+    static Aircraft s_local_ac[FR_MAX_AIRCRAFT];
+    int local_n = 0;
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    local_n = g_state.aircraft_count;
+    if (local_n > FR_MAX_AIRCRAFT) {
+        local_n = FR_MAX_AIRCRAFT;
+    }
+    if (local_n > 0) {
+        memcpy(s_local_ac, g_state.aircraft, sizeof(Aircraft) * (size_t)local_n);
+    }
+    xSemaphoreGive(g_state.mutex);
+
+    bool ok = false;
+    if (local_n > 0) {
+        ok = net_build_airport_board_from_traffic(icao, s_local_ac, local_n, s_arr, FR_MAX_BOARD_ROWS, &an,
+                                                  s_dep, FR_MAX_BOARD_ROWS, &dn, label, sizeof(label),
+                                                  &board_lat, &board_lon);
+    }
+    if (!ok) {
+        // Fallback: dedicated ADS-B fetch around the airport.
+        ok = net_fetch_airport_board(icao, s_arr, FR_MAX_BOARD_ROWS, &an, s_dep, FR_MAX_BOARD_ROWS, &dn,
+                                     label, sizeof(label), &board_lat, &board_lon);
+    }
 
     if (ok) {
         xSemaphoreTake(g_state.mutex, portMAX_DELAY);
@@ -783,6 +853,9 @@ static void handle_airport_board() {
         memcpy(g_state.board_dep, s_dep, sizeof(s_dep));
         g_state.board_arr_n = an;
         g_state.board_dep_n = dn;
+        g_state.board_lat = board_lat;
+        g_state.board_lon = board_lon;
+        g_state.board_ll_ok = (fabsf(board_lat) + fabsf(board_lon) > 0.01f);
         strncpy(g_state.board_icao, icao, sizeof(g_state.board_icao) - 1);
         g_state.board_icao[sizeof(g_state.board_icao) - 1] = 0;
         strncpy(g_state.board_label, label[0] ? label : icao, sizeof(g_state.board_label) - 1);
@@ -1237,8 +1310,8 @@ void setup() {
     memset(&g_state, 0, sizeof(g_state));
     g_state.mutex = xSemaphoreCreateMutex();
     config_load(&g_state.cfg);
-    // Grab DRAM for ADS-B before RGB bounce + LVGL eat internal heap.
-    net_init_buffers();
+    // Defer HTTP buffer alloc until after WiFi — pre-boot DMA/PSRAM games broke
+    // ESP-Hosted (Req_WifiInit timeout).
 
 #ifdef BOARD_CROWPANEL_P4
     if (!crowpanel_enable_panel_power()) {
@@ -1292,11 +1365,18 @@ void setup() {
     // Splash first (display-only). Wi-Fi starts after so STA join is not disrupted.
     ui_wait_splash(10000);  // 10s, or tap splash to skip
 
+#if FR_ENABLE_SD
     // After splash / outside LVGL lock — avoids watchdog resets from slow SD I/O at boot.
     ui_load_sd_databases();
+#else
+    Serial.println("[sd] disabled (FR_ENABLE_SD=0)");
+#endif
 
+    // Leave internal heap alone for ESP-Hosted WiFi + TLS. Do NOT call
+    // heap_caps_malloc_extmem_enable() — that diverted small allocs to PSRAM and
+    // WiFi init failed with Req_WifiInit timeout.
     WiFi.setSleep(false);
-    heap_caps_malloc_extmem_enable(64);
+    net_init_buffers();
     net_set_status_callback(ui_set_status);
     xTaskCreatePinnedToCore(net_task, "net", 32768, nullptr, 1, nullptr, 0);
 
@@ -1319,11 +1399,6 @@ void setup() {
         if (ok) {
             char msg[96];
             snprintf(msg, sizeof(msg), "Joined %s", g_state.cfg.wifi_ssid);
-            // Wait for NTP so TLS cert checks don't fail on a cold clock (up to ~8s).
-            ui_set_status("Syncing time...");
-            for (int i = 0; i < 80 && time(nullptr) < 1700000000L; i++) {
-                delay(100);
-            }
             if (g_state.cfg.location.valid) {
                 // Existing airport homes may still be "KBNA (BNA)" — upgrade to "BNA - City".
                 if (net_enrich_airport_home_label(&g_state.cfg.location)) {

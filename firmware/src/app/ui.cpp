@@ -3,6 +3,7 @@
 #include "audio_click.h"
 #include "board_ctrl.h"
 #include "config_store.h"
+#include "fr_features.h"
 #include "lvgl_v8_port.h"
 #include "city_db.h"
 #include "county_db.h"
@@ -1000,88 +1001,9 @@ static void trail_push(float lat, float lon) {
     }
 }
 
-// Day-of-week 0=Sun … 6=Sat (Sakamoto).
-static int civil_dow(int y, int m, int d) {
-    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-    if (m < 3) {
-        y -= 1;
-    }
-    return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
-}
-
-// nth weekday in month (n=1 first); weekday 0=Sun. Returns day-of-month.
-static int nth_weekday_of_month(int y, int m, int weekday, int n) {
-    const int first = civil_dow(y, m, 1);
-    return 1 + (weekday - first + 7) % 7 + (n - 1) * 7;
-}
-
-// Last weekday in month (weekday 0=Sun).
-static int last_weekday_of_month(int y, int m, int weekday) {
-    const int dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    int last = dim[m - 1];
-    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0))) {
-        last = 29;
-    }
-    const int dow = civil_dow(y, m, last);
-    return last - (dow - weekday + 7) % 7;
-}
-
-static bool us_dst_active(time_t utc, int std_off_sec) {
-    // Evaluate in local standard time. US: 2nd Sun Mar 02:00 → 1st Sun Nov 01:00 std.
-    time_t local = utc + (time_t)std_off_sec;
-    struct tm t;
-    gmtime_r(&local, &t);
-    const int y = t.tm_year + 1900;
-    const int start_d = nth_weekday_of_month(y, 3, 0, 2);
-    const int end_d = nth_weekday_of_month(y, 11, 0, 1);
-    const int now_k = (t.tm_mon + 1) * 1000000 + t.tm_mday * 10000 + t.tm_hour * 100 + t.tm_min;
-    const int start_k = 3 * 1000000 + start_d * 10000 + 2 * 100;
-    const int end_k = 11 * 1000000 + end_d * 10000 + 1 * 100;
-    return now_k >= start_k && now_k < end_k;
-}
-
-static bool eu_dst_active(time_t utc, int std_off_sec) {
-    // EU: last Sun Mar 01:00 UTC → last Sun Oct 01:00 UTC (approx via local std + offset).
-    time_t local = utc + (time_t)std_off_sec;
-    struct tm t;
-    gmtime_r(&local, &t);
-    const int y = t.tm_year + 1900;
-    const int start_d = last_weekday_of_month(y, 3, 0);
-    const int end_d = last_weekday_of_month(y, 10, 0);
-    const int now_k = (t.tm_mon + 1) * 1000000 + t.tm_mday * 10000 + t.tm_hour * 100 + t.tm_min;
-    const int start_k = 3 * 1000000 + start_d * 10000 + 1 * 100;
-    const int end_k = 10 * 1000000 + end_d * 10000 + 1 * 100;
-    return now_k >= start_k && now_k < end_k;
-}
-
-/** Rough civil TZ offset (seconds east of UTC) from lat/lon, with US/EU DST. */
+/** Civil TZ offset from lat/lon with US/EU daylight saving (shared with net_client). */
 static int tz_offset_for_ll(float lat, float lon) {
-    int off = (int)lroundf(lon / 15.0f) * 3600;
-    if (off < -12 * 3600) {
-        off = -12 * 3600;
-    }
-    if (off > 14 * 3600) {
-        off = 14 * 3600;
-    }
-
-    time_t utc = time(nullptr);
-    if (utc > 1700000000) {
-        // US/Canada DST (excl. most of AZ / HI).
-        const bool namerica = (lat >= 24.0f && lat <= 60.0f && lon <= -52.0f && lon >= -170.0f);
-        const bool arizona = (lat >= 31.0f && lat <= 37.5f && lon <= -109.0f && lon >= -115.0f);
-        const bool hawaii = (lat >= 18.0f && lat <= 23.0f && lon <= -154.0f && lon >= -161.0f);
-        if (namerica && !arizona && !hawaii) {
-            if (us_dst_active(utc, off)) {
-                off += 3600;
-            }
-        } else if (lat >= 35.0f && lat <= 72.0f && lon >= -10.0f && lon <= 40.0f) {
-            // Europe (EU DST).
-            if (eu_dst_active(utc, off)) {
-                off += 3600;
-            }
-        }
-    }
-    return off;
+    return net_tz_offset_for_ll(lat, lon, 0);
 }
 
 static void recalc_tz_offset() {
@@ -2070,6 +1992,13 @@ static void sd_viewer_show_folder(const char *folder) {
 
 /** Manual Screen Shot: BMP → SD (and email if SMTP is configured). */
 static void begin_screenshot_email(bool quiet_if_busy) {
+#if !FR_ENABLE_SCREENSHOT
+    LV_UNUSED(quiet_if_busy);
+    if (radar_status) {
+        lv_label_set_text(radar_status, "Screen grab disabled");
+    }
+    return;
+#else
     if (!g_state) {
         return;
     }
@@ -2151,6 +2080,7 @@ static void begin_screenshot_email(bool quiet_if_busy) {
             lv_label_set_text(radar_status, "SD save failed");
         }
     }
+#endif
 }
 
 static void update_screenshot_btn_label();
@@ -2161,17 +2091,34 @@ static void timelapse_flash_button();
 
 static void screenshot_clicked(lv_event_t *e) {
     LV_UNUSED(e);
+#if !FR_ENABLE_SCREENSHOT && !FR_ENABLE_TIMELAPSE
+    if (radar_status) {
+        lv_label_set_text(radar_status, "Screen grab disabled");
+    }
+    return;
+#else
     bool want_tl = false;
     if (g_state) {
         xSemaphoreTake(g_state->mutex, portMAX_DELAY);
         want_tl = g_state->cfg.email.timelapse;
         xSemaphoreGive(g_state->mutex);
     }
+#if FR_ENABLE_TIMELAPSE
     if (want_tl) {
         timelapse_start_from_button();
-    } else {
-        begin_screenshot_email(false);
+        return;
     }
+#else
+    LV_UNUSED(want_tl);
+#endif
+#if FR_ENABLE_SCREENSHOT
+    begin_screenshot_email(false);
+#else
+    if (radar_status) {
+        lv_label_set_text(radar_status, "Screen grab disabled");
+    }
+#endif
+#endif
 }
 
 static void timelapse_btn_flash_restore_cb(lv_timer_t *t) {
@@ -2266,6 +2213,10 @@ static bool timelapse_crop_rgb565(const lv_img_dsc_t *snap, int cx, int cy, uint
 
 /** Capture one 200x200 aircraft-centered JPEG frame; also write Gnnn.BMP (same crop) to SD. */
 static void timelapse_capture_frame(bool flash_btn) {
+#if !FR_ENABLE_TIMELAPSE
+    LV_UNUSED(flash_btn);
+    return;
+#else
     if (!g_state || !s_follow || !s_timelapse_active) {
         return;
     }
@@ -2338,6 +2289,7 @@ static void timelapse_capture_frame(bool flash_btn) {
         }
         lv_label_set_text(radar_status, msg);
     }
+#endif
 }
 
 static void timelapse_cancel_finalize_timer() {
@@ -2360,6 +2312,12 @@ static void timelapse_stop_recording() {
 
 /** Press Timelapse: start recording; press again to end + email AVI. */
 static void timelapse_start_from_button() {
+#if !FR_ENABLE_TIMELAPSE
+    if (radar_status) {
+        lv_label_set_text(radar_status, "Timelapse disabled");
+    }
+    return;
+#else
     if (!g_state) {
         return;
     }
@@ -2388,6 +2346,7 @@ static void timelapse_start_from_button() {
                           s_follow ? "Timelapse started — press again to end"
                                    : "Timelapse armed — follow a flight; press again to end");
     }
+#endif
 }
 
 /** Read a finished AVI back from SD into PSRAM for the SMTP task (caller/net frees it). */
@@ -2416,6 +2375,9 @@ static uint8_t *tl_read_avi_file(const char *path, size_t len) {
 
 /** Build AVI, email once, stop recording (keep Timelapse button preference). */
 static void timelapse_finalize_and_email() {
+#if !FR_ENABLE_TIMELAPSE
+    return;
+#else
     timelapse_cancel_finalize_timer();
     if (!g_state || !s_timelapse_active) {
         return;
@@ -2519,6 +2481,7 @@ static void timelapse_finalize_and_email() {
     if (radar_status) {
         lv_label_set_text(radar_status, saved_sd ? "Timelapse AVI saved to SD" : "AVI save failed");
     }
+#endif
 }
 
 static void timelapse_finalize_timer_cb(lv_timer_t *t) {
@@ -10033,7 +9996,7 @@ static void build_radar() {
     lv_obj_add_event_cb(radar_plot, radar_clicked, LV_EVENT_CLICKED, nullptr);
 
     // Title / location / ADS-B status sit in the square corners (outside the circular PPI).
-    // Tap FLIGHT RADAR (unchanged look) → screenshot + email (same as Screen Shot).
+    // Tap FLIGHT RADAR → screenshot (disabled while FR_ENABLE_SCREENSHOT=0).
     lv_obj_t *hdr = lv_label_create(scr_radar);
     lv_label_set_text(hdr, "FLIGHT RADAR");
     lv_label_set_long_mode(hdr, LV_LABEL_LONG_WRAP);
@@ -10041,8 +10004,10 @@ static void build_radar() {
     lv_obj_set_style_text_font(hdr, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(hdr, COL_GREEN, 0);
     lv_obj_align_to(hdr, radar_plot, LV_ALIGN_TOP_LEFT, 10, 8);
+#if FR_ENABLE_SCREENSHOT || FR_ENABLE_TIMELAPSE
     lv_obj_add_flag(hdr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(hdr, screenshot_clicked, LV_EVENT_CLICKED, nullptr);
+#endif
 
     lv_obj_t *ver_lbl = lv_label_create(scr_radar);
     lv_label_set_text(ver_lbl, FR_VERSION_STR);
@@ -10339,12 +10304,16 @@ static void build_radar() {
     lv_obj_clear_flag(route_btn, LV_OBJ_FLAG_SCROLL_CHAIN);
     style_two_line_btn_label(route_btn, row_btn_w);
     lv_obj_align(route_btn, LV_ALIGN_RIGHT_MID, -2 * (row_btn_w + 6), 0);
+#if FR_ENABLE_SCREENSHOT || FR_ENABLE_TIMELAPSE
     screenshot_btn = make_btn(btn_row, "Screen\nShot", screenshot_clicked, nullptr);
     lv_obj_set_size(screenshot_btn, row_btn_w, btn_h);
     lv_obj_set_style_radius(screenshot_btn, 6, 0);
     lv_obj_clear_flag(screenshot_btn, LV_OBJ_FLAG_SCROLL_CHAIN);
     style_two_line_btn_label(screenshot_btn, row_btn_w);
     lv_obj_align(screenshot_btn, LV_ALIGN_RIGHT_MID, -(row_btn_w + 6), 0);
+#else
+    screenshot_btn = nullptr;
+#endif
     cty_toggle_btn = make_btn(btn_row, "Hide\nCounty", toggle_counties, nullptr);
     lv_obj_set_size(cty_toggle_btn, row_btn_w, btn_h);
     lv_obj_set_style_radius(cty_toggle_btn, 6, 0);
@@ -10600,6 +10569,7 @@ static void build_radar() {
     lv_obj_align(email_show_pw_cb, LV_ALIGN_TOP_LEFT, 8, 260);
     lv_obj_add_event_cb(email_show_pw_cb, email_show_pass_changed, LV_EVENT_VALUE_CHANGED, nullptr);
 
+#if FR_ENABLE_TIMELAPSE
     email_timelapse_cb = lv_checkbox_create(email_panel);
     lv_checkbox_set_text(email_timelapse_cb,
                          "Time lapse — Timelapse button: press to start, press again to end + email");
@@ -10608,6 +10578,9 @@ static void build_radar() {
     lv_obj_set_style_text_font(email_timelapse_cb, &lv_font_montserrat_12, 0);
     lv_obj_align(email_timelapse_cb, LV_ALIGN_TOP_LEFT, 8, 292);
     lv_obj_add_event_cb(email_timelapse_cb, email_timelapse_changed, LV_EVENT_VALUE_CHANGED, nullptr);
+#else
+    email_timelapse_cb = nullptr;
+#endif
 
     lv_obj_t *esave = make_btn(email_panel, "Save", email_save_clicked, nullptr);
     lv_obj_set_size(esave, 140, 40);
@@ -11874,11 +11847,30 @@ void ui_notify_airport_board(bool ok, const char *msg) {
     }
 
     lvgl_port_lock(-1);
-    // Re-resolve airport LL after fetch (SD / search hits may be ready now).
+    // Prefer lat/lon resolved during the board fetch (AWC/SD); fall back to local DB.
     if (ok) {
-        const char *ll_code = icao[0] ? icao : label;
-        if (ll_code && ll_code[0]) {
-            board_set_airport_ll(ll_code);
+        bool have_ll = false;
+        float lat = 0, lon = 0;
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        if (g_state->board_ll_ok) {
+            lat = g_state->board_lat;
+            lon = g_state->board_lon;
+            have_ll = true;
+        }
+        xSemaphoreGive(g_state->mutex);
+        if (have_ll) {
+            s_board_lat = lat;
+            s_board_lon = lon;
+            s_board_ll_ok = true;
+            if (icao[0]) {
+                strncpy(s_board_icao, icao, sizeof(s_board_icao) - 1);
+                s_board_icao[sizeof(s_board_icao) - 1] = 0;
+            }
+        } else {
+            const char *ll_code = icao[0] ? icao : label;
+            if (ll_code && ll_code[0]) {
+                board_set_airport_ll(ll_code);
+            }
         }
         if (WiFi.status() == WL_CONNECTED && time(nullptr) < 1700000000) {
             configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");

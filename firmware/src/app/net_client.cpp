@@ -4,6 +4,7 @@
 #include "sd_store.h"
 #include "waypoint_db.h"
 #include "board_config.h"
+#include "fr_features.h"
 
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -114,13 +115,12 @@ static bool parse_url(const char *url, bool *tls, char *host, size_t host_len, u
     return true;
 }
 
-// Fixed PSRAM body buffer (no String realloc thrash). Keep it out of internal
-// DRAM — mbedTLS needs that for the SSL handshake.
+// HTTP body buffer — prefer PSRAM so internal DMA stays free for ESP-Hosted WiFi
+// + mbedTLS. Sized for ADS-B JSON / small HTML (FA scrape disabled).
 static char *g_http_buf = nullptr;
 static size_t g_http_cap = 0;
 static size_t g_http_len = 0;
-// FlightStats ~110-170 KB; FlightAware live pages with flightPlan are ~500-600 KB.
-static constexpr size_t kHttpBufCap = 768 * 1024;
+static constexpr size_t kHttpBufCap = 192 * 1024;
 
 static bool ensure_http_buf() {
     if (g_http_buf) {
@@ -140,19 +140,70 @@ static bool ensure_http_buf() {
 }
 
 void net_init_buffers() {
+    // Do NOT pre-reserve internal DMA here — that starved ESP-Hosted WiFi
+    // (rpc Req_WifiInit timeout / esp_wifi_init FAIL) at boot.
     ensure_http_buf();
 }
 
-// Sticky TLS session — full handshakes every ADS-B poll are what thrash flash/PSRAM
-// against RGB bounce. Keep-alive reuses one session on the preferred host.
+// Park a contiguous INTERNAL+DMA slab after WiFi is up so esp-aes can grab it
+// for the next TLS handshake (LVGL fragments the heap). Never call before
+// ESP-Hosted WiFi init — that caused Req_WifiInit timeouts.
+static constexpr uint32_t kDmaInternal = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
+static void *s_dma_tls_reserve = nullptr;
+static size_t s_dma_tls_reserve_sz = 0;
+
+static void dma_tls_reserve_release() {
+    if (s_dma_tls_reserve) {
+        heap_caps_free(s_dma_tls_reserve);
+        s_dma_tls_reserve = nullptr;
+        s_dma_tls_reserve_sz = 0;
+    }
+}
+
+static void dma_tls_reserve_hold() {
+    if (s_dma_tls_reserve) {
+        return;
+    }
+    // Prefer ~40 KB; fall back so we still leave a usable hole for esp-aes.
+    for (size_t kb = 40; kb >= 16; kb -= 4) {
+        const size_t sz = kb * 1024;
+        void *p = heap_caps_malloc(sz, kDmaInternal);
+        if (p) {
+            s_dma_tls_reserve = p;
+            s_dma_tls_reserve_sz = sz;
+            Serial.printf("DMA TLS reserve +%u KB (int-dma free=%u largest=%u)\n", (unsigned)kb,
+                          (unsigned)heap_caps_get_free_size(kDmaInternal),
+                          (unsigned)heap_caps_get_largest_free_block(kDmaInternal));
+            return;
+        }
+    }
+    Serial.printf("DMA TLS reserve FAIL (int-dma free=%u largest=%u)\n",
+                  (unsigned)heap_caps_get_free_size(kDmaInternal),
+                  (unsigned)heap_caps_get_largest_free_block(kDmaInternal));
+}
+
+void net_arm_tls_dma_after_wifi() {
+    dma_tls_reserve_hold();
+}
+
+// Sticky TLS session — full handshakes every ADS-B poll thrash internal DMA RAM
+// (esp-aes descriptors) once LVGL/airports have fragmented the heap. Keep-alive
+// reuses one session on the preferred host; FA pages use force_close.
 static NetworkClientSecure *g_tls = nullptr;
 static char g_tls_host[80] = "";
 static uint16_t g_tls_port = 0;
 // Set on every tls_close so the next handshake can wait for stack teardown.
 static uint32_t s_tls_last_close_ms = 0;
+static bool s_tls_last_was_fa = false;
+
+static bool host_is_flightaware(const char *host) {
+    return host && (strcasecmp(host, "www.flightaware.com") == 0 ||
+                    strcasecmp(host, "flightaware.com") == 0);
+}
 
 static void tls_close() {
     if (g_tls) {
+        s_tls_last_was_fa = host_is_flightaware(g_tls_host);
         g_tls->stop();
         delete g_tls;
         g_tls = nullptr;
@@ -160,14 +211,13 @@ static void tls_close() {
     }
     g_tls_host[0] = 0;
     g_tls_port = 0;
+    // Session gone — park contiguous DMA again for the next handshake.
+    dma_tls_reserve_hold();
 }
 
 void net_tls_reset() {
     tls_close();
 }
-
-// Simple handshake (GitHub style) + one slow retry. Rapid reconnect to FlightAware
-// after a large HTML download often fails once with "TLS generic error".
 
 static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_t connect_ms, uint32_t io_ms) {
     if (g_tls && g_tls->connected() && g_tls_port == port && strcmp(g_tls_host, host) == 0) {
@@ -178,31 +228,39 @@ static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_
         set_err("TLS Wi-Fi down");
         return nullptr;
     }
-    // Let lwIP/mbedTLS finish teardown after a prior FA page abort/close.
+    // Long settle only after / before FlightAware — ADS-B must stay snappy.
+    const bool fa = host_is_flightaware(host) || s_tls_last_was_fa;
+    const uint32_t settle_ms = fa ? 1500u : 200u;
     if (s_tls_last_close_ms) {
         const uint32_t since = millis() - s_tls_last_close_ms;
-        if (since < 1500u) {
-            delay(1500u - since);
+        if (since < settle_ms) {
+            delay(settle_ms - since);
         }
     }
+
+    // Free the parked slab so esp-aes can grab contiguous DMA descriptors.
+    dma_tls_reserve_release();
 
     char last_tlserr[72] = {0};
     for (int attempt = 1; attempt <= 2; attempt++) {
         NetworkClientSecure *client = new NetworkClientSecure();
         if (!client) {
             set_err("No TLS client RAM");
+            dma_tls_reserve_hold();
             return nullptr;
         }
         client->setInsecure();
         client->setHandshakeTimeout((connect_ms + 999) / 1000);
         client->setTimeout((io_ms + 999) / 1000);
-        Serial.printf("TLS connect %s:%u try %d (free=%u)\n", host, port, attempt,
-                      (unsigned)ESP.getFreeHeap());
+        Serial.printf("TLS connect %s:%u try %d (free=%u int-dma=%u largest=%u)\n", host, port, attempt,
+                      (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_free_size(kDmaInternal),
+                      (unsigned)heap_caps_get_largest_free_block(kDmaInternal));
         if (client->connect(host, port, (int32_t)connect_ms)) {
             g_tls = client;
             strncpy(g_tls_host, host, sizeof(g_tls_host) - 1);
             g_tls_host[sizeof(g_tls_host) - 1] = 0;
             g_tls_port = port;
+            s_tls_last_was_fa = false;
             Serial.printf("TLS session open %s:%u\n", host, port);
             return g_tls;
         }
@@ -212,10 +270,11 @@ static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_
         delete client;
         s_tls_last_close_ms = millis();
         if (attempt == 1) {
-            delay(2000);
+            delay(fa ? 2000 : 400);
             yield();
         }
     }
+    dma_tls_reserve_hold();
     char msg[96];
     snprintf(msg, sizeof(msg), "TLS %s", last_tlserr[0] ? last_tlserr : "connect failed");
     set_err(msg);
@@ -341,6 +400,16 @@ static int http_read_exact(Client &client, char *dst, int n, uint32_t idle_ms, u
 
 static bool (*g_http_early_ok)(const char *buf, size_t len) = nullptr;
 
+// When a page-specific early_ok is set (FA board), NEVER keep a partial just
+// because we hit 64 KB — arrivals sit ~68 KB in and departures ~83 KB; a 64 KB
+// stall left the dep column empty. Generic downloads still use the 64 KB floor.
+static bool http_partial_usable(const char *buf, size_t len) {
+    if (g_http_early_ok) {
+        return g_http_early_ok(buf, len);
+    }
+    return len >= 64 * 1024;
+}
+
 static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool keep_alive) {
     if (!ensure_http_buf()) {
         return false;
@@ -351,7 +420,8 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
     size_t len = 0;
     int header_end = -1;
     uint8_t chunk[512];
-    const uint32_t hdr_ms = io_ms > 8000 ? 8000 : io_ms;
+    // Headers are tiny but ESP-Hosted + first TLS write can be slow after join.
+    const uint32_t hdr_ms = io_ms > 20000 ? 20000 : (io_ms < 12000 ? 12000 : io_ms);
     while (millis() - start < hdr_ms) {
         const int avail = client.available();
         int n = 0;
@@ -390,6 +460,9 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
         }
     }
     if (header_end < 0) {
+        Serial.printf("HTTP hdr timeout after %u ms (got %u B, conn=%d int-dma largest=%u)\n",
+                      (unsigned)(millis() - start), (unsigned)len, client.connected() ? 1 : 0,
+                      (unsigned)heap_caps_get_largest_free_block(kDmaInternal));
         set_err("HTTP header timeout");
         return false;
     }
@@ -422,12 +495,23 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
     size_t pre_len = len > body_off ? len - body_off : 0;
 
     // Prefetch bytes already read past headers — feed into pushback for chunked,
-    // or into the body buffer for Content-Length / raw. 16 KB covers a full TCP
-    // window past the header terminator (old 2 KB guard false-failed large FA pages).
-    static char pushback[16 * 1024];
+    // or into the body buffer for Content-Length / raw. Keep this in PSRAM so
+    // internal DMA stays free for esp-aes during the TLS body read.
+    static char *pushback = nullptr;
+    static constexpr size_t kPushbackCap = 16 * 1024;
+    if (!pushback) {
+        pushback = (char *)heap_caps_malloc(kPushbackCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!pushback) {
+            pushback = (char *)heap_caps_malloc(kPushbackCap, MALLOC_CAP_8BIT);
+        }
+        if (!pushback) {
+            set_err("No HTTP pushback RAM");
+            return false;
+        }
+    }
     size_t push_n = 0;
     if (chunked) {
-        if (pre_len > sizeof(pushback)) {
+        if (pre_len > kPushbackCap) {
             set_err("HTTP chunk prefetch large");
             return false;
         }
@@ -475,7 +559,7 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
         for (;;) {
             if ((long)(millis() - abs_deadline) >= 0) {
                 // Prefer a clean peer-close; only keep a partial if we already have usable HTML.
-                if (len >= 64 * 1024 || (g_http_early_ok && g_http_early_ok(g_http_buf, len))) {
+                if (http_partial_usable(g_http_buf, len)) {
                     Serial.printf("HTTP body deadline at %u KB — using partial\n", (unsigned)(len / 1024));
                     goto body_done;
                 }
@@ -489,7 +573,7 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
                 uint8_t b = 0;
                 if (!take_byte(&b)) {
                     // Already have enough HTML (airport boards ~65–120 KB in) — keep it.
-                    if (len >= 64 * 1024 || (g_http_early_ok && g_http_early_ok(g_http_buf, len))) {
+                    if (http_partial_usable(g_http_buf, len)) {
                         Serial.printf("HTTP chunk-size stall after %u KB — using partial body\n",
                                       (unsigned)(len / 1024));
                         goto body_done;
@@ -551,27 +635,31 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
             }
             if (!take_bytes(g_http_buf + len, (int)csz)) {
                 // Only keep a partial body if we already have enough HTML to parse.
-                // (Airport boards sit ~65–120 KB in; tiny stalls must NOT count as success.)
-                if (len >= 64 * 1024 || (g_http_early_ok && g_http_early_ok(g_http_buf, len))) {
+                if (http_partial_usable(g_http_buf, len)) {
                     Serial.printf("HTTP chunk stall after %u KB — using partial body\n",
                                   (unsigned)(len / 1024));
                     break;
                 }
+                Serial.printf("HTTP chunk data timeout at %u KB\n", (unsigned)(len / 1024));
                 set_err("HTTP chunk data timeout");
                 return false;
             }
             len += (size_t)csz;
             g_http_buf[len] = 0;
-            if ((len / 32768) != ((len - (size_t)csz) / 32768)) {
+            if ((len / 16384) != ((len - (size_t)csz) / 16384)) {
                 char st[40];
                 snprintf(st, sizeof(st), "Download %u KB…", (unsigned)(len / 1024));
                 status_msg(st);
             }
-            // Do NOT mid-stream abort on early_ok — that RST poisons the next FA TLS handshake.
+            // FA board: stop as soon as boards are present (force_close path).
+            if (g_http_early_ok && g_http_early_ok(g_http_buf, len)) {
+                Serial.printf("HTTP early-complete at %u KB\n", (unsigned)(len / 1024));
+                goto body_done;
+            }
             // Trailing CRLF after chunk data.
             uint8_t crlf[2];
             if (!take_bytes((char *)crlf, 2)) {
-                if (len >= 64 * 1024 || (g_http_early_ok && g_http_early_ok(g_http_buf, len))) {
+                if (http_partial_usable(g_http_buf, len)) {
                     break;
                 }
                 set_err("HTTP chunk CRLF timeout");
@@ -720,22 +808,58 @@ bool https_get(const char *url, String *body, const char *user_agent, uint32_t c
 
         bool ok = false;
         if (tls) {
-            // Always close between hops — redirect often changes host.
-            tls_close();
+            // Sticky keep-alive for ADS-B (force_close=false). Closing every poll
+            // forces a new mbedTLS handshake and runs out of internal DMA RAM
+            // (esp-aes descriptor alloc fails → "TLS generic error").
+            // FA HTML / redirects: force_close=true → Connection: close each time.
+            const bool same_host =
+                g_tls && g_tls->connected() && g_tls_port == port && strcmp(g_tls_host, host) == 0;
+            if (force_close || !same_host) {
+                tls_close();
+            }
             NetworkClientSecure *client = tls_acquire(host, port, connect_ms, io_ms);
             if (!client) {
+                g_http_early_ok = nullptr;
                 return false;
             }
-            client->printf("GET %s HTTP/1.1\r\n", path);
-            client->printf("Host: %s\r\n", host);
-            client->printf("User-Agent: %s\r\n", ua);
-            client->printf("Accept: %s\r\n", acc);
-            client->print("Accept-Encoding: identity\r\n");
-            // Redirects + large bodies: prefer close so Location parsing isn't kept-alive junk.
-            client->print("Connection: close\r\n\r\n");
-            ok = read_http_body(*client, body, io_ms, false);
-            tls_close();
-            (void)force_close;
+            // Build request in one write so TLS record framing is clean on Hosted WiFi.
+            static char req[1536];
+            const int req_n =
+                snprintf(req, sizeof(req),
+                         "GET %s HTTP/1.1\r\n"
+                         "Host: %s\r\n"
+                         "User-Agent: %s\r\n"
+                         "Accept: %s\r\n"
+                         "Accept-Encoding: identity\r\n"
+                         "Connection: %s\r\n\r\n",
+                         path, host, ua, acc, force_close ? "close" : "keep-alive");
+            if (req_n <= 0 || (size_t)req_n >= sizeof(req)) {
+                set_err("HTTP request too large");
+                tls_close();
+                g_http_early_ok = nullptr;
+                return false;
+            }
+            const int wrote = client->write((const uint8_t *)req, (size_t)req_n);
+            if (wrote != req_n) {
+                Serial.printf("HTTP write short %d/%d\n", wrote, req_n);
+                set_err("HTTP write failed");
+                tls_close();
+                g_http_early_ok = nullptr;
+                return false;
+            }
+            client->flush();
+            Serial.printf("HTTP req %d B sent (int-dma free=%u largest=%u)\n", req_n,
+                          (unsigned)heap_caps_get_free_size(kDmaInternal),
+                          (unsigned)heap_caps_get_largest_free_block(kDmaInternal));
+            if (force_close) {
+                ok = read_http_body(*client, body, io_ms, false);
+                tls_close();
+            } else {
+                ok = read_http_body(*client, body, io_ms, true);
+                if (!ok) {
+                    tls_close();
+                }
+            }
         } else {
             WiFiClient client;
             client.setTimeout((io_ms + 999) / 1000);
@@ -957,7 +1081,8 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
         g_adsb_pref = 0;
     }
 
-    // Try preferred host first, then the rest. Empty lists are not sticky successes.
+    // Prefer one host per poll. A second TLS handshake (failover) often fails
+    // once internal DMA is fragmented — empty airspace is a valid answer.
     for (int attempt = 0; attempt < nsrc; attempt++) {
         const int idx = (g_adsb_pref + attempt) % nsrc;
         char msg[48];
@@ -965,7 +1090,9 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
         status_msg(msg);
         snprintf(url, sizeof(url), kSrc[idx].fmt, lat, lon, dist);
         // nullptr body → fill g_http_buf only (no second PSRAM String copy).
-        if (!https_get(url, nullptr, kUa, 5000, 10000)) {
+        // force_close=true: Hosted Wi‑Fi + sticky keep-alive was stalling after
+        // handshake (HTTP header timeout) and then breaking DNS.
+        if (!https_get(url, nullptr, kUa, 8000, 25000, nullptr, true)) {
             continue;
         }
         size_t blen = 0;
@@ -975,10 +1102,11 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
             g_adsb_pref = idx;
             return n;
         }
-        if (n == 0) {
-            any_ok = true;
-            best_empty = 0;
-        }
+        // HTTP OK with 0 aircraft — do not open a second TLS session this poll.
+        g_adsb_pref = idx;
+        any_ok = true;
+        best_empty = 0;
+        break;
     }
 
     if (any_ok) {
@@ -1437,7 +1565,7 @@ static int adsb_solo(const char *path_fmt_lol, const char *path_fmt_fi, const ch
     bool any_ok = false;
     for (int src = 0; src < 2; src++) {
         snprintf(url, sizeof(url), src == 0 ? path_fmt_lol : path_fmt_fi, key);
-        if (!https_get(url, nullptr, kUa, 5000, 10000)) {
+        if (!https_get(url, nullptr, kUa, 8000, 20000)) {
             continue;
         }
         size_t blen = 0;
@@ -3283,6 +3411,110 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
     return n > 0 || have_track > 0;
 }
 
+// ---- Airport board (live ADS-B + hexdb routes; replaces FA HTML scrape) ----
+
+static bool apt_codes_match(const char *a, const char *b) {
+    if (!a || !b || !a[0] || !b[0]) {
+        return false;
+    }
+    if (strcasecmp(a, b) == 0) {
+        return true;
+    }
+    // KATL ↔ ATL
+    if (strlen(a) == 4 && (a[0] == 'K' || a[0] == 'k') && strcasecmp(a + 1, b) == 0) {
+        return true;
+    }
+    if (strlen(b) == 4 && (b[0] == 'K' || b[0] == 'k') && strcasecmp(b + 1, a) == 0) {
+        return true;
+    }
+    return false;
+}
+
+// Day-of-week 0=Sun … 6=Sat (Sakamoto).
+static int tz_civil_dow(int y, int m, int d) {
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) {
+        y -= 1;
+    }
+    return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+}
+
+static int tz_nth_weekday_of_month(int y, int m, int weekday, int n) {
+    const int first = tz_civil_dow(y, m, 1);
+    return 1 + (weekday - first + 7) % 7 + (n - 1) * 7;
+}
+
+static int tz_last_weekday_of_month(int y, int m, int weekday) {
+    const int dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int last = dim[m - 1];
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0))) {
+        last = 29;
+    }
+    const int dow = tz_civil_dow(y, m, last);
+    return last - (dow - weekday + 7) % 7;
+}
+
+static bool tz_us_dst_active(time_t utc, int std_off_sec) {
+    // US: 2nd Sun Mar 02:00 → 1st Sun Nov 01:00 (local standard time).
+    time_t local = utc + (time_t)std_off_sec;
+    struct tm t {};
+    gmtime_r(&local, &t);
+    const int y = t.tm_year + 1900;
+    const int start_d = tz_nth_weekday_of_month(y, 3, 0, 2);
+    const int end_d = tz_nth_weekday_of_month(y, 11, 0, 1);
+    const int now_k = (t.tm_mon + 1) * 1000000 + t.tm_mday * 10000 + t.tm_hour * 100 + t.tm_min;
+    const int start_k = 3 * 1000000 + start_d * 10000 + 2 * 100;
+    const int end_k = 11 * 1000000 + end_d * 10000 + 1 * 100;
+    return now_k >= start_k && now_k < end_k;
+}
+
+static bool tz_eu_dst_active(time_t utc, int std_off_sec) {
+    // EU: last Sun Mar 01:00 UTC → last Sun Oct 01:00 UTC (approx via local std).
+    time_t local = utc + (time_t)std_off_sec;
+    struct tm t {};
+    gmtime_r(&local, &t);
+    const int y = t.tm_year + 1900;
+    const int start_d = tz_last_weekday_of_month(y, 3, 0);
+    const int end_d = tz_last_weekday_of_month(y, 10, 0);
+    const int now_k = (t.tm_mon + 1) * 1000000 + t.tm_mday * 10000 + t.tm_hour * 100 + t.tm_min;
+    const int start_k = 3 * 1000000 + start_d * 10000 + 1 * 100;
+    const int end_k = 10 * 1000000 + end_d * 10000 + 1 * 100;
+    return now_k >= start_k && now_k < end_k;
+}
+
+int net_tz_offset_for_ll(float lat, float lon, time_t when_utc) {
+    int off = (int)lroundf(lon / 15.0f) * 3600;
+    if (off < -12 * 3600) {
+        off = -12 * 3600;
+    }
+    if (off > 14 * 3600) {
+        off = 14 * 3600;
+    }
+
+    time_t utc = when_utc;
+    if (utc <= 0) {
+        utc = time(nullptr);
+    }
+    if (utc > 1700000000) {
+        // US/Canada DST (excl. most of AZ / HI).
+        const bool namerica = (lat >= 24.0f && lat <= 60.0f && lon <= -52.0f && lon >= -170.0f);
+        const bool arizona = (lat >= 31.0f && lat <= 37.5f && lon <= -109.0f && lon >= -115.0f);
+        const bool hawaii = (lat >= 18.0f && lat <= 23.0f && lon <= -154.0f && lon >= -161.0f);
+        if (namerica && !arizona && !hawaii) {
+            if (tz_us_dst_active(utc, off)) {
+                off += 3600;
+            }
+        } else if (lat >= 35.0f && lat <= 72.0f && lon >= -10.0f && lon <= 40.0f) {
+            if (tz_eu_dst_active(utc, off)) {
+                off += 3600;
+            }
+        }
+    }
+    return off;
+}
+
+// ---- FlightAware airport board HTML parse ----
+
 static void fa_html_unescape_nbsp(char *s) {
     if (!s) {
         return;
@@ -3387,7 +3619,6 @@ static bool fa_parse_hist_dep_epoch(const char *href, uint32_t *epoch_out) {
     t.tm_hour = hh;
     t.tm_min = mm;
     t.tm_sec = 0;
-    // Device TZ is UTC (configTime(0,0,...)).
     time_t e = mktime(&t);
     if (e < 0) {
         return false;
@@ -3424,7 +3655,7 @@ static void fa_board_fill_progress(AirportBoardRow *row, bool prefer_complete) {
     }
     const uint32_t span = arr - row->dep_epoch;
     const uint32_t el = (uint32_t)now - row->dep_epoch;
-    row->progress_pct = (uint8_t)((el * 100u) / span);
+    row->progress_pct = (int)((el * 100u) / span);
     if (row->progress_pct > 99) {
         row->progress_pct = 99;
     }
@@ -3463,7 +3694,6 @@ static int fa_parse_airport_board_section(const char *html, const char *board_id
     int n = 0;
     const char *p = sec;
     while (n < out_max && p < sec_end) {
-        // Yield so the LVGL/display task can run during large FA HTML scans.
         if ((n & 7) == 7) {
             vTaskDelay(1);
         }
@@ -3476,7 +3706,6 @@ static int fa_parse_airport_board_section(const char *html, const char *board_id
             break;
         }
         const size_t tlen = (size_t)(tr_end - tr);
-        // Static — board HTML rows are large; keep off net-task stack (was rebooting).
         static char rowbuf[1600];
         if (tlen >= sizeof(rowbuf)) {
             p = tr_end + 5;
@@ -3513,10 +3742,6 @@ static int fa_parse_airport_board_section(const char *html, const char *board_id
                 if (*slash2 == '/') {
                     char a[8] = {0}, b[8] = {0};
                     if (sscanf(slash2, "/%7[^/]/%7s", a, b) == 2) {
-                        // Departures + scheduled: other = destination (b).
-                        // Arrivals / enroute: other = origin (a).
-                        // (strstr "depart" alone misses scheduled-board — Next Hour
-                        // preferred those rows and showed the dep city in TO.)
                         const bool dep_side = strstr(board_id, "depart") != nullptr ||
                                               strstr(board_id, "scheduled") != nullptr;
                         copy_trunc(row.other_apt, sizeof(row.other_apt), dep_side ? b : a);
@@ -3554,7 +3779,6 @@ static int fa_parse_airport_board_section(const char *html, const char *board_id
             }
         }
         if (!row.other_apt[0]) {
-            // Prefer the last /live/airport/ in the row (usually the opposite end).
             const char *ap = nullptr;
             for (const char *q = rowbuf; (q = strstr(q, "/live/airport/")) != nullptr; q += 14) {
                 ap = q;
@@ -3628,17 +3852,246 @@ static int fa_parse_airport_board_section(const char *html, const char *board_id
     return n;
 }
 
+static bool fa_board_body_ok(const char *buf, size_t len) {
+    // FA order: arrivals → departures (~83 KB) → enroute → scheduled.
+    // Prefer deps present; never hang forever waiting for a full 170 KB page.
+    if (!buf || len < 48 * 1024) {
+        return false;
+    }
+    if (strstr(buf, "id=\"departures-board\"") != nullptr ||
+        strstr(buf, "id=\"scheduled-board\"") != nullptr) {
+        return true;
+    }
+    // Arrivals-only is better than a 90s failure if the stream dies early.
+    return strstr(buf, "id=\"arrivals-board\"") != nullptr ||
+           strstr(buf, "id=\"enroute-board\"") != nullptr;
+}
+
+static void board_resolve_ll(const char *code, float *lat, float *lon) {
+    if (!lat || !lon || !code || !code[0]) {
+        return;
+    }
+    *lat = 0;
+    *lon = 0;
+    if (net_lookup_airport(code, lat, lon, nullptr, nullptr)) {
+        return;
+    }
+    char resolved[8] = {0};
+    if (net_lookup_airport_iata(code, resolved, sizeof(resolved), lat, lon) &&
+        (*lat != 0.0f || *lon != 0.0f)) {
+        return;
+    }
+    JsonDocument doc;
+    if (awc_airports(code, doc) && doc.as<JsonArray>().size() > 0) {
+        *lat = doc[0]["lat"] | 0.0f;
+        *lon = doc[0]["lon"] | 0.0f;
+        return;
+    }
+    if (strlen(code) == 3) {
+        char kcode[8];
+        snprintf(kcode, sizeof(kcode), "K%s", code);
+        if (awc_airports(kcode, doc) && doc.as<JsonArray>().size() > 0) {
+            *lat = doc[0]["lat"] | 0.0f;
+            *lon = doc[0]["lon"] | 0.0f;
+        }
+    }
+}
+
+static void board_normalize_icao(const char *icao, char *code, size_t code_len) {
+    copy_trunc(code, code_len, icao ? icao : "");
+    for (char *q = code; *q; q++) {
+        *q = (char)toupper((unsigned char)*q);
+    }
+    if (strlen(code) == 3) {
+        char icao4[8] = {0};
+        if (net_lookup_airport_iata(code, icao4, sizeof(icao4), nullptr, nullptr) && icao4[0]) {
+            copy_trunc(code, code_len, icao4);
+        } else {
+            char kcode[8];
+            snprintf(kcode, sizeof(kcode), "K%s", code);
+            copy_trunc(code, code_len, kcode);
+        }
+    }
+}
+
+static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_lon, const Aircraft *acs,
+                                     int n_ac, AirportBoardRow *arr, int arr_max, int *arr_n,
+                                     AirportBoardRow *dep, int dep_max, int *dep_n) {
+    if (arr_n) {
+        *arr_n = 0;
+    }
+    if (dep_n) {
+        *dep_n = 0;
+    }
+    if (!acs || n_ac <= 0 || !arr || !dep) {
+        return false;
+    }
+
+    auto ang_diff = [](float a, float b) -> float {
+        float d = a - b;
+        while (d > 180.0f) {
+            d -= 360.0f;
+        }
+        while (d < -180.0f) {
+            d += 360.0f;
+        }
+        return fabsf(d);
+    };
+    auto fill_row = [&](AirportBoardRow *row, const Aircraft &ac, float dst_nm, bool inbound) {
+        memset(row, 0, sizeof(*row));
+        copy_trunc(row->flight, sizeof(row->flight), ac.flight[0] ? ac.flight : ac.reg);
+        for (char *p = row->flight; *p; p++) {
+            if (*p == ' ') {
+                *p = 0;
+                break;
+            }
+        }
+        copy_trunc(row->type, sizeof(row->type), ac.type);
+        snprintf(row->other_name, sizeof(row->other_name), "%.0fnm", dst_nm);
+        if (ac.on_ground || ac.alt_ft < 50.0f) {
+            copy_trunc(row->dep_time, sizeof(row->dep_time), "GND");
+        } else {
+            snprintf(row->dep_time, sizeof(row->dep_time), "%.0f", ac.alt_ft);
+        }
+        if (ac.gs_kts > 0.5f) {
+            snprintf(row->arr_time, sizeof(row->arr_time), "%.0fk", ac.gs_kts);
+        }
+        int pct = inbound ? (int)lroundf(100.0f - dst_nm * 2.5f) : (int)lroundf(dst_nm * 2.5f);
+        if (pct < 0) {
+            pct = 0;
+        }
+        if (pct > 100) {
+            pct = 100;
+        }
+        row->progress_pct = pct;
+        row->valid = row->flight[0] != 0;
+    };
+
+    struct Cand {
+        int idx;
+        float dst;
+        bool inbound;
+    };
+    Cand cands[96];
+    int nc = 0;
+    for (int i = 0; i < n_ac && nc < 96; i++) {
+        if (!acs[i].valid || (!acs[i].flight[0] && !acs[i].reg[0])) {
+            continue;
+        }
+        float east = 0, north = 0;
+        ll_to_nm(acs[i].lat, acs[i].lon, apt_lat, apt_lon, &east, &north);
+        const float dst = sqrtf(east * east + north * north);
+        if (dst > 40.0f) {
+            continue;
+        }
+        const float brg = atan2f(east, north) * 57.2957795f;
+        const float dhdg = ang_diff(acs[i].track_deg, brg);
+        bool inbound = false;
+        if (acs[i].on_ground || acs[i].alt_ft < 50.0f) {
+            inbound = false;
+        } else if (acs[i].vrate_fpm < -200.0f || dhdg < 70.0f) {
+            inbound = true;
+        } else if (acs[i].vrate_fpm > 200.0f || dhdg > 110.0f) {
+            inbound = false;
+        } else {
+            inbound = dhdg < 90.0f;
+        }
+        cands[nc++] = Cand{i, dst, inbound};
+    }
+    for (int i = 0; i + 1 < nc; i++) {
+        for (int j = i + 1; j < nc; j++) {
+            if (cands[j].dst < cands[i].dst) {
+                Cand t = cands[i];
+                cands[i] = cands[j];
+                cands[j] = t;
+            }
+        }
+    }
+
+    int na = 0, nd = 0;
+    for (int k = 0; k < nc; k++) {
+        const Aircraft &ac = acs[cands[k].idx];
+        if (cands[k].inbound) {
+            if (na < arr_max) {
+                fill_row(&arr[na], ac, cands[k].dst, true);
+                if (arr[na].valid) {
+                    na++;
+                }
+            }
+        } else if (nd < dep_max) {
+            fill_row(&dep[nd], ac, cands[k].dst, false);
+            if (dep[nd].valid) {
+                nd++;
+            }
+        }
+    }
+    if (arr_n) {
+        *arr_n = na;
+    }
+    if (dep_n) {
+        *dep_n = nd;
+    }
+    Serial.printf("ADS-B board %s: %d arr / %d dep (from %d near)\n", code, na, nd, nc);
+    return na > 0 || nd > 0;
+}
+
+bool net_build_airport_board_from_traffic(const char *icao, const Aircraft *ac, int ac_n,
+                                          AirportBoardRow *arr, int arr_max, int *arr_n,
+                                          AirportBoardRow *dep, int dep_max, int *dep_n, char *label_out,
+                                          size_t label_len, float *out_lat, float *out_lon) {
+    if (arr_n) {
+        *arr_n = 0;
+    }
+    if (dep_n) {
+        *dep_n = 0;
+    }
+    if (label_out && label_len) {
+        label_out[0] = 0;
+    }
+    if (out_lat) {
+        *out_lat = 0;
+    }
+    if (out_lon) {
+        *out_lon = 0;
+    }
+    if (!icao || !icao[0] || !arr || !dep || arr_max <= 0 || dep_max <= 0) {
+        set_err("Bad airport board args");
+        return false;
+    }
+    char code[8];
+    board_normalize_icao(icao, code, sizeof(code));
+    float lat = 0, lon = 0;
+    board_resolve_ll(code, &lat, &lon);
+    if (fabsf(lat) + fabsf(lon) < 0.01f) {
+        set_err("Airport not in DB");
+        return false;
+    }
+    if (out_lat) {
+        *out_lat = lat;
+    }
+    if (out_lon) {
+        *out_lon = lon;
+    }
+    if (label_out && label_len) {
+        snprintf(label_out, label_len, "%s (live)", code);
+    }
+    if (!board_fill_from_aircraft(code, lat, lon, ac, ac_n, arr, arr_max, arr_n, dep, dep_max, dep_n)) {
+        set_err("No traffic near airport");
+        return false;
+    }
+    return true;
+}
+
 bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max, int *arr_n,
                              AirportBoardRow *dep, int dep_max, int *dep_n, char *label_out,
-                             size_t label_len) {
-    // Reopen within ~3 min reuses last parse — second FA TLS right after a ~140KB
-    // download often fails with "TLS generic error" on this stack.
+                             size_t label_len, float *out_lat, float *out_lon) {
     static char s_cache_icao[8] = {0};
     static char s_cache_label[72] = {0};
     static AirportBoardRow s_cache_arr[FR_MAX_BOARD_ROWS];
     static AirportBoardRow s_cache_dep[FR_MAX_BOARD_ROWS];
     static int s_cache_an = 0;
     static int s_cache_dn = 0;
+    static float s_cache_lat = 0, s_cache_lon = 0;
     static uint32_t s_cache_ms = 0;
     static constexpr uint32_t kBoardCacheMs = 180000u;
 
@@ -3651,24 +4104,19 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
     if (label_out && label_len) {
         label_out[0] = 0;
     }
+    if (out_lat) {
+        *out_lat = 0;
+    }
+    if (out_lon) {
+        *out_lon = 0;
+    }
     if (!icao || !icao[0] || !arr || !dep || arr_max <= 0 || dep_max <= 0) {
         set_err("Bad airport board args");
         return false;
     }
+
     char code[8];
-    copy_trunc(code, sizeof(code), icao);
-    for (char *q = code; *q; q++) {
-        *q = (char)toupper((unsigned char)*q);
-    }
-    if (strlen(code) == 3) {
-        char icao4[8] = {0};
-        if (net_lookup_airport_iata(code, icao4, sizeof(icao4), nullptr, nullptr) && icao4[0]) {
-            copy_trunc(code, sizeof(code), icao4);
-        }
-    }
-    if (label_out && label_len) {
-        snprintf(label_out, label_len, "%s", code);
-    }
+    board_normalize_icao(icao, code, sizeof(code));
 
     if (s_cache_icao[0] && strcasecmp(s_cache_icao, code) == 0 && s_cache_ms &&
         (millis() - s_cache_ms) < kBoardCacheMs && (s_cache_an > 0 || s_cache_dn > 0)) {
@@ -3689,212 +4137,76 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
         if (label_out && label_len && s_cache_label[0]) {
             snprintf(label_out, label_len, "%s", s_cache_label);
         }
-        Serial.printf("FA board cache hit %s (%d arr / %d dep)\n", code, na, nd);
+        if (out_lat) {
+            *out_lat = s_cache_lat;
+        }
+        if (out_lon) {
+            *out_lon = s_cache_lon;
+        }
+        Serial.printf("Board cache hit %s (%d arr / %d dep)\n", code, na, nd);
         status_msg("Airport board (cached)");
         return true;
     }
 
+    float lat = 0, lon = 0;
+    board_resolve_ll(code, &lat, &lon);
+    if (fabsf(lat) + fabsf(lon) < 0.01f) {
+        set_err("Airport not in DB");
+        return false;
+    }
+
     status_msg("Airport board...");
-    char enc[16];
-    url_encode(code, enc, sizeof(enc));
-    char url[160];
-    snprintf(url, sizeof(url), "https://www.flightaware.com/live/airport/%s", enc);
-    // early_ok is stall-only (never mid-stream abort) — keeps partial HTML if boards are in.
-    auto fa_board_body_ok = [](const char *buf, size_t len) -> bool {
-        if (!buf || len < 4096) {
-            return false;
-        }
-        return strstr(buf, "id=\"enroute-board\"") != nullptr ||
-               strstr(buf, "id=\"arrivals-board\"") != nullptr ||
-               strstr(buf, "id=\"departures-board\"") != nullptr ||
-               strstr(buf, "id=\"scheduled-board\"") != nullptr;
-    };
-    bool got = false;
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        if (s_tls_last_close_ms) {
-            const uint32_t since = millis() - s_tls_last_close_ms;
-            if (since < 2500u) {
-                delay(2500u - since);
-            }
-        }
-        tls_close();
-        status_msg(attempt == 1 ? "Airport board..." : "Airport board retry...");
-        got = https_get(url, nullptr, kUaBrowser, 10000, 90000, "text/html,application/xhtml+xml,*/*",
-                        true, fa_board_body_ok);
-        if (got) {
-            break;
-        }
-        Serial.printf("FA board try %d fail: %s\n", attempt, g_last_err);
-        if (attempt == 1) {
-            delay(2500);
-            yield();
+    static Aircraft *s_board_ac = nullptr;
+    static constexpr int kBoardAcMax = 64;
+    if (!s_board_ac) {
+        s_board_ac = (Aircraft *)heap_caps_malloc(sizeof(Aircraft) * (size_t)kBoardAcMax,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_board_ac) {
+            s_board_ac = (Aircraft *)heap_caps_malloc(sizeof(Aircraft) * (size_t)kBoardAcMax, MALLOC_CAP_8BIT);
         }
     }
-    if (!got) {
+    if (!s_board_ac) {
+        set_err("Board OOM");
         return false;
     }
-    size_t blen = 0;
-    const char *html = http_body_buf(&blen);
-    if (!html || blen < 800) {
-        set_err("Airport board empty");
+    const int n_ac = net_fetch_aircraft(lat, lon, 40.0f, s_board_ac, (size_t)kBoardAcMax);
+    if (n_ac < 0) {
         return false;
     }
-    Serial.printf("FA airport body %u KB\n", (unsigned)(blen / 1024));
-    tls_close();
-
-    // Static / PSRAM scratch — keep large row buffers off internal DRAM + stack.
-    static AirportBoardRow s_board_tmp[FR_MAX_BOARD_ROWS];
-    static AirportBoardRow s_board_sched[FR_MAX_BOARD_ROWS];
-    // FA departures-board lists recent past first; upcoming often sit past row 20.
-    static constexpr int kDepParseMax = 40;
-    static AirportBoardRow *s_dep_raw = nullptr;
-    if (!s_dep_raw) {
-        s_dep_raw = (AirportBoardRow *)heap_caps_malloc(sizeof(AirportBoardRow) * (size_t)kDepParseMax,
-                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_dep_raw) {
-            s_dep_raw = (AirportBoardRow *)heap_caps_malloc(sizeof(AirportBoardRow) * (size_t)kDepParseMax,
-                                                            MALLOC_CAP_8BIT);
-        }
-    }
-    if (!s_dep_raw) {
-        set_err("Board parse OOM");
-        return false;
-    }
-    memset(s_dep_raw, 0, sizeof(AirportBoardRow) * (size_t)kDepParseMax);
-
-    int na = fa_parse_airport_board_section(html, "enroute-board", arr, arr_max, false);
-    if (na < arr_max) {
-        const int n2 = fa_parse_airport_board_section(html, "arrivals-board", s_board_tmp, FR_MAX_BOARD_ROWS, true);
-        for (int i = 0; i < n2 && na < arr_max; i++) {
-            bool dup = false;
-            for (int j = 0; j < na; j++) {
-                if (strcasecmp(arr[j].flight, s_board_tmp[i].flight) == 0) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup) {
-                arr[na++] = s_board_tmp[i];
-            }
-        }
-    }
-
-    const int n_raw = fa_parse_airport_board_section(html, "departures-board", s_dep_raw, kDepParseMax, false);
-    const int ns = fa_parse_airport_board_section(html, "scheduled-board", s_board_sched, FR_MAX_BOARD_ROWS, false);
-    const time_t now_t = time(nullptr);
-    const uint32_t now_u = (now_t > 1700000000) ? (uint32_t)now_t : 0;
-    auto dep_is_upcoming = [&](const AirportBoardRow &r) -> bool {
-        if (now_u && r.dep_epoch) {
-            // Keep not-yet-gone and up to 10 min past (boarding / late push).
-            return r.dep_epoch + 600u >= now_u;
-        }
-        return r.progress_pct < 100;
-    };
-    auto dep_already = [&](const AirportBoardRow *list, int n, const char *flight) -> bool {
-        for (int j = 0; j < n; j++) {
-            if (strcasecmp(list[j].flight, flight) == 0) {
-                return true;
-            }
-        }
-        return false;
-    };
-    int nd = 0;
-    // Prefer upcoming (scheduled + still-listed deps) so Next Hour is not empty.
-    for (int i = 0; i < ns && nd < dep_max; i++) {
-        if (!s_board_sched[i].flight[0] || !dep_is_upcoming(s_board_sched[i])) {
-            continue;
-        }
-        if (!dep_already(dep, nd, s_board_sched[i].flight)) {
-            dep[nd++] = s_board_sched[i];
-        }
-    }
-    for (int i = 0; i < n_raw && nd < dep_max; i++) {
-        if (!s_dep_raw[i].flight[0] || !dep_is_upcoming(s_dep_raw[i])) {
-            continue;
-        }
-        if (!dep_already(dep, nd, s_dep_raw[i].flight)) {
-            dep[nd++] = s_dep_raw[i];
-        }
-    }
-    // Fill remaining slots with recent past departures (board default look).
-    for (int i = 0; i < n_raw && nd < dep_max; i++) {
-        if (!s_dep_raw[i].flight[0] || dep_is_upcoming(s_dep_raw[i])) {
-            continue;
-        }
-        if (!dep_already(dep, nd, s_dep_raw[i].flight)) {
-            dep[nd++] = s_dep_raw[i];
-        }
-    }
-    if (arr_n) {
-        *arr_n = na;
-    }
-    if (dep_n) {
-        *dep_n = nd;
-    }
-
     if (label_out && label_len) {
-        const char *og = strstr(html, "og:description\" content=\"");
-        if (!og) {
-            og = strstr(html, "og:description\" content='");
-        }
-        if (og) {
-            const char *c = strstr(og, "content=\"");
-            if (c) {
-                c += 9;
-                char desc[120];
-                size_t di = 0;
-                while (c[di] && c[di] != '"' && di + 1 < sizeof(desc)) {
-                    desc[di] = c[di];
-                    di++;
-                }
-                desc[di] = 0;
-                char *paren = strchr(desc, '(');
-                if (paren) {
-                    *paren = 0;
-                }
-                trim_inplace(desc);
-                if (desc[0]) {
-                    snprintf(label_out, label_len, "%s (%s)", desc, code);
-                }
-            }
-        }
+        snprintf(label_out, label_len, "%s (ADS-B)", code);
     }
-
-    if (na > 0 || nd > 0) {
-        copy_trunc(s_cache_icao, sizeof(s_cache_icao), code);
-        s_cache_an = (na < FR_MAX_BOARD_ROWS) ? na : FR_MAX_BOARD_ROWS;
-        s_cache_dn = (nd < FR_MAX_BOARD_ROWS) ? nd : FR_MAX_BOARD_ROWS;
-        for (int i = 0; i < s_cache_an; i++) {
-            s_cache_arr[i] = arr[i];
-        }
-        for (int i = 0; i < s_cache_dn; i++) {
-            s_cache_dep[i] = dep[i];
-        }
-        if (label_out && label_out[0]) {
-            copy_trunc(s_cache_label, sizeof(s_cache_label), label_out);
-        } else {
-            copy_trunc(s_cache_label, sizeof(s_cache_label), code);
-        }
-        s_cache_ms = millis();
-    }
-    return na > 0 || nd > 0;
-}
-
-static bool apt_codes_match(const char *a, const char *b) {
-    if (!a || !b || !a[0] || !b[0]) {
+    if (!board_fill_from_aircraft(code, lat, lon, s_board_ac, n_ac, arr, arr_max, arr_n, dep, dep_max, dep_n)) {
+        set_err("No traffic near airport");
         return false;
     }
-    if (strcasecmp(a, b) == 0) {
-        return true;
+    if (out_lat) {
+        *out_lat = lat;
     }
-    // KATL ↔ ATL
-    if (strlen(a) == 4 && (a[0] == 'K' || a[0] == 'k') && strcasecmp(a + 1, b) == 0) {
-        return true;
+    if (out_lon) {
+        *out_lon = lon;
     }
-    if (strlen(b) == 4 && (b[0] == 'K' || b[0] == 'k') && strcasecmp(b + 1, a) == 0) {
-        return true;
+
+    const int na = arr_n ? *arr_n : 0;
+    const int nd = dep_n ? *dep_n : 0;
+    copy_trunc(s_cache_icao, sizeof(s_cache_icao), code);
+    s_cache_an = (na < FR_MAX_BOARD_ROWS) ? na : FR_MAX_BOARD_ROWS;
+    s_cache_dn = (nd < FR_MAX_BOARD_ROWS) ? nd : FR_MAX_BOARD_ROWS;
+    for (int i = 0; i < s_cache_an; i++) {
+        s_cache_arr[i] = arr[i];
     }
-    return false;
+    for (int i = 0; i < s_cache_dn; i++) {
+        s_cache_dep[i] = dep[i];
+    }
+    if (label_out && label_out[0]) {
+        copy_trunc(s_cache_label, sizeof(s_cache_label), label_out);
+    } else {
+        copy_trunc(s_cache_label, sizeof(s_cache_label), code);
+    }
+    s_cache_lat = lat;
+    s_cache_lon = lon;
+    s_cache_ms = millis();
+    return true;
 }
 
 static int route_push_unique(AirportBoardRow *out, int n, int out_max, const AirportBoardRow &row) {
