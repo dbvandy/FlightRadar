@@ -5,9 +5,7 @@
 #include <string.h>
 #include <strings.h>
 
-// Plates list: airports that ship a plate in /sdcard/fr_data/plates/*.frpl (see sd_pack).
-// RECOVERY NOTE: the original generated Class B list was never committed. This covers the
-// plates present in firmware/sd_pack/fr_data/plates; extend as plates are added.
+// Plates list for procedural Class B overlays (runway geometry). SD bitmaps removed.
 struct AirportPlateInfo {
     const char *icao;
     const char *iata;
@@ -42,7 +40,7 @@ static inline const AirportPlateInfo *airport_plate_at(int idx) {
     return (idx >= 0 && idx < AIRPORT_PLATE_COUNT) ? &kAirportPlates[idx] : nullptr;
 }
 
-// FAA plate bitmaps on SD (faa_plate_db.cpp).
+// Legacy FAA bitmap API (stubs — always empty without SD).
 const lv_img_dsc_t *faa_plate_lookup(const char *icao);
 const lv_img_dsc_t *faa_plate_peek(const char *icao);
 void faa_plate_request(const char *icao);

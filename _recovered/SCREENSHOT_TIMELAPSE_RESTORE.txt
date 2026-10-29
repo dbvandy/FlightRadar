@@ -1,40 +1,21 @@
-Restore Screen Grab + Timelapse (after Wi‑Fi/radar basics are solid)
-====================================================================
+Screen Grab + Timelapse + SD — REMOVED from tree after v1.1.1
+==============================================================
 
-1) firmware/include/fr_features.h
-   Set:
-     FR_ENABLE_SD 1
-     FR_ENABLE_SCREENSHOT 1
-     FR_ENABLE_TIMELAPSE 1
+Code for SD card, screen grab, SMTP email, and timelapse was deleted
+(not merely feature-flagged) to stabilize Wi‑Fi / ADS‑B.
 
-2) Screen grab flow (ui.cpp / main.cpp / net_client.cpp)
-   - UI button "Screen Shot" → begin_screenshot_email()
-   - Captures LVGL snapshot to BMP in PSRAM (g_state.screenshot_bmp)
-   - Sets UI_REQ_EMAIL_SCREENSHOT → net_task handle_email_screenshot()
-   - net_send_screenshot_email() / net_send_email_attachment() SMTP SSL:465
-   - Optional SD save via sd_write_grab_bmp() under /sdcard/fr_data/grabs/...
+To restore, check out an older tag and cherry-pick or copy:
 
-3) Timelapse flow
-   - Settings "Screen Grab Setup" checkbox enables Timelapse button mode
-   - timelapse_start_from_button() records cropped follow-view JPEG frames on SD
-   - On land (alt < 600) + 5 min OR press again → timelapse_finalize_and_email()
-   - timelapse_avi.cpp builds AVI; emailed as attachment (same SMTP path)
-   - Sources: firmware/src/app/timelapse_avi.cpp/.h, sd_store grab helpers
+  git show v1.1.1:firmware/src/app/ui.cpp
+  git show v1.1.0:...   (full SD pack + AVI/email era)
 
-4) SD databases
-   - ui_load_sd_databases() mounts SD and loads fr_data (airports/runways/etc.)
-   - net_install_fr_data() downloads pack from GitHub to SD
+Key pieces that lived in those tags:
+  - Screen Shot button → begin_screenshot_email() → SMTP
+  - Timelapse → timelapse_avi.cpp + SD JPEG frames → AVI email
+  - SD Card Setup → Update Data (net_install_fr_data) + file browser
+  - airports/runways/waypoints loaded from /sdcard/fr_data/*.bin
 
-5) Do NOT re-enable heap_caps_malloc_extmem_enable(64) or a large pre-WiFi
-   DMA reserve — those starved ESP-Hosted WiFi (Req_WifiInit timeout).
+After the strip, airport + runway DBs are flash-embedded again
+(airport_db.cpp / runway_db.cpp). Waypoints stay empty (FA route still works).
 
-6) Post-WiFi DMA park is OK: net_arm_tls_dma_after_wifi() after STA join.
-   TLS path releases that slab only for the handshake (esp-aes DMA).
-
-7) Traffic/airport scratch: keep in PSRAM (ensure_net_scratch), not BSS.
-
-8) HTTP chunk pushback must stay in PSRAM (was a 16 KB static BSS buffer that
-   starved esp-aes DMA → TLS handshake OK but body/header timeouts).
-
-9) After WiFi: heap_caps_malloc_extmem_enable(4096) is OK (large→PSRAM).
-   Never use enable(64) — that broke Req_WifiInit.
+Do NOT re-enable heap_caps_malloc_extmem_enable(64) or pre-WiFi DMA reserve.

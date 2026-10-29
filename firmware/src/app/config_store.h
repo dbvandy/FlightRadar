@@ -14,7 +14,6 @@ void config_save_show_cities(bool show);
 void config_save_county_mask(uint64_t mask);
 void config_save_brightness(int brightness);
 void config_save_volume(int volume);
-void config_save_email(const EmailConfig *email);
 
 // Plates list: user-added airports (ICAO + optional city) beyond the built-in list.
 void config_load_plate_extras(char ids[][FR_PLATE_EXTRA_ID_LEN], char cities[][FR_PLATE_EXTRA_CITY_LEN], int *n);

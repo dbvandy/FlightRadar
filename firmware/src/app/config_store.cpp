@@ -36,7 +36,6 @@ void config_load(AppConfig *cfg) {
     cfg->county_mask = kCountyMaskAll50;
     cfg->brightness = 100;
     cfg->volume = 60;
-    cfg->email.smtp_port = 465;
     if (!prefs.begin("fradar", true)) {
         cfg->startup_range_nm = cfg->range_nm;
         cfg->startup_max_alt_ft = cfg->max_alt_ft;
@@ -70,18 +69,6 @@ void config_load(AppConfig *cfg) {
     cfg->startup_show_airports = cfg->show_airports;
     cfg->startup_show_counties = cfg->show_counties;
     cfg->startup_show_cities = cfg->show_cities;
-
-    // Email (Screen Grab Setup).
-    prefs.getString("smtphost", cfg->email.smtp_host, sizeof(cfg->email.smtp_host));
-    cfg->email.smtp_port = (uint16_t)prefs.getUInt("smtpport", 465);
-    prefs.getString("smtpuser", cfg->email.username, sizeof(cfg->email.username));
-    prefs.getString("smtppass", cfg->email.password, sizeof(cfg->email.password));
-    prefs.getString("smtpfrom", cfg->email.from_addr, sizeof(cfg->email.from_addr));
-    prefs.getString("smtpto", cfg->email.to_addr, sizeof(cfg->email.to_addr));
-    cfg->email.timelapse = prefs.getBool("smtptl", false);
-    if (cfg->email.smtp_port == 0) {
-        cfg->email.smtp_port = 465;
-    }
     prefs.end();
 }
 
@@ -187,20 +174,6 @@ void config_save_volume(int volume) {
         return;
     }
     prefs.putInt("vol", clamp_pct(volume));
-    prefs.end();
-}
-
-void config_save_email(const EmailConfig *email) {
-    if (!email || !prefs.begin("fradar", false)) {
-        return;
-    }
-    prefs.putString("smtphost", email->smtp_host);
-    prefs.putUInt("smtpport", email->smtp_port ? email->smtp_port : 465);
-    prefs.putString("smtpuser", email->username);
-    prefs.putString("smtppass", email->password);
-    prefs.putString("smtpfrom", email->from_addr);
-    prefs.putString("smtpto", email->to_addr);
-    prefs.putBool("smtptl", email->timelapse);
     prefs.end();
 }
 

@@ -4,7 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 
-#define FR_VERSION_STR "1.1.1"
+#define FR_VERSION_STR "1.1.2"
 
 #define FR_MAX_AIRCRAFT 64
 #define FR_TRACK_NEARBY_MAX 40  // when following with Show Ac: closest N to tracked
@@ -174,17 +174,6 @@ struct GeoFix {
     bool from_zip;    // home chosen via US ZIP -> label is city name
 };
 
-// SMTP settings for Screen Shot / Timelapse email (Screen Grab Setup).
-struct EmailConfig {
-    char smtp_host[64];
-    uint16_t smtp_port;   // typically 465 (SSL)
-    char username[64];
-    char password[64];
-    char from_addr[64];
-    char to_addr[64];
-    bool timelapse;       // Screen Grab Setup: show Timelapse button (start on press)
-};
-
 struct AppConfig {
     char wifi_ssid[33];
     char wifi_pass[65];
@@ -203,7 +192,6 @@ struct AppConfig {
     uint64_t county_mask;  // bit i = show counties for kCountyStateAbbr[i] (0=AL ... 49=WY)
     int brightness;  // 0-100 backlight
     int volume;      // 0-100 click / UI audio
-    EmailConfig email;
 };
 
 // Persisted id lists (NVS) used by the plates / board / track pickers.

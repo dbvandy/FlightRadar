@@ -19,15 +19,12 @@ enum UiRequest : uint32_t {
     UI_REQ_SAVE_COUNTY_MASK = 1u << 13,
     UI_REQ_SAVE_BRIGHTNESS = 1u << 14,
     UI_REQ_SAVE_VOLUME = 1u << 15,
-    UI_REQ_SAVE_EMAIL = 1u << 16,
-    UI_REQ_EMAIL_SCREENSHOT = 1u << 17,  // net task emails screenshot_bmp (BMP or AVI)
     UI_REQ_TRACK_FLIGHT = 1u << 18,
     UI_REQ_SEARCH_AIRPORTS = 1u << 19,
     UI_REQ_FETCH_AIRPORT_BOARD = 1u << 20,
     UI_REQ_REFRESH_PLATE_CITIES = 1u << 21,
     UI_REQ_ROUTE_SEARCH = 1u << 22,
     UI_REQ_FETCH_ROUTE_FLIGHTS = 1u << 23,
-    UI_REQ_UPDATE_SD_DATA = 1u << 24,  // download plates+DBs from GitHub -> SD
 };
 
 struct SharedState {
@@ -83,12 +80,6 @@ struct SharedState {
     FlightInfo flight_info;
     FlightTrackPt flight_track[FR_MAX_TRACK_PTS];  // FA alt/gs history for follow chart
     int flight_track_n;
-    // Screenshot / timelapse email: buffer owned by UI until net task frees via
-    // ui_release_screenshot_bmp(). filename selects mime (radar.bmp / *.avi).
-    uint8_t *screenshot_bmp;
-    size_t screenshot_bmp_len;
-    char screenshot_filename[40];
-    bool screenshot_busy;
     Aircraft tracked_ac;
     bool tracked_ok;
     // Follow mode (UI -> net task): solo = ADS-B for tracked only; else nearby list.
@@ -116,8 +107,6 @@ void ui_init(SharedState *state);
 void ui_show_splash();
 /** Show splash and hold for ms (LVGL keeps refreshing). */
 void ui_wait_splash(uint32_t ms);
-/** Mount SD and load fr_data DBs into PSRAM (call outside LVGL lock). */
-void ui_load_sd_databases();
 void ui_show_wifi();
 void ui_show_wifi_joining(const char *ssid);
 void ui_hide_wifi_joining();
@@ -141,8 +130,4 @@ void ui_notify_plate_cities(bool ok);
 void ui_notify_route_search(bool ok, const char *msg);
 void ui_notify_route_flights(bool ok, const char *msg);
 void ui_notify_track_result(bool ok, const char *msg);
-void ui_notify_email_result(bool ok, const char *msg);
-void ui_notify_sd_data_result(bool ok, const char *msg);
-/** Free screenshot BMP after net task finishes (call under LVGL lock or from UI notify). */
-void ui_release_screenshot_bmp();
 void ui_set_status(const char *msg);

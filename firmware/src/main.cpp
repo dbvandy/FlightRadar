@@ -11,11 +11,8 @@
 #include "board_ctrl.h"
 #include "app/audio_click.h"
 #include "app/config_store.h"
-#include "app/faa_plate_db.h"
 #include "app/net_client.h"
-#include "app/sd_db.h"
 #include "app/ui.h"
-#include "fr_features.h"
 
 #ifdef BOARD_CROWPANEL_P4
 #include <esp_ldo_regulator.h>
@@ -294,59 +291,6 @@ static void handle_save_location() {
         ui_notify_home_label(fix.label);
     }
     lvgl_port_unlock();
-}
-
-static void handle_save_email() {
-    EmailConfig email{};
-    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
-    email = g_state.cfg.email;
-    xSemaphoreGive(g_state.mutex);
-    lvgl_port_lock(-1);
-    config_save_email(&email);
-    lvgl_port_unlock();
-}
-
-static void handle_email_screenshot() {
-#if FR_ENABLE_SCREENSHOT || FR_ENABLE_TIMELAPSE
-    uint8_t *bmp = nullptr;
-    size_t bmp_len = 0;
-    char fname[40] = {0};
-    EmailConfig email{};
-    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
-    bmp = g_state.screenshot_bmp;
-    bmp_len = g_state.screenshot_bmp_len;
-    strncpy(fname, g_state.screenshot_filename, sizeof(fname) - 1);
-    email = g_state.cfg.email;
-    xSemaphoreGive(g_state.mutex);
-    if (!bmp || bmp_len == 0) {
-        ui_notify_email_result(false, "No screenshot");
-        return;
-    }
-    if (!fname[0]) {
-        strncpy(fname, "radar.bmp", sizeof(fname) - 1);
-    }
-    const bool is_avi = strstr(fname, ".avi") || strstr(fname, ".AVI");
-    ui_set_status(is_avi ? "Emailing timelapse AVI…" : "Emailing screenshot…");
-    bool ok = false;
-    if (is_avi) {
-        ok = net_send_email_attachment(&email, bmp, bmp_len, fname, "video/x-msvideo",
-                                       "Flight Radar timelapse",
-                                       "Timelapse AVI from Flight Radar (records until 5 min after landing).");
-    } else {
-        ok = net_send_screenshot_email(&email, bmp, bmp_len);
-    }
-    const char *err = net_last_error();
-    char msg[96];
-    if (ok) {
-        snprintf(msg, sizeof(msg), "Emailed %s", fname);
-    } else {
-        snprintf(msg, sizeof(msg), "%s", err && err[0] ? err : "Email failed");
-    }
-    ui_notify_email_result(ok, msg);
-#else
-    ui_notify_email_result(false, "Screen grab disabled");
-    ui_release_screenshot_bmp();
-#endif
 }
 
 // Do not hold the LVGL lock across HTTPS — that freezes touch (zoom feels
@@ -810,7 +754,7 @@ static void handle_airport_board() {
     // Keep previous board rows until a successful fetch (reopen must not wipe UI).
     xSemaphoreGive(g_state.mutex);
 
-    // Static — avoid ~6KB stack on net_task after a large timelapse AVI free (was rebooting).
+    // Static — keep board rows off the net_task stack.
     static AirportBoardRow s_arr[FR_MAX_BOARD_ROWS];
     static AirportBoardRow s_dep[FR_MAX_BOARD_ROWS];
     char label[48] = {0};
@@ -1203,21 +1147,6 @@ static void net_task(void *arg) {
         if (req & UI_REQ_SAVE_LOCATION) {
             handle_save_location();
         }
-        if (req & UI_REQ_SAVE_EMAIL) {
-            handle_save_email();
-        }
-        if (req & UI_REQ_EMAIL_SCREENSHOT) {
-            handle_email_screenshot();
-        }
-        if (req & UI_REQ_UPDATE_SD_DATA) {
-            ui_set_status("Updating SD data from GitHub…");
-            const bool ok = net_install_fr_data();
-            if (ok) {
-                faa_plates_invalidate();
-                sd_db_reload();
-            }
-            ui_notify_sd_data_result(ok, ok ? "SD data updated" : net_last_error());
-        }
         if (req & UI_REQ_WIFI_SCAN) {
             handle_wifi_scan();
         }
@@ -1364,13 +1293,6 @@ void setup() {
 
     // Splash first (display-only). Wi-Fi starts after so STA join is not disrupted.
     ui_wait_splash(10000);  // 10s, or tap splash to skip
-
-#if FR_ENABLE_SD
-    // After splash / outside LVGL lock — avoids watchdog resets from slow SD I/O at boot.
-    ui_load_sd_databases();
-#else
-    Serial.println("[sd] disabled (FR_ENABLE_SD=0)");
-#endif
 
     // Leave internal heap alone for ESP-Hosted WiFi + TLS. Do NOT call
     // heap_caps_malloc_extmem_enable() — that diverted small allocs to PSRAM and

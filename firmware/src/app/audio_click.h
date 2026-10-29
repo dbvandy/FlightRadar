@@ -11,5 +11,5 @@ void audio_set_volume(int volume_pct);
 void audio_click_play();
 /** Camera shutter (Screen Shot). */
 void audio_shutter_play();
-/** Movie-projector gate clicks for duration_ms (timelapse start / email cue). */
+/** Movie-projector gate clicks for duration_ms. */
 void audio_projector_play(int duration_ms);

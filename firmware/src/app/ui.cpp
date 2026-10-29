@@ -3,16 +3,12 @@
 #include "audio_click.h"
 #include "board_ctrl.h"
 #include "config_store.h"
-#include "fr_features.h"
 #include "lvgl_v8_port.h"
 #include "city_db.h"
 #include "county_db.h"
 #include "airport_plate_db.h"
 #include "faa_plate_db.h"
 #include "map_db.h"
-#include "timelapse_avi.h"
-#include "sd_store.h"
-#include "sd_db.h"
 #include "net_client.h"
 #include "splash_img.h"
 #include "board_config.h"
@@ -48,34 +44,6 @@ static lv_obj_t *wifi_show_pw_cb = nullptr;
 static lv_obj_t *wifi_joining_overlay = nullptr;
 static lv_obj_t *wifi_joining_lbl = nullptr;
 static lv_obj_t *loc_panel = nullptr;
-static lv_obj_t *email_panel = nullptr;
-static lv_obj_t *sd_panel = nullptr;
-static lv_obj_t *sd_status_lbl = nullptr;
-static lv_obj_t *sd_path_lbl = nullptr;
-static lv_obj_t *sd_file_list = nullptr;
-static lv_obj_t *sd_preview_img = nullptr;
-static lv_obj_t *sd_format_confirm = nullptr;
-static char s_sd_cwd[160] = SD_MOUNT_POINT;
-static lv_img_dsc_t s_sd_preview_dsc {};
-static uint8_t *s_sd_preview_px = nullptr;
-static SdListEntry s_sd_entries[SD_MAX_LIST];
-static int s_sd_entry_n = 0;
-static lv_obj_t *email_host_ta = nullptr;
-static lv_obj_t *email_port_ta = nullptr;
-static lv_obj_t *email_user_ta = nullptr;
-static lv_obj_t *email_pass_ta = nullptr;
-static lv_obj_t *email_from_ta = nullptr;
-static lv_obj_t *email_to_ta = nullptr;
-static lv_obj_t *email_show_pw_cb = nullptr;
-static lv_obj_t *email_timelapse_cb = nullptr;
-static lv_obj_t *email_status = nullptr;
-static lv_obj_t *email_kb = nullptr;
-static lv_obj_t *email_kb_target = nullptr;
-static lv_timer_t *s_timelapse_finalize_timer = nullptr;  // one-shot: email AVI 5 min after land
-static lv_timer_t *s_timelapse_btn_flash_timer = nullptr;  // restore Timelapse btn after grab flash
-static bool s_timelapse_active = false;  // recording; started by Timelapse button
-static char s_tl_grab_folder[160] = {0};  // SD folder holding tl_NNN.jpg + timelapse.avi
-static bool s_email_syncing = false;
 static lv_obj_t *wifi_list = nullptr;
 static lv_obj_t *wifi_status = nullptr;
 static lv_obj_t *wifi_connected_lbl = nullptr;
@@ -197,7 +165,6 @@ static lv_obj_t *follow_panel = nullptr;
 static lv_obj_t *follow_info_lbl = nullptr;
 static lv_obj_t *follow_list_btn = nullptr;
 static lv_obj_t *follow_center_btn = nullptr;
-static lv_obj_t *screenshot_btn = nullptr;
 static lv_obj_t *follow_sched_lbl = nullptr;
 static lv_obj_t *follow_chart = nullptr;
 static lv_obj_t *follow_btn_row = nullptr;
@@ -668,11 +635,11 @@ static bool follow_ac_is_airborne(const Aircraft *ac) {
     return (ac->alt_ft - (float)elev) >= 100.0f;
 }
 
-/** Altitude gate for "landed" timelapse end (below 600 ft pressure/MSL). */
-static constexpr float kTimelapseLandAltFt = 600.0f;
+/** Altitude gate for "landed" (below 600 ft pressure/MSL). */
+static constexpr float kFollowLandAltFt = 600.0f;
 
-/** True when we should treat the flight as landed for the +5 min timelapse timer. */
-static bool follow_ac_is_landed_for_timelapse(const Aircraft *ac) {
+/** True when we should treat the flight as landed (freezes follow duration). */
+static bool follow_ac_is_landed(const Aircraft *ac) {
     if (!ac) {
         return true;
     }
@@ -680,27 +647,21 @@ static bool follow_ac_is_landed_for_timelapse(const Aircraft *ac) {
         return true;
     }
     // ADS-B often clears on_ground late; alt < 600 ft ⇒ assume down / short final done.
-    if (ac->alt_ft > 0.0f && ac->alt_ft < kTimelapseLandAltFt) {
+    if (ac->alt_ft > 0.0f && ac->alt_ft < kFollowLandAltFt) {
         return true;
     }
     return false;
 }
-
-static void timelapse_schedule_finalize_after_landing();
-static void timelapse_cancel_finalize_timer();
 
 /** Latch takeoff on first airborne sample; freeze duration when landed. */
 static void follow_note_airborne_sample(const Aircraft *ac) {
     if (!ac) {
         return;
     }
-    // Clearly airborne again (go-around / bounce) — cancel pending post-land finalize.
-    if (follow_ac_is_airborne(ac) && ac->alt_ft >= kTimelapseLandAltFt) {
+    // Clearly airborne again (go-around / bounce) — clear landed latch.
+    if (follow_ac_is_airborne(ac) && ac->alt_ft >= kFollowLandAltFt) {
         if (s_follow_takeoff_ms == 0) {
             s_follow_takeoff_ms = millis();
-        }
-        if (s_follow_land_ms != 0) {
-            timelapse_cancel_finalize_timer();
         }
         s_follow_land_ms = 0;
         return;
@@ -712,9 +673,8 @@ static void follow_note_airborne_sample(const Aircraft *ac) {
         }
         return;
     }
-    if (s_follow_takeoff_ms != 0 && s_follow_land_ms == 0 && follow_ac_is_landed_for_timelapse(ac)) {
+    if (s_follow_takeoff_ms != 0 && s_follow_land_ms == 0 && follow_ac_is_landed(ac)) {
         s_follow_land_ms = millis();
-        timelapse_schedule_finalize_after_landing();
     }
 }
 
@@ -1171,7 +1131,7 @@ static void board_set_airport_ll(const char *icao) {
             }
         }
     }
-    // Fallback: last airport-search hits (have lat/lon even if SD DB missed).
+    // Fallback: last airport-search hits (have lat/lon even if DB missed).
     if (!s_board_ll_ok) {
         for (int i = 0; i < s_apt_hit_n; i++) {
             if (!s_apt_hits[i].valid) {
@@ -1886,641 +1846,6 @@ static void update_adsb_clicked(lv_event_t *e) {
     request(UI_REQ_REFRESH_TRAFFIC | UI_REQ_REFRESH_AIRPORTS);
 }
 
-static void ui_release_screenshot_bmp_unlocked() {
-    if (!g_state) {
-        return;
-    }
-    if (g_state->screenshot_bmp) {
-        heap_caps_free(g_state->screenshot_bmp);
-        g_state->screenshot_bmp = nullptr;
-    }
-    g_state->screenshot_bmp_len = 0;
-    g_state->screenshot_filename[0] = 0;
-    g_state->screenshot_busy = false;
-}
-
-void ui_release_screenshot_bmp() {
-    if (!g_state) {
-        return;
-    }
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    ui_release_screenshot_bmp_unlocked();
-    xSemaphoreGive(g_state->mutex);
-}
-
-/** Build a Windows BMP (24-bit BGR) from an LVGL TRUE_COLOR snapshot. */
-static uint8_t *rgb565_snapshot_to_bmp(const lv_img_dsc_t *snap, size_t *out_len) {
-    if (!snap || !snap->data || snap->header.w <= 0 || snap->header.h <= 0 || !out_len) {
-        return nullptr;
-    }
-    const int w = snap->header.w;
-    const int h = snap->header.h;
-    const int stride = ((w * 3 + 3) / 4) * 4;
-    const size_t pix_bytes = (size_t)stride * (size_t)h;
-    const size_t total = 54 + pix_bytes;
-    uint8_t *bmp = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!bmp) {
-        bmp = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_8BIT);
-    }
-    if (!bmp) {
-        return nullptr;
-    }
-    memset(bmp, 0, 54);
-    bmp[0] = 'B';
-    bmp[1] = 'M';
-    bmp[2] = (uint8_t)(total);
-    bmp[3] = (uint8_t)(total >> 8);
-    bmp[4] = (uint8_t)(total >> 16);
-    bmp[5] = (uint8_t)(total >> 24);
-    bmp[10] = 54;
-    bmp[14] = 40;
-    bmp[18] = (uint8_t)(w);
-    bmp[19] = (uint8_t)(w >> 8);
-    bmp[20] = (uint8_t)(w >> 16);
-    bmp[21] = (uint8_t)(w >> 24);
-    bmp[22] = (uint8_t)(h);
-    bmp[23] = (uint8_t)(h >> 8);
-    bmp[24] = (uint8_t)(h >> 16);
-    bmp[25] = (uint8_t)(h >> 24);
-    bmp[26] = 1;
-    bmp[28] = 24;
-    bmp[34] = (uint8_t)(pix_bytes);
-    bmp[35] = (uint8_t)(pix_bytes >> 8);
-    bmp[36] = (uint8_t)(pix_bytes >> 16);
-    bmp[37] = (uint8_t)(pix_bytes >> 24);
-
-    const lv_color_t *src = (const lv_color_t *)snap->data;
-    for (int y = 0; y < h; y++) {
-        uint8_t *row = bmp + 54 + (size_t)(h - 1 - y) * (size_t)stride;
-        for (int x = 0; x < w; x++) {
-            const uint32_t c32 = lv_color_to32(src[y * w + x]);
-            row[x * 3 + 0] = (uint8_t)(c32 & 0xFF);          // B
-            row[x * 3 + 1] = (uint8_t)((c32 >> 8) & 0xFF);   // G
-            row[x * 3 + 2] = (uint8_t)((c32 >> 16) & 0xFF);  // R
-        }
-    }
-    *out_len = total;
-    return bmp;
-}
-
-static bool email_cfg_ready(const EmailConfig *e) {
-    return e && e->smtp_host[0] && e->from_addr[0] && e->to_addr[0] &&
-           (e->username[0] || e->from_addr[0]) && e->password[0];
-}
-
-/** Resolve grab folder "mmddyy FLIGHT" on SD (creates if needed). */
-static bool sd_current_grab_folder(char *out, size_t out_len) {
-    const char *flight =
-        s_follow_label[0] ? s_follow_label : (s_follow_hex[0] ? s_follow_hex : "UNKNOWN");
-    return sd_ensure_grab_folder(flight, s_tz_off_sec, out, out_len);
-}
-
-static void sd_refresh_file_list();
-
-/** If SD Card Setup is open, jump into folder and refresh so new BMPs appear live. */
-static void sd_viewer_show_folder(const char *folder) {
-    if (!folder || !folder[0] || !sd_panel) {
-        return;
-    }
-    if (lv_obj_has_flag(sd_panel, LV_OBJ_FLAG_HIDDEN)) {
-        return;
-    }
-    strncpy(s_sd_cwd, folder, sizeof(s_sd_cwd) - 1);
-    s_sd_cwd[sizeof(s_sd_cwd) - 1] = 0;
-    sd_refresh_file_list();
-}
-
-/** Manual Screen Shot: BMP → SD (and email if SMTP is configured). */
-static void begin_screenshot_email(bool quiet_if_busy) {
-#if !FR_ENABLE_SCREENSHOT
-    LV_UNUSED(quiet_if_busy);
-    if (radar_status) {
-        lv_label_set_text(radar_status, "Screen grab disabled");
-    }
-    return;
-#else
-    if (!g_state) {
-        return;
-    }
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    const bool busy = g_state->screenshot_busy;
-    EmailConfig email = g_state->cfg.email;
-    const bool wifi_ok = g_state->wifi_connected;
-    xSemaphoreGive(g_state->mutex);
-    if (busy) {
-        if (!quiet_if_busy && radar_status) {
-            lv_label_set_text(radar_status, "Screenshot busy…");
-        }
-        return;
-    }
-    const bool sd_ok = sd_mount();
-    const bool can_email = wifi_ok && email_cfg_ready(&email);
-    if (!sd_ok && !can_email) {
-        if (!quiet_if_busy && radar_status) {
-            lv_label_set_text(radar_status, "Insert SD or set up Screen Grab email");
-        }
-        return;
-    }
-    audio_shutter_play();
-    if (radar_status) {
-        lv_label_set_text(radar_status, "Capturing screen…");
-    }
-    lv_obj_t *scr = scr_radar ? scr_radar : lv_scr_act();
-    lv_img_dsc_t *snap = lv_snapshot_take(scr, LV_IMG_CF_TRUE_COLOR);
-    if (!snap) {
-        if (radar_status) {
-            lv_label_set_text(radar_status, "Screenshot failed (RAM)");
-        }
-        return;
-    }
-    size_t bmp_len = 0;
-    uint8_t *bmp = rgb565_snapshot_to_bmp(snap, &bmp_len);
-    lv_snapshot_free(snap);
-    if (!bmp) {
-        if (radar_status) {
-            lv_label_set_text(radar_status, "BMP encode failed (RAM)");
-        }
-        return;
-    }
-
-    bool saved_sd = false;
-    char sd_name[32] = {0};
-    char folder[160] = {0};
-    if (sd_ok) {
-        if (sd_current_grab_folder(folder, sizeof(folder)) &&
-            sd_write_grab_bmp(folder, bmp, bmp_len, sd_name, sizeof(sd_name))) {
-            saved_sd = true;
-            sd_viewer_show_folder(folder);
-        }
-    }
-
-    if (can_email) {
-        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-        ui_release_screenshot_bmp_unlocked();
-        g_state->screenshot_bmp = bmp;
-        g_state->screenshot_bmp_len = bmp_len;
-        strncpy(g_state->screenshot_filename, "radar.bmp", sizeof(g_state->screenshot_filename) - 1);
-        g_state->screenshot_busy = true;
-        xSemaphoreGive(g_state->mutex);
-        if (radar_status) {
-            lv_label_set_text(radar_status,
-                              saved_sd ? "Saved to SD — emailing…" : "Emailing screenshot…");
-        }
-        request(UI_REQ_EMAIL_SCREENSHOT);
-        return;
-    }
-
-    heap_caps_free(bmp);
-    if (radar_status) {
-        if (saved_sd) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "Saved %s to SD", sd_name[0] ? sd_name : "grab");
-            lv_label_set_text(radar_status, msg);
-        } else {
-            lv_label_set_text(radar_status, "SD save failed");
-        }
-    }
-#endif
-}
-
-static void update_screenshot_btn_label();
-static void timelapse_start_from_button();
-static void timelapse_stop_recording();
-static void timelapse_finalize_and_email();
-static void timelapse_flash_button();
-
-static void screenshot_clicked(lv_event_t *e) {
-    LV_UNUSED(e);
-#if !FR_ENABLE_SCREENSHOT && !FR_ENABLE_TIMELAPSE
-    if (radar_status) {
-        lv_label_set_text(radar_status, "Screen grab disabled");
-    }
-    return;
-#else
-    bool want_tl = false;
-    if (g_state) {
-        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-        want_tl = g_state->cfg.email.timelapse;
-        xSemaphoreGive(g_state->mutex);
-    }
-#if FR_ENABLE_TIMELAPSE
-    if (want_tl) {
-        timelapse_start_from_button();
-        return;
-    }
-#else
-    LV_UNUSED(want_tl);
-#endif
-#if FR_ENABLE_SCREENSHOT
-    begin_screenshot_email(false);
-#else
-    if (radar_status) {
-        lv_label_set_text(radar_status, "Screen grab disabled");
-    }
-#endif
-#endif
-}
-
-static void timelapse_btn_flash_restore_cb(lv_timer_t *t) {
-    LV_UNUSED(t);
-    s_timelapse_btn_flash_timer = nullptr;
-    if (!screenshot_btn) {
-        return;
-    }
-    lv_obj_set_style_bg_color(screenshot_btn, COL_BTN_HI, 0);
-    lv_obj_set_style_bg_grad_color(screenshot_btn, COL_BTN, 0);
-    lv_obj_set_style_border_color(screenshot_btn, COL_BTN_BORDER, 0);
-}
-
-/** Brief green flash on Timelapse button (after a grab is already taken). */
-static void timelapse_flash_button() {
-    if (!screenshot_btn) {
-        return;
-    }
-    lv_obj_set_style_bg_color(screenshot_btn, COL_GREEN, 0);
-    lv_obj_set_style_bg_grad_color(screenshot_btn, lv_color_hex(0x148A3C), 0);
-    lv_obj_set_style_border_color(screenshot_btn, lv_color_hex(0x7CFFA8), 0);
-    if (s_timelapse_btn_flash_timer) {
-        lv_timer_del(s_timelapse_btn_flash_timer);
-        s_timelapse_btn_flash_timer = nullptr;
-    }
-    s_timelapse_btn_flash_timer = lv_timer_create(timelapse_btn_flash_restore_cb, 180, nullptr);
-    if (s_timelapse_btn_flash_timer) {
-        lv_timer_set_repeat_count(s_timelapse_btn_flash_timer, 1);
-    }
-}
-
-/** Screen position (snapshot pixels) of the followed aircraft, using the radar projection. */
-static bool timelapse_follow_screen_xy(int *out_x, int *out_y) {
-    if (!out_x || !out_y || !s_follow_ac_ok || !radar_plot) {
-        return false;
-    }
-    lv_coord_t px, py;
-    // Plot-local position (same call the PPI draw uses); ignore the in-range flag so a
-    // slightly off-scope aircraft still biases the crop toward its edge.
-    map_point_ll(s_follow_ac.lat, s_follow_ac.lon, s_olat, s_olon, s_range, kRadarPlot, kRadarPlot, &px, &py);
-    lv_area_t plot_a, scr_a;
-    lv_obj_t *scr = scr_radar ? scr_radar : lv_scr_act();
-    lv_obj_get_coords(radar_plot, &plot_a);
-    lv_obj_get_coords(scr, &scr_a);
-    *out_x = (int)(plot_a.x1 - scr_a.x1) + (int)px;
-    *out_y = (int)(plot_a.y1 - scr_a.y1) + (int)py;
-    return true;
-}
-
-/**
- * Copy a FR_TL_W x FR_TL_H RGB565 window out of a full-screen snapshot, centered on
- * (cx,cy) and clamped to the snapshot bounds. Caller frees *out_buf with heap_caps_free.
- */
-static bool timelapse_crop_rgb565(const lv_img_dsc_t *snap, int cx, int cy, uint16_t **out_buf) {
-    if (!snap || !snap->data || !out_buf) {
-        return false;
-    }
-    const int sw = snap->header.w;
-    const int sh = snap->header.h;
-    if (sw < FR_TL_W || sh < FR_TL_H) {
-        return false;
-    }
-    int x0 = cx - FR_TL_W / 2;
-    int y0 = cy - FR_TL_H / 2;
-    if (x0 < 0) {
-        x0 = 0;
-    }
-    if (y0 < 0) {
-        y0 = 0;
-    }
-    if (x0 > sw - FR_TL_W) {
-        x0 = sw - FR_TL_W;
-    }
-    if (y0 > sh - FR_TL_H) {
-        y0 = sh - FR_TL_H;
-    }
-    const size_t bytes = (size_t)FR_TL_W * (size_t)FR_TL_H * sizeof(uint16_t);
-    uint16_t *dst = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!dst) {
-        dst = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
-    }
-    if (!dst) {
-        return false;
-    }
-    const uint16_t *src = (const uint16_t *)snap->data;
-    for (int y = 0; y < FR_TL_H; y++) {
-        memcpy(dst + (size_t)y * FR_TL_W, src + (size_t)(y0 + y) * sw + x0, (size_t)FR_TL_W * sizeof(uint16_t));
-    }
-    *out_buf = dst;
-    return true;
-}
-
-/** Capture one 200x200 aircraft-centered JPEG frame; also write Gnnn.BMP (same crop) to SD. */
-static void timelapse_capture_frame(bool flash_btn) {
-#if !FR_ENABLE_TIMELAPSE
-    LV_UNUSED(flash_btn);
-    return;
-#else
-    if (!g_state || !s_follow || !s_timelapse_active) {
-        return;
-    }
-    lv_obj_t *scr = scr_radar ? scr_radar : lv_scr_act();
-    lv_img_dsc_t *snap = lv_snapshot_take(scr, LV_IMG_CF_TRUE_COLOR);
-    if (!snap || !snap->data) {
-        if (snap) {
-            lv_snapshot_free(snap);
-        }
-        return;
-    }
-
-    // Crop center: followed aircraft on screen; fall back to snapshot center if unknown.
-    int cx = snap->header.w / 2;
-    int cy = snap->header.h / 2;
-    timelapse_follow_screen_xy(&cx, &cy);
-    uint16_t *crop = nullptr;
-    if (!timelapse_crop_rgb565(snap, cx, cy, &crop)) {
-        lv_snapshot_free(snap);
-        if (radar_status) {
-            lv_label_set_text(radar_status, "Timelapse crop failed");
-        }
-        return;
-    }
-    lv_snapshot_free(snap);  // full-screen snapshot no longer needed
-    lv_img_dsc_t crop_dsc{};
-    crop_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
-    crop_dsc.header.w = FR_TL_W;
-    crop_dsc.header.h = FR_TL_H;
-    crop_dsc.data_size = (uint32_t)FR_TL_W * FR_TL_H * sizeof(uint16_t);
-    crop_dsc.data = (const uint8_t *)crop;
-
-    // Persist a BMP on SD as each frame lands so the viewer lists files during capture.
-    char sd_name[32] = {0};
-    if (sd_mount()) {
-        char folder[160];
-        size_t bmp_len = 0;
-        uint8_t *bmp = rgb565_snapshot_to_bmp(&crop_dsc, &bmp_len);
-        if (bmp && sd_current_grab_folder(folder, sizeof(folder)) &&
-            sd_write_grab_bmp(folder, bmp, bmp_len, sd_name, sizeof(sd_name))) {
-            sd_viewer_show_folder(folder);
-        }
-        if (bmp) {
-            heap_caps_free(bmp);
-        }
-        // JPEG frames are staged on SD next to the BMPs; finalize streams them into the AVI.
-        if (sd_current_grab_folder(folder, sizeof(folder))) {
-            tl_set_storage_dir(folder);
-            strncpy(s_tl_grab_folder, folder, sizeof(s_tl_grab_folder) - 1);
-            s_tl_grab_folder[sizeof(s_tl_grab_folder) - 1] = 0;
-        }
-    }
-
-    const bool ok = tl_add_rgb565_frame(crop, FR_TL_W, FR_TL_H);
-    heap_caps_free(crop);
-    // Flash only after the grab is done so the flash itself is not in this frame.
-    if (ok && flash_btn) {
-        timelapse_flash_button();
-    }
-    if (radar_status) {
-        char msg[64];
-        if (ok) {
-            if (sd_name[0]) {
-                snprintf(msg, sizeof(msg), "Timelapse %d · %s", tl_frame_count(), sd_name);
-            } else {
-                snprintf(msg, sizeof(msg), "Timelapse %d frames", tl_frame_count());
-            }
-        } else {
-            snprintf(msg, sizeof(msg), "Timelapse frame failed");
-        }
-        lv_label_set_text(radar_status, msg);
-    }
-#endif
-}
-
-static void timelapse_cancel_finalize_timer() {
-    if (s_timelapse_finalize_timer) {
-        lv_timer_del(s_timelapse_finalize_timer);
-        s_timelapse_finalize_timer = nullptr;
-    }
-}
-
-static void timelapse_stop_recording() {
-    s_timelapse_active = false;
-    timelapse_cancel_finalize_timer();
-    if (s_timelapse_btn_flash_timer) {
-        lv_timer_del(s_timelapse_btn_flash_timer);
-        s_timelapse_btn_flash_timer = nullptr;
-        timelapse_btn_flash_restore_cb(nullptr);
-    }
-    tl_clear();
-}
-
-/** Press Timelapse: start recording; press again to end + email AVI. */
-static void timelapse_start_from_button() {
-#if !FR_ENABLE_TIMELAPSE
-    if (radar_status) {
-        lv_label_set_text(radar_status, "Timelapse disabled");
-    }
-    return;
-#else
-    if (!g_state) {
-        return;
-    }
-    if (s_timelapse_active) {
-        timelapse_finalize_and_email();
-        return;
-    }
-    EmailConfig em{};
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    em = g_state->cfg.email;
-    xSemaphoreGive(g_state->mutex);
-    const bool have_sd = sd_mount();
-    if (!email_cfg_ready(&em) && !have_sd) {
-        if (radar_status) {
-            lv_label_set_text(radar_status, "Insert SD or set up Screen Grab email");
-        }
-        return;
-    }
-    tl_clear();
-    s_tl_grab_folder[0] = 0;
-    timelapse_cancel_finalize_timer();
-    s_timelapse_active = true;
-    audio_projector_play(1000);  // 1 s start cue
-    if (radar_status) {
-        lv_label_set_text(radar_status,
-                          s_follow ? "Timelapse started — press again to end"
-                                   : "Timelapse armed — follow a flight; press again to end");
-    }
-#endif
-}
-
-/** Read a finished AVI back from SD into PSRAM for the SMTP task (caller/net frees it). */
-static uint8_t *tl_read_avi_file(const char *path, size_t len) {
-    if (!path || !path[0] || len == 0) {
-        return nullptr;
-    }
-    uint8_t *buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf) {
-        return nullptr;
-    }
-    sd_lock();
-    FILE *f = fopen(path, "rb");
-    size_t got = 0;
-    if (f) {
-        got = fread(buf, 1, len, f);
-        fclose(f);
-    }
-    sd_unlock();
-    if (got != len) {
-        heap_caps_free(buf);
-        return nullptr;
-    }
-    return buf;
-}
-
-/** Build AVI, email once, stop recording (keep Timelapse button preference). */
-static void timelapse_finalize_and_email() {
-#if !FR_ENABLE_TIMELAPSE
-    return;
-#else
-    timelapse_cancel_finalize_timer();
-    if (!g_state || !s_timelapse_active) {
-        return;
-    }
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    const bool busy = g_state->screenshot_busy;
-    const bool wifi_ok = g_state->wifi_connected;
-    EmailConfig email = g_state->cfg.email;
-    xSemaphoreGive(g_state->mutex);
-    // Final frame after the post-landing window.
-    timelapse_capture_frame(true);
-    if (tl_frame_count() <= 0) {
-        timelapse_stop_recording();
-        if (radar_status) {
-            lv_label_set_text(radar_status, "Timelapse: no frames");
-        }
-        return;
-    }
-    if (busy) {
-        if (radar_status) {
-            lv_label_set_text(radar_status, "Timelapse wait — email busy");
-        }
-        return;
-    }
-    const bool can_email_pre = wifi_ok && email_cfg_ready(&email);
-    const bool sd_ok_pre = sd_mount();
-    if (!can_email_pre && !sd_ok_pre) {
-        if (radar_status) {
-            lv_label_set_text(radar_status, "Insert SD or set up Screen Grab email");
-        }
-        return;
-    }
-    if (radar_status) {
-        lv_label_set_text(radar_status, "Building timelapse AVI…");
-    }
-    // Stream SD JPEG frames -> /<grab folder>/timelapse.avi (one frame in RAM at a time).
-    uint8_t *avi = nullptr;
-    size_t avi_len = 0;
-    char avi_path[192] = {0};
-    bool built = false;
-    if (s_tl_grab_folder[0]) {
-        snprintf(avi_path, sizeof(avi_path), "%s/timelapse.avi", s_tl_grab_folder);
-        built = tl_build_avi_to_file(avi_path, 5, &avi_len) && avi_len > 0;
-    }
-    if (!built) {
-        timelapse_stop_recording();
-        if (radar_status) {
-            lv_label_set_text(radar_status, "AVI build failed (SD)");
-        }
-        return;
-    }
-    const bool saved_sd = true;  // AVI is already on SD
-    // Only read the file back into RAM when we are going to email it.
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    const bool can_email = g_state->wifi_connected && email_cfg_ready(&g_state->cfg.email);
-    xSemaphoreGive(g_state->mutex);
-    if (can_email) {
-        avi = tl_read_avi_file(avi_path, avi_len);
-    }
-    char fname[40];
-    const char *id = s_follow_label[0] ? s_follow_label : (s_follow_hex[0] ? s_follow_hex : "flight");
-    char safe[24];
-    size_t j = 0;
-    for (size_t i = 0; id[i] && j + 1 < sizeof(safe); i++) {
-        const char c = id[i];
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
-            c == '-') {
-            safe[j++] = c;
-        }
-    }
-    safe[j] = 0;
-    if (!safe[0]) {
-        strncpy(safe, "flight", sizeof(safe) - 1);
-    }
-    snprintf(fname, sizeof(fname), "%s_timelapse.avi", safe);
-
-    if (can_email && avi) {
-        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-        ui_release_screenshot_bmp_unlocked();
-        g_state->screenshot_bmp = avi;
-        g_state->screenshot_bmp_len = avi_len;
-        strncpy(g_state->screenshot_filename, fname, sizeof(g_state->screenshot_filename) - 1);
-        g_state->screenshot_busy = true;
-        xSemaphoreGive(g_state->mutex);
-        timelapse_stop_recording();
-        // Short cue only — a 3s blocking I2S write here starved LVGL / next board open.
-        audio_projector_play(400);
-        if (radar_status) {
-            lv_label_set_text(radar_status,
-                              saved_sd ? "AVI on SD — emailing…" : "Emailing timelapse AVI…");
-        }
-        request(UI_REQ_EMAIL_SCREENSHOT);
-        return;
-    }
-
-    if (avi) {
-        heap_caps_free(avi);
-    }
-    timelapse_stop_recording();
-    audio_projector_play(400);
-    if (radar_status) {
-        lv_label_set_text(radar_status, saved_sd ? "Timelapse AVI saved to SD" : "AVI save failed");
-    }
-#endif
-}
-
-static void timelapse_finalize_timer_cb(lv_timer_t *t) {
-    LV_UNUSED(t);
-    s_timelapse_finalize_timer = nullptr;
-    timelapse_finalize_and_email();
-}
-
-/** Keep recording for 5 minutes after touchdown, then email AVI. */
-static void timelapse_schedule_finalize_after_landing() {
-    if (!s_timelapse_active) {
-        return;
-    }
-    timelapse_cancel_finalize_timer();
-    s_timelapse_finalize_timer = lv_timer_create(timelapse_finalize_timer_cb, 5 * 60 * 1000, nullptr);
-    if (s_timelapse_finalize_timer) {
-        lv_timer_set_repeat_count(s_timelapse_finalize_timer, 1);
-    }
-    if (radar_status) {
-        lv_label_set_text(radar_status, "Landed — timelapse +5 min…");
-    }
-}
-
-static void update_screenshot_btn_label() {
-    if (!screenshot_btn) {
-        return;
-    }
-    bool want_tl = false;
-    if (g_state) {
-        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-        want_tl = g_state->cfg.email.timelapse;
-        xSemaphoreGive(g_state->mutex);
-    }
-    lv_obj_t *lbl = lv_obj_get_child(screenshot_btn, 0);
-    if (lbl) {
-        lv_label_set_text(lbl, want_tl ? "Time\nlapse" : "Screen\nShot");
-    }
-}
-
 static void capture_home_from_cfg() {
     if (!g_state) {
         return;
@@ -2661,8 +1986,6 @@ static void update_follow_from_traffic() {
     trail_push(hit->lat, hit->lon);
     hist_push(hit->on_ground ? 0.0f : hit->alt_ft, hit->gs_kts);
     follow_note_airborne_sample(hit);
-    // One screen grab after each ADS-B position update (including 5 min post-land).
-    timelapse_capture_frame(true);
     follow_maybe_apply_speed_view(hit);
     follow_maybe_approach_zoom(hit);
 
@@ -5198,12 +4521,6 @@ static void goto_counties(lv_event_t *e) {
     if (sound_panel) {
         lv_obj_add_flag(sound_panel, LV_OBJ_FLAG_HIDDEN);
     }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    }
     if (county_panel) {
         sync_county_checkboxes();
         lv_obj_clear_flag(county_panel, LV_OBJ_FLAG_HIDDEN);
@@ -5249,566 +4566,6 @@ static void loc_ta_clicked(lv_event_t *e) {
     show_location_keyboard();
 }
 
-static void hide_email_panel(lv_event_t *e) {
-    LV_UNUSED(e);
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    // Leave Settings closed (same as other Settings selections).
-}
-
-static void sd_clear_preview() {
-    if (sd_preview_img) {
-        lv_img_set_src(sd_preview_img, nullptr);
-    }
-    if (s_sd_preview_px) {
-        heap_caps_free(s_sd_preview_px);
-        s_sd_preview_px = nullptr;
-    }
-    memset(&s_sd_preview_dsc, 0, sizeof(s_sd_preview_dsc));
-}
-
-static void sd_parent_path(char *out, size_t out_len, const char *path) {
-    if (!out || out_len == 0) {
-        return;
-    }
-    strncpy(out, path ? path : SD_MOUNT_POINT, out_len - 1);
-    out[out_len - 1] = 0;
-    char *slash = strrchr(out, '/');
-    if (!slash || strcmp(out, SD_MOUNT_POINT) == 0) {
-        strncpy(out, SD_MOUNT_POINT, out_len - 1);
-        out[out_len - 1] = 0;
-        return;
-    }
-    *slash = 0;
-    if (out[0] == 0 || strcmp(out, "/sdcard") == 0 || strncmp(out, SD_MOUNT_POINT, strlen(SD_MOUNT_POINT)) != 0) {
-        strncpy(out, SD_MOUNT_POINT, out_len - 1);
-        out[out_len - 1] = 0;
-    }
-}
-
-/** Load BMP from SD into a downscaled RGB565 preview for lv_img. */
-static bool sd_load_bmp_preview(const char *path) {
-    sd_clear_preview();
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return false;
-    }
-    uint8_t hdr[54];
-    if (fread(hdr, 1, 54, f) != 54 || hdr[0] != 'B' || hdr[1] != 'M') {
-        fclose(f);
-        return false;
-    }
-    const int w = (int)(hdr[18] | (hdr[19] << 8) | (hdr[20] << 16) | (hdr[21] << 24));
-    const int h_raw = (int)(hdr[22] | (hdr[23] << 8) | (hdr[24] << 16) | (hdr[25] << 24));
-    const int h = (h_raw < 0) ? -h_raw : h_raw;
-    const bool top_down = h_raw < 0;
-    const int bpp = hdr[28];
-    if (w < 8 || h < 8 || w > 2048 || h > 2048 || bpp != 24) {
-        fclose(f);
-        return false;
-    }
-    const int stride = ((w * 3 + 3) / 4) * 4;
-    const int max_w = 400;
-    const int max_h = 220;
-    int dw = w;
-    int dh = h;
-    if (dw > max_w || dh > max_h) {
-        const float sx = (float)max_w / (float)dw;
-        const float sy = (float)max_h / (float)dh;
-        const float s = (sx < sy) ? sx : sy;
-        dw = (int)(dw * s);
-        dh = (int)(dh * s);
-        if (dw < 1) {
-            dw = 1;
-        }
-        if (dh < 1) {
-            dh = 1;
-        }
-    }
-    uint8_t *row = (uint8_t *)malloc((size_t)stride);
-    uint16_t *px = (uint16_t *)heap_caps_malloc((size_t)dw * (size_t)dh * 2u,
-                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!row || !px) {
-        free(row);
-        if (px) {
-            heap_caps_free(px);
-        }
-        fclose(f);
-        return false;
-    }
-    const long pix_off = (long)(hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24));
-    for (int dy = 0; dy < dh; dy++) {
-        const int sy = (dy * h) / dh;
-        const int file_y = top_down ? sy : (h - 1 - sy);
-        if (fseek(f, pix_off + (long)file_y * (long)stride, SEEK_SET) != 0 ||
-            fread(row, 1, (size_t)stride, f) != (size_t)stride) {
-            free(row);
-            heap_caps_free(px);
-            fclose(f);
-            return false;
-        }
-        for (int dx = 0; dx < dw; dx++) {
-            const int sx = (dx * w) / dw;
-            const uint8_t b = row[sx * 3 + 0];
-            const uint8_t g = row[sx * 3 + 1];
-            const uint8_t r = row[sx * 3 + 2];
-            px[dy * dw + dx] =
-                (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-        }
-    }
-    free(row);
-    fclose(f);
-    s_sd_preview_px = (uint8_t *)px;
-    s_sd_preview_dsc.header.always_zero = 0;
-    s_sd_preview_dsc.header.w = (lv_coord_t)dw;
-    s_sd_preview_dsc.header.h = (lv_coord_t)dh;
-    s_sd_preview_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
-    s_sd_preview_dsc.data_size = (uint32_t)dw * (uint32_t)dh * 2u;
-    s_sd_preview_dsc.data = s_sd_preview_px;
-    if (sd_preview_img) {
-        lv_img_set_src(sd_preview_img, &s_sd_preview_dsc);
-    }
-    return true;
-}
-
-static void sd_refresh_status_lbl() {
-    if (sd_status_lbl) {
-        char line[160];
-        snprintf(line, sizeof(line), "%s | %s | plates %s", sd_status_text(), sd_db_status_text(),
-                 faa_plates_sd_ready() ? "OK" : "MISSING");
-        lv_label_set_text(sd_status_lbl, line);
-    }
-    if (sd_path_lbl) {
-        lv_label_set_text(sd_path_lbl, s_sd_cwd);
-    }
-}
-
-static void sd_file_clicked(lv_event_t *e);
-
-static void sd_refresh_file_list() {
-    if (!sd_file_list) {
-        return;
-    }
-    lv_obj_clean(sd_file_list);
-    s_sd_entry_n = sd_list_dir(s_sd_cwd, s_sd_entries, SD_MAX_LIST);
-    for (int i = 0; i < s_sd_entry_n; i++) {
-        char label[80];
-        if (s_sd_entries[i].is_dir) {
-            snprintf(label, sizeof(label), "[DIR] %s", s_sd_entries[i].name);
-        } else {
-            snprintf(label, sizeof(label), "%s", s_sd_entries[i].name);
-        }
-        lv_obj_t *btn = lv_list_add_btn(sd_file_list, nullptr, label);
-        lv_obj_set_user_data(btn, (void *)(intptr_t)i);
-        lv_obj_add_event_cb(btn, sd_file_clicked, LV_EVENT_CLICKED, nullptr);
-    }
-    sd_refresh_status_lbl();
-}
-
-static void sd_file_clicked(lv_event_t *e) {
-    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
-    const int idx = (int)(intptr_t)lv_obj_get_user_data(btn);
-    if (idx < 0 || idx >= s_sd_entry_n) {
-        return;
-    }
-    const SdListEntry *ent = &s_sd_entries[idx];
-    if (ent->is_dir) {
-        if (strcmp(ent->name, "..") == 0) {
-            char parent[160];
-            sd_parent_path(parent, sizeof(parent), s_sd_cwd);
-            strncpy(s_sd_cwd, parent, sizeof(s_sd_cwd) - 1);
-        } else {
-            char next[160];
-            sd_path_join(next, sizeof(next), s_sd_cwd, ent->name);
-            strncpy(s_sd_cwd, next, sizeof(s_sd_cwd) - 1);
-        }
-        s_sd_cwd[sizeof(s_sd_cwd) - 1] = 0;
-        sd_clear_preview();
-        sd_refresh_file_list();
-        return;
-    }
-    char path[192];
-    sd_path_join(path, sizeof(path), s_sd_cwd, ent->name);
-    const char *dot = strrchr(ent->name, '.');
-    if (dot && (strcasecmp(dot, ".bmp") == 0)) {
-        if (sd_load_bmp_preview(path)) {
-            if (sd_status_lbl) {
-                lv_label_set_text(sd_status_lbl, ent->name);
-            }
-        } else if (sd_status_lbl) {
-            lv_label_set_text(sd_status_lbl, "Preview failed");
-        }
-    } else if (dot && (strcasecmp(dot, ".avi") == 0)) {
-        sd_clear_preview();
-        if (sd_status_lbl) {
-            lv_label_set_text(sd_status_lbl, "AVI — copy to PC to play");
-        }
-    } else if (sd_status_lbl) {
-        lv_label_set_text(sd_status_lbl, "Select a .bmp to preview");
-    }
-}
-
-static void hide_sd_panel(lv_event_t *e) {
-    LV_UNUSED(e);
-    sd_clear_preview();
-    if (sd_format_confirm) {
-        lv_obj_add_flag(sd_format_confirm, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (sd_panel) {
-        lv_obj_add_flag(sd_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-static void sd_refresh_clicked(lv_event_t *e) {
-    LV_UNUSED(e);
-    sd_mount();
-    strncpy(s_sd_cwd, SD_MOUNT_POINT, sizeof(s_sd_cwd) - 1);
-    s_sd_cwd[sizeof(s_sd_cwd) - 1] = 0;
-    sd_clear_preview();
-    sd_refresh_file_list();
-}
-
-static void sd_update_clicked(lv_event_t *e) {
-    LV_UNUSED(e);
-    bool wifi_ok = false;
-    if (g_state) {
-        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-        wifi_ok = g_state->wifi_connected;
-        xSemaphoreGive(g_state->mutex);
-    }
-    if (!wifi_ok) {
-        if (sd_status_lbl) {
-            lv_label_set_text(sd_status_lbl, "Connect Wi-Fi first, then Update Data");
-        }
-        if (radar_status) {
-            lv_label_set_text(radar_status, "Update Data needs Wi-Fi");
-        }
-        return;
-    }
-    if (!sd_mount()) {
-        sd_refresh_status_lbl();
-        return;
-    }
-    if (sd_status_lbl) {
-        lv_label_set_text(sd_status_lbl, "Downloading plates + DBs from GitHub…");
-    }
-    if (radar_status) {
-        lv_label_set_text(radar_status, "Updating SD data…");
-    }
-    request(UI_REQ_UPDATE_SD_DATA);
-}
-
-static void sd_format_yes(lv_event_t *e) {
-    LV_UNUSED(e);
-    if (sd_format_confirm) {
-        lv_obj_add_flag(sd_format_confirm, LV_OBJ_FLAG_HIDDEN);
-    }
-    sd_clear_preview();
-    if (sd_status_lbl) {
-        lv_label_set_text(sd_status_lbl, "Formatting SD…");
-    }
-    lv_timer_handler();  // paint status
-    const bool ok = sd_format();
-    faa_plates_invalidate();
-    strncpy(s_sd_cwd, SD_MOUNT_POINT, sizeof(s_sd_cwd) - 1);
-    s_sd_cwd[sizeof(s_sd_cwd) - 1] = 0;
-    sd_refresh_file_list();
-    if (sd_status_lbl) {
-        lv_label_set_text(sd_status_lbl,
-                          ok ? "Formatted — tap Update Data (needs Wi-Fi)" : "Format failed");
-    }
-}
-
-static void sd_format_no(lv_event_t *e) {
-    LV_UNUSED(e);
-    if (sd_format_confirm) {
-        lv_obj_add_flag(sd_format_confirm, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-static void sd_format_clicked(lv_event_t *e) {
-    LV_UNUSED(e);
-    if (!sd_mount()) {
-        sd_refresh_status_lbl();
-        return;
-    }
-    if (sd_format_confirm) {
-        lv_obj_clear_flag(sd_format_confirm, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(sd_format_confirm);
-    }
-}
-
-static void open_sd_panel() {
-    if (settings_panel) {
-        lv_obj_add_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (sound_panel) {
-        lv_obj_add_flag(sound_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (county_panel) {
-        lv_obj_add_flag(county_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    sd_mount();
-    strncpy(s_sd_cwd, SD_MOUNT_POINT, sizeof(s_sd_cwd) - 1);
-    s_sd_cwd[sizeof(s_sd_cwd) - 1] = 0;
-    sd_clear_preview();
-    sd_refresh_file_list();
-    if (sd_panel) {
-        lv_obj_clear_flag(sd_panel, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(sd_panel);
-    }
-}
-
-static void goto_sd(lv_event_t *e) {
-    LV_UNUSED(e);
-    open_sd_panel();
-}
-
-/** Last username mirrored into From/To — only overwrite those fields while they still match. */
-static char s_email_auto_user[64] = {0};
-
-static void email_mirror_from_to_from_user() {
-    if (!email_user_ta) {
-        return;
-    }
-    const char *user = lv_textarea_get_text(email_user_ta);
-    if (!user) {
-        user = "";
-    }
-    const char *from = email_from_ta ? lv_textarea_get_text(email_from_ta) : "";
-    const char *to = email_to_ta ? lv_textarea_get_text(email_to_ta) : "";
-    if (email_from_ta && (!from[0] || strcmp(from, s_email_auto_user) == 0)) {
-        lv_textarea_set_text(email_from_ta, user);
-    }
-    if (email_to_ta && (!to[0] || strcmp(to, s_email_auto_user) == 0)) {
-        lv_textarea_set_text(email_to_ta, user);
-    }
-    strncpy(s_email_auto_user, user, sizeof(s_email_auto_user) - 1);
-    s_email_auto_user[sizeof(s_email_auto_user) - 1] = 0;
-}
-
-static void email_user_changed(lv_event_t *e) {
-    LV_UNUSED(e);
-    email_mirror_from_to_from_user();
-}
-
-static void sync_email_fields_from_cfg() {
-    if (!g_state) {
-        return;
-    }
-    EmailConfig e{};
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    e = g_state->cfg.email;
-    xSemaphoreGive(g_state->mutex);
-    if (email_host_ta) {
-        lv_textarea_set_text(email_host_ta, e.smtp_host);
-    }
-    if (email_port_ta) {
-        char port[8];
-        snprintf(port, sizeof(port), "%u", e.smtp_port ? e.smtp_port : 465);
-        lv_textarea_set_text(email_port_ta, port);
-    }
-    if (email_user_ta) {
-        lv_textarea_set_text(email_user_ta, e.username);
-    }
-    if (email_pass_ta) {
-        lv_textarea_set_text(email_pass_ta, e.password);
-        lv_textarea_set_password_mode(email_pass_ta, true);
-    }
-    if (email_show_pw_cb) {
-        lv_obj_clear_state(email_show_pw_cb, LV_STATE_CHECKED);
-    }
-    if (email_timelapse_cb) {
-        s_email_syncing = true;
-        if (e.timelapse) {
-            lv_obj_add_state(email_timelapse_cb, LV_STATE_CHECKED);
-        } else {
-            lv_obj_clear_state(email_timelapse_cb, LV_STATE_CHECKED);
-        }
-        s_email_syncing = false;
-    }
-    update_screenshot_btn_label();
-    // Prefer saved From/To; if blank, fill from username.
-    char from_fill[64];
-    char to_fill[64];
-    strncpy(from_fill, e.from_addr[0] ? e.from_addr : e.username, sizeof(from_fill) - 1);
-    from_fill[sizeof(from_fill) - 1] = 0;
-    strncpy(to_fill, e.to_addr[0] ? e.to_addr : e.username, sizeof(to_fill) - 1);
-    to_fill[sizeof(to_fill) - 1] = 0;
-    if (email_from_ta) {
-        lv_textarea_set_text(email_from_ta, from_fill);
-    }
-    if (email_to_ta) {
-        lv_textarea_set_text(email_to_ta, to_fill);
-    }
-    strncpy(s_email_auto_user, e.username, sizeof(s_email_auto_user) - 1);
-    s_email_auto_user[sizeof(s_email_auto_user) - 1] = 0;
-    if (email_status) {
-        if (email_cfg_ready(&e)) {
-            lv_label_set_text(email_status,
-                              e.timelapse ? "Saved — Timelapse button (press to start)"
-                                          : "Saved — Screen Shot emails to To address");
-        } else {
-            lv_label_set_text(email_status, "Enter SMTP host, login, From, To — then Save");
-        }
-    }
-}
-
-static void email_ta_focused(lv_event_t *e) {
-    lv_obj_t *ta = (lv_obj_t *)lv_event_get_target(e);
-    email_kb_target = ta;
-    if (!email_kb || !ta) {
-        return;
-    }
-    lv_keyboard_set_textarea(email_kb, ta);
-    lv_obj_clear_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(email_kb);
-}
-
-static void email_show_pass_changed(lv_event_t *e) {
-    LV_UNUSED(e);
-    if (!email_pass_ta || !email_show_pw_cb) {
-        return;
-    }
-    const bool show = lv_obj_has_state(email_show_pw_cb, LV_STATE_CHECKED);
-    lv_textarea_set_password_mode(email_pass_ta, !show);
-}
-
-static void email_save_clicked(lv_event_t *e) {
-    LV_UNUSED(e);
-    if (!g_state) {
-        return;
-    }
-    EmailConfig em{};
-    const char *host = email_host_ta ? lv_textarea_get_text(email_host_ta) : "";
-    const char *port_s = email_port_ta ? lv_textarea_get_text(email_port_ta) : "465";
-    const char *user = email_user_ta ? lv_textarea_get_text(email_user_ta) : "";
-    const char *pass = email_pass_ta ? lv_textarea_get_text(email_pass_ta) : "";
-    const char *from = email_from_ta ? lv_textarea_get_text(email_from_ta) : "";
-    const char *to = email_to_ta ? lv_textarea_get_text(email_to_ta) : "";
-    strncpy(em.smtp_host, host ? host : "", sizeof(em.smtp_host) - 1);
-    strncpy(em.username, user ? user : "", sizeof(em.username) - 1);
-    strncpy(em.password, pass ? pass : "", sizeof(em.password) - 1);
-    // Empty From/To → use username.
-    if (from && from[0]) {
-        strncpy(em.from_addr, from, sizeof(em.from_addr) - 1);
-    } else {
-        strncpy(em.from_addr, em.username, sizeof(em.from_addr) - 1);
-    }
-    if (to && to[0]) {
-        strncpy(em.to_addr, to, sizeof(em.to_addr) - 1);
-    } else {
-        strncpy(em.to_addr, em.username, sizeof(em.to_addr) - 1);
-    }
-    trim_inplace(em.smtp_host);
-    trim_inplace(em.username);
-    trim_inplace(em.from_addr);
-    trim_inplace(em.to_addr);
-    if (email_from_ta) {
-        lv_textarea_set_text(email_from_ta, em.from_addr);
-    }
-    if (email_to_ta) {
-        lv_textarea_set_text(email_to_ta, em.to_addr);
-    }
-    strncpy(s_email_auto_user, em.username, sizeof(s_email_auto_user) - 1);
-    s_email_auto_user[sizeof(s_email_auto_user) - 1] = 0;
-    int port = port_s ? atoi(port_s) : 465;
-    if (port <= 0 || port > 65535) {
-        port = 465;
-    }
-    em.smtp_port = (uint16_t)port;
-    em.timelapse = email_timelapse_cb && lv_obj_has_state(email_timelapse_cb, LV_STATE_CHECKED);
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    g_state->cfg.email = em;
-    xSemaphoreGive(g_state->mutex);
-    if (!em.timelapse) {
-        timelapse_stop_recording();
-    }
-    update_screenshot_btn_label();
-    request(UI_REQ_SAVE_EMAIL);
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    // Do not reopen Settings — Save dismisses the Screen Grab flow.
-}
-
-static void email_timelapse_changed(lv_event_t *e) {
-    LV_UNUSED(e);
-    if (s_email_syncing || !g_state || !email_timelapse_cb) {
-        return;
-    }
-    const bool on = lv_obj_has_state(email_timelapse_cb, LV_STATE_CHECKED);
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    g_state->cfg.email.timelapse = on;
-    EmailConfig em = g_state->cfg.email;
-    xSemaphoreGive(g_state->mutex);
-    if (!on) {
-        timelapse_stop_recording();
-    }
-    update_screenshot_btn_label();
-    // Persist toggle immediately so it survives reboot without another Save.
-    request(UI_REQ_SAVE_EMAIL);
-    if (email_status) {
-        if (on && !email_cfg_ready(&em)) {
-            lv_label_set_text(email_status, "Timelapse button — finish SMTP fields + Save");
-        } else if (on) {
-            lv_label_set_text(email_status, "Timelapse button ready — press Timelapse to start");
-        } else {
-            lv_label_set_text(email_status, "Screen Shot button restored");
-        }
-    }
-}
-
-static void open_email_panel() {
-    if (settings_panel) {
-        lv_obj_add_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (sound_panel) {
-        lv_obj_add_flag(sound_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (county_panel) {
-        lv_obj_add_flag(county_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (wifi_panel) {
-        lv_obj_add_flag(wifi_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (wifi_kb) {
-        lv_obj_add_flag(wifi_kb, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (loc_panel) {
-        lv_obj_add_flag(loc_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (loc_kb) {
-        lv_obj_add_flag(loc_kb, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    }
-    sync_email_fields_from_cfg();
-    if (email_panel) {
-        lv_obj_clear_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(email_panel);
-    }
-}
-
-static void goto_email(lv_event_t *e) {
-    LV_UNUSED(e);
-    open_email_panel();
-}
-
 static void open_wifi_panel() {
     if (settings_panel) {
         lv_obj_add_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
@@ -5818,12 +4575,6 @@ static void open_wifi_panel() {
     }
     if (county_panel) {
         lv_obj_add_flag(county_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
     }
     if (detail) {
         lv_obj_add_flag(detail, LV_OBJ_FLAG_HIDDEN);
@@ -5920,12 +4671,6 @@ static void goto_sound(lv_event_t *e) {
     if (county_panel) {
         lv_obj_add_flag(county_panel, LV_OBJ_FLAG_HIDDEN);
     }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    }
     if (sound_panel) {
         sync_sound_panel_controls();
         lv_obj_clear_flag(sound_panel, LV_OBJ_FLAG_HIDDEN);
@@ -5994,15 +4739,6 @@ static void open_settings(lv_event_t *e) {
     }
     if (county_panel) {
         lv_obj_add_flag(county_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (sd_panel) {
-        lv_obj_add_flag(sd_panel, LV_OBJ_FLAG_HIDDEN);
     }
     if (loc_kb) {
         lv_obj_add_flag(loc_kb, LV_OBJ_FLAG_HIDDEN);
@@ -6740,12 +5476,6 @@ static void goto_plates(lv_event_t *e) {
     if (settings_panel) {
         lv_obj_add_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
     }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    }
     if (!plates_panel) {
         return;
     }
@@ -6827,12 +5557,6 @@ static void goto_loc(lv_event_t *e) {
     }
     if (sound_panel) {
         lv_obj_add_flag(sound_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_panel) {
-        lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (email_kb) {
-        lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
     }
     if (county_panel) {
         lv_obj_add_flag(county_panel, LV_OBJ_FLAG_HIDDEN);
@@ -7976,24 +6700,6 @@ static void open_airport_board(lv_event_t *e) {
     if (!board_panel) {
         return;
     }
-    // After a big timelapse AVI email, PSRAM is tight — wait rather than stack-alloc fetch.
-    bool email_busy = false;
-    if (g_state) {
-        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-        email_busy = g_state->screenshot_busy;
-        xSemaphoreGive(g_state->mutex);
-    }
-    if (email_busy) {
-        if (radar_status) {
-            lv_label_set_text(radar_status, "Wait — finishing timelapse email…");
-        }
-        return;
-    }
-    // Drop any leftover timelapse frames before opening a heavy HTTPS panel.
-    if (!s_timelapse_active) {
-        tl_clear();
-    }
-
     hide_track(nullptr);
     hide_route_search(nullptr);
     config_load_board_history(s_board_hist, &s_board_hist_n);
@@ -9996,7 +8702,6 @@ static void build_radar() {
     lv_obj_add_event_cb(radar_plot, radar_clicked, LV_EVENT_CLICKED, nullptr);
 
     // Title / location / ADS-B status sit in the square corners (outside the circular PPI).
-    // Tap FLIGHT RADAR → screenshot (disabled while FR_ENABLE_SCREENSHOT=0).
     lv_obj_t *hdr = lv_label_create(scr_radar);
     lv_label_set_text(hdr, "FLIGHT RADAR");
     lv_label_set_long_mode(hdr, LV_LABEL_LONG_WRAP);
@@ -10004,10 +8709,6 @@ static void build_radar() {
     lv_obj_set_style_text_font(hdr, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(hdr, COL_GREEN, 0);
     lv_obj_align_to(hdr, radar_plot, LV_ALIGN_TOP_LEFT, 10, 8);
-#if FR_ENABLE_SCREENSHOT || FR_ENABLE_TIMELAPSE
-    lv_obj_add_flag(hdr, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(hdr, screenshot_clicked, LV_EVENT_CLICKED, nullptr);
-#endif
 
     lv_obj_t *ver_lbl = lv_label_create(scr_radar);
     lv_label_set_text(ver_lbl, FR_VERSION_STR);
@@ -10290,7 +8991,7 @@ static void build_radar() {
     lv_obj_align(city_toggle_btn, LV_ALIGN_LEFT_MID, +3 * (row_btn_w + 6), 0);
     update_city_toggle_label();
 
-    // Board | Dep/Arr | Screenshot (under Update ADS-B) | Hide County
+    // Board | Dep/Arr | (gap) | Hide County
     lv_obj_t *btn_row = make_ctrl_row(controls);
     lv_obj_t *board_btn = make_btn(btn_row, "Airport\nBoard", open_airport_board, nullptr);
     lv_obj_set_size(board_btn, row_btn_w, btn_h);
@@ -10304,16 +9005,6 @@ static void build_radar() {
     lv_obj_clear_flag(route_btn, LV_OBJ_FLAG_SCROLL_CHAIN);
     style_two_line_btn_label(route_btn, row_btn_w);
     lv_obj_align(route_btn, LV_ALIGN_RIGHT_MID, -2 * (row_btn_w + 6), 0);
-#if FR_ENABLE_SCREENSHOT || FR_ENABLE_TIMELAPSE
-    screenshot_btn = make_btn(btn_row, "Screen\nShot", screenshot_clicked, nullptr);
-    lv_obj_set_size(screenshot_btn, row_btn_w, btn_h);
-    lv_obj_set_style_radius(screenshot_btn, 6, 0);
-    lv_obj_clear_flag(screenshot_btn, LV_OBJ_FLAG_SCROLL_CHAIN);
-    style_two_line_btn_label(screenshot_btn, row_btn_w);
-    lv_obj_align(screenshot_btn, LV_ALIGN_RIGHT_MID, -(row_btn_w + 6), 0);
-#else
-    screenshot_btn = nullptr;
-#endif
     cty_toggle_btn = make_btn(btn_row, "Hide\nCounty", toggle_counties, nullptr);
     lv_obj_set_size(cty_toggle_btn, row_btn_w, btn_h);
     lv_obj_set_style_radius(cty_toggle_btn, 6, 0);
@@ -10355,7 +9046,7 @@ static void build_radar() {
     lv_obj_align(settings, LV_ALIGN_RIGHT_MID, 0, 0);
 
     settings_panel = lv_obj_create(scr_radar);
-    lv_obj_set_size(settings_panel, 360, 476);
+    lv_obj_set_size(settings_panel, 360, 340);
     lv_obj_center(settings_panel);
     lv_obj_set_style_bg_color(settings_panel, lv_color_hex(0x101810), 0);
     lv_obj_set_style_border_color(settings_panel, COL_GREEN, 0);
@@ -10382,273 +9073,17 @@ static void build_radar() {
     lv_obj_set_size(swifi, 320, 44);
     lv_obj_align(swifi, LV_ALIGN_TOP_MID, 0, 104);
 
-    lv_obj_t *semail = make_btn(settings_panel, "Screen Grab Setup", goto_email, nullptr);
-    lv_obj_set_size(semail, 320, 44);
-    lv_obj_align(semail, LV_ALIGN_TOP_MID, 0, 156);
-
-    lv_obj_t *ssd = make_btn(settings_panel, "SD Card Setup", goto_sd, nullptr);
-    lv_obj_set_size(ssd, 320, 44);
-    lv_obj_align(ssd, LV_ALIGN_TOP_MID, 0, 208);
-
     lv_obj_t *ssound = make_btn(settings_panel, "Display & Sound", goto_sound, nullptr);
     lv_obj_set_size(ssound, 320, 44);
-    lv_obj_align(ssound, LV_ALIGN_TOP_MID, 0, 260);
+    lv_obj_align(ssound, LV_ALIGN_TOP_MID, 0, 156);
 
     lv_obj_t *scounty = make_btn(settings_panel, "County Borders", goto_counties, nullptr);
     lv_obj_set_size(scounty, 320, 44);
-    lv_obj_align(scounty, LV_ALIGN_TOP_MID, 0, 312);
+    lv_obj_align(scounty, LV_ALIGN_TOP_MID, 0, 208);
 
     lv_obj_t *splates = make_btn(settings_panel, "Airport Plates", goto_plates, nullptr);
     lv_obj_set_size(splates, 320, 44);
-    lv_obj_align(splates, LV_ALIGN_TOP_MID, 0, 364);
-
-    // SD card setup: toolbar + file viewer for grabs / fr_data.
-    sd_panel = lv_obj_create(scr_radar);
-    lv_obj_set_size(sd_panel, 920, 520);
-    lv_obj_center(sd_panel);
-    lv_obj_set_style_bg_color(sd_panel, lv_color_hex(0x101810), 0);
-    lv_obj_set_style_border_color(sd_panel, COL_GREEN, 0);
-    lv_obj_set_style_radius(sd_panel, 12, 0);
-    lv_obj_set_style_pad_all(sd_panel, 8, 0);
-    lv_obj_clear_flag(sd_panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(sd_panel, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t *sdtitle = lv_label_create(sd_panel);
-    lv_label_set_text(sdtitle, "SD Card Setup");
-    lv_obj_set_style_text_font(sdtitle, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(sdtitle, COL_GREEN, 0);
-    lv_obj_align(sdtitle, LV_ALIGN_TOP_LEFT, 8, 4);
-
-    lv_obj_t *sdclose = make_btn(sd_panel, "Close", hide_sd_panel, nullptr);
-    lv_obj_set_size(sdclose, 90, 36);
-    lv_obj_align(sdclose, LV_ALIGN_TOP_RIGHT, -4, 4);
-
-    sd_status_lbl = lv_label_create(sd_panel);
-    lv_label_set_text(sd_status_lbl, "SD: —");
-    lv_obj_set_style_text_color(sd_status_lbl, COL_TEXT, 0);
-    lv_obj_set_style_text_font(sd_status_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_width(sd_status_lbl, 880);
-    lv_label_set_long_mode(sd_status_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(sd_status_lbl, LV_ALIGN_TOP_LEFT, 8, 44);
-
-    sd_path_lbl = lv_label_create(sd_panel);
-    lv_label_set_text(sd_path_lbl, SD_MOUNT_POINT);
-    lv_obj_set_style_text_color(sd_path_lbl, COL_DIM, 0);
-    lv_obj_set_style_text_font(sd_path_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_width(sd_path_lbl, 880);
-    lv_label_set_long_mode(sd_path_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(sd_path_lbl, LV_ALIGN_TOP_LEFT, 8, 68);
-
-    // Single toolbar row — no overlap with Close (Close stays on the title line).
-    lv_obj_t *sdrefresh = make_btn(sd_panel, "Refresh", sd_refresh_clicked, nullptr);
-    lv_obj_set_size(sdrefresh, 110, 40);
-    lv_obj_align(sdrefresh, LV_ALIGN_TOP_LEFT, 8, 92);
-
-    lv_obj_t *sdupd = make_btn(sd_panel, "Update Data", sd_update_clicked, nullptr);
-    lv_obj_set_size(sdupd, 150, 40);
-    lv_obj_align(sdupd, LV_ALIGN_TOP_LEFT, 126, 92);
-
-    lv_obj_t *sdfmt = make_btn(sd_panel, "Format SD", sd_format_clicked, nullptr);
-    lv_obj_set_size(sdfmt, 130, 40);
-    lv_obj_align(sdfmt, LV_ALIGN_TOP_LEFT, 284, 92);
-
-    lv_obj_t *sdhint = lv_label_create(sd_panel);
-    lv_label_set_text(sdhint, "Update Data pulls plates + DBs from GitHub after format / new card");
-    lv_obj_set_style_text_color(sdhint, COL_DIM, 0);
-    lv_obj_set_style_text_font(sdhint, &lv_font_montserrat_12, 0);
-    lv_obj_align(sdhint, LV_ALIGN_TOP_LEFT, 424, 100);
-
-    sd_file_list = lv_list_create(sd_panel);
-    lv_obj_set_size(sd_file_list, 420, 360);
-    lv_obj_align(sd_file_list, LV_ALIGN_BOTTOM_LEFT, 8, -8);
-    lv_obj_set_style_bg_color(sd_file_list, lv_color_hex(0x0A120C), 0);
-    lv_obj_set_style_border_color(sd_file_list, COL_DIM, 0);
-
-    lv_obj_t *prev_frame = lv_obj_create(sd_panel);
-    lv_obj_set_size(prev_frame, 460, 360);
-    lv_obj_align(prev_frame, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
-    lv_obj_set_style_bg_color(prev_frame, lv_color_hex(0x0A120C), 0);
-    lv_obj_set_style_border_color(prev_frame, COL_DIM, 0);
-    lv_obj_clear_flag(prev_frame, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *prev_lbl = lv_label_create(prev_frame);
-    lv_label_set_text(prev_lbl, "Preview");
-    lv_obj_set_style_text_color(prev_lbl, COL_DIM, 0);
-    lv_obj_set_style_text_font(prev_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_align(prev_lbl, LV_ALIGN_TOP_LEFT, 4, 2);
-
-    sd_preview_img = lv_img_create(prev_frame);
-    lv_obj_align(sd_preview_img, LV_ALIGN_CENTER, 0, 8);
-
-    sd_format_confirm = lv_obj_create(sd_panel);
-    lv_obj_set_size(sd_format_confirm, 420, 140);
-    lv_obj_center(sd_format_confirm);
-    lv_obj_set_style_bg_color(sd_format_confirm, lv_color_hex(0x1A1010), 0);
-    lv_obj_set_style_border_color(sd_format_confirm, lv_color_hex(0xE05050), 0);
-    lv_obj_set_style_radius(sd_format_confirm, 10, 0);
-    lv_obj_add_flag(sd_format_confirm, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t *fc_msg = lv_label_create(sd_format_confirm);
-    lv_label_set_text(fc_msg, "Format SD card?\nErases all files.");
-    lv_obj_set_style_text_color(fc_msg, COL_TEXT, 0);
-    lv_obj_set_style_text_align(fc_msg, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(fc_msg, LV_ALIGN_TOP_MID, 0, 16);
-
-    lv_obj_t *fc_yes = make_btn(sd_format_confirm, "Format", sd_format_yes, nullptr);
-    lv_obj_set_size(fc_yes, 120, 40);
-    lv_obj_align(fc_yes, LV_ALIGN_BOTTOM_LEFT, 24, -12);
-
-    lv_obj_t *fc_no = make_btn(sd_format_confirm, "Cancel", sd_format_no, nullptr);
-    lv_obj_set_size(fc_no, 120, 40);
-    lv_obj_align(fc_no, LV_ALIGN_BOTTOM_RIGHT, -24, -12);
-
-    // Email SMTP setup (used by Screen Shot + optional timelapse).
-    email_panel = lv_obj_create(scr_radar);
-    lv_obj_set_size(email_panel, 720, 460);
-    lv_obj_center(email_panel);
-    lv_obj_set_style_bg_color(email_panel, lv_color_hex(0x101810), 0);
-    lv_obj_set_style_border_color(email_panel, COL_GREEN, 0);
-    lv_obj_set_style_radius(email_panel, 12, 0);
-    lv_obj_set_style_pad_all(email_panel, 8, 0);
-    lv_obj_clear_flag(email_panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(email_panel, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t *etitle = lv_label_create(email_panel);
-    lv_label_set_text(etitle, "Screen Grab Setup");
-    lv_obj_set_style_text_font(etitle, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(etitle, COL_GREEN, 0);
-    lv_obj_align(etitle, LV_ALIGN_TOP_LEFT, 8, 4);
-
-    lv_obj_t *eclose = make_btn(email_panel, "Close", hide_email_panel, nullptr);
-    lv_obj_set_size(eclose, 90, 36);
-    lv_obj_align(eclose, LV_ALIGN_TOP_RIGHT, -4, 4);
-
-    lv_obj_t *ehint = lv_label_create(email_panel);
-    lv_label_set_text(ehint,
-                      "SMTP SSL (465). Check Timelapse to swap the Screen Shot button; press it to start (AVI emailed 5 min after landing).");
-    lv_obj_set_style_text_color(ehint, COL_TEXT, 0);
-    lv_obj_set_style_text_font(ehint, &lv_font_montserrat_12, 0);
-    lv_obj_align(ehint, LV_ALIGN_TOP_LEFT, 8, 42);
-
-    auto make_email_field = [&](const char *label, lv_coord_t y, lv_coord_t x, lv_coord_t w,
-                                lv_obj_t **ta_out, const char *placeholder, bool password) {
-        lv_obj_t *lbl = lv_label_create(email_panel);
-        lv_label_set_text(lbl, label);
-        lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, x, y);
-        lv_obj_t *ta = lv_textarea_create(email_panel);
-        lv_obj_set_size(ta, w, 36);
-        lv_obj_align(ta, LV_ALIGN_TOP_LEFT, x, y + 18);
-        lv_textarea_set_one_line(ta, true);
-        lv_textarea_set_placeholder_text(ta, placeholder);
-        lv_textarea_set_max_length(ta, 63);
-        if (password) {
-            lv_textarea_set_password_mode(ta, true);
-            lv_textarea_set_password_show_time(ta, 0);
-        }
-        lv_obj_add_event_cb(ta, email_ta_focused, LV_EVENT_CLICKED, nullptr);
-        lv_obj_add_event_cb(ta, email_ta_focused, LV_EVENT_FOCUSED, nullptr);
-        *ta_out = ta;
-    };
-    make_email_field("SMTP host", 68, 8, 420, &email_host_ta, "smtp.gmail.com", false);
-    make_email_field("Port", 68, 440, 120, &email_port_ta, "465", false);
-    make_email_field("Username", 130, 8, 340, &email_user_ta, "you@example.com", false);
-    make_email_field("Password", 130, 360, 340, &email_pass_ta, "app password", true);
-    make_email_field("From", 192, 8, 340, &email_from_ta, "you@example.com", false);
-    make_email_field("To", 192, 360, 340, &email_to_ta, "recipient@example.com", false);
-    if (email_user_ta) {
-        lv_obj_add_event_cb(email_user_ta, email_user_changed, LV_EVENT_VALUE_CHANGED, nullptr);
-    }
-
-    email_show_pw_cb = lv_checkbox_create(email_panel);
-    lv_checkbox_set_text(email_show_pw_cb, "Show password");
-    lv_obj_clear_state(email_show_pw_cb, LV_STATE_CHECKED);
-    lv_obj_set_style_text_color(email_show_pw_cb, COL_TEXT, 0);
-    lv_obj_set_style_text_font(email_show_pw_cb, &lv_font_montserrat_12, 0);
-    lv_obj_align(email_show_pw_cb, LV_ALIGN_TOP_LEFT, 8, 260);
-    lv_obj_add_event_cb(email_show_pw_cb, email_show_pass_changed, LV_EVENT_VALUE_CHANGED, nullptr);
-
-#if FR_ENABLE_TIMELAPSE
-    email_timelapse_cb = lv_checkbox_create(email_panel);
-    lv_checkbox_set_text(email_timelapse_cb,
-                         "Time lapse — Timelapse button: press to start, press again to end + email");
-    lv_obj_clear_state(email_timelapse_cb, LV_STATE_CHECKED);
-    style_startup_checkbox(email_timelapse_cb);
-    lv_obj_set_style_text_font(email_timelapse_cb, &lv_font_montserrat_12, 0);
-    lv_obj_align(email_timelapse_cb, LV_ALIGN_TOP_LEFT, 8, 292);
-    lv_obj_add_event_cb(email_timelapse_cb, email_timelapse_changed, LV_EVENT_VALUE_CHANGED, nullptr);
-#else
-    email_timelapse_cb = nullptr;
-#endif
-
-    lv_obj_t *esave = make_btn(email_panel, "Save", email_save_clicked, nullptr);
-    lv_obj_set_size(esave, 140, 40);
-    lv_obj_align(esave, LV_ALIGN_TOP_RIGHT, -8, 252);
-
-    email_status = lv_label_create(email_panel);
-    lv_label_set_text(email_status, "");
-    lv_obj_set_style_text_color(email_status, COL_GREEN, 0);
-    lv_obj_set_style_text_font(email_status, &lv_font_montserrat_12, 0);
-    lv_label_set_long_mode(email_status, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(email_status, 680);
-    lv_obj_align(email_status, LV_ALIGN_TOP_LEFT, 8, 330);
-
-    // Email keyboard: default LCGL layout + "@gmail.com" key (inserts into focused field).
-    static const char *kEmailKbLc[] = {
-        "1#", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", LV_SYMBOL_BACKSPACE, "\n",
-        "ABC", "a", "s", "d", "f", "g", "h", "j", "k", "l", LV_SYMBOL_NEW_LINE, "\n",
-        "_", "-", "z", "x", "c", "v", "b", "n", "m", ".", "@", ":", "\n",
-        LV_SYMBOL_CLOSE, "@gmail.com", " ", LV_SYMBOL_OK, "",
-    };
-    static const lv_btnmatrix_ctrl_t kEmailKbLcCtrl[] = {
-        LV_KEYBOARD_CTRL_BTN_FLAGS | 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 7,
-        LV_KEYBOARD_CTRL_BTN_FLAGS | 6, 3, 3, 3, 3, 3, 3, 3, 3, 3, 7,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        LV_KEYBOARD_CTRL_BTN_FLAGS | 2, 7, 6, LV_KEYBOARD_CTRL_BTN_FLAGS | 2,
-    };
-    static const char *kEmailKbUc[] = {
-        "1#", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", LV_SYMBOL_BACKSPACE, "\n",
-        "abc", "A", "S", "D", "F", "G", "H", "J", "K", "L", LV_SYMBOL_NEW_LINE, "\n",
-        "_", "-", "Z", "X", "C", "V", "B", "N", "M", ".", "@", ":", "\n",
-        LV_SYMBOL_CLOSE, "@gmail.com", " ", LV_SYMBOL_OK, "",
-    };
-    static const lv_btnmatrix_ctrl_t kEmailKbUcCtrl[] = {
-        LV_KEYBOARD_CTRL_BTN_FLAGS | 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 7,
-        LV_KEYBOARD_CTRL_BTN_FLAGS | 6, 3, 3, 3, 3, 3, 3, 3, 3, 3, 7,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        LV_KEYBOARD_CTRL_BTN_FLAGS | 2, 7, 6, LV_KEYBOARD_CTRL_BTN_FLAGS | 2,
-    };
-    static const char *kEmailKbSp[] = {
-        "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", LV_SYMBOL_BACKSPACE, "\n",
-        "abc", "+", "-", "/", "*", "=", "%", "!", "?", "#", "<", ">", "\n",
-        "\\", "@", "$", "(", ")", "{", "}", "[", "]", ";", "\"", "'", "\n",
-        LV_SYMBOL_CLOSE, "@gmail.com", " ", LV_SYMBOL_OK, "",
-    };
-    static const lv_btnmatrix_ctrl_t kEmailKbSpCtrl[] = {
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 7,
-        LV_KEYBOARD_CTRL_BTN_FLAGS | 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        LV_KEYBOARD_CTRL_BTN_FLAGS | 2, 7, 6, LV_KEYBOARD_CTRL_BTN_FLAGS | 2,
-    };
-
-    email_kb = lv_keyboard_create(scr_radar);
-    lv_obj_set_size(email_kb, 900, 220);
-    lv_obj_align(email_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_keyboard_set_map(email_kb, LV_KEYBOARD_MODE_TEXT_LOWER, kEmailKbLc, kEmailKbLcCtrl);
-    lv_keyboard_set_map(email_kb, LV_KEYBOARD_MODE_TEXT_UPPER, kEmailKbUc, kEmailKbUcCtrl);
-    lv_keyboard_set_map(email_kb, LV_KEYBOARD_MODE_SPECIAL, kEmailKbSp, kEmailKbSpCtrl);
-    lv_keyboard_set_mode(email_kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(
-        email_kb,
-        [](lv_event_t *e) {
-            const lv_event_code_t code = lv_event_get_code(e);
-            if ((code == LV_EVENT_READY || code == LV_EVENT_CANCEL) && email_kb) {
-                lv_obj_add_flag(email_kb, LV_OBJ_FLAG_HIDDEN);
-            }
-        },
-        LV_EVENT_ALL, nullptr);
+    lv_obj_align(splates, LV_ALIGN_TOP_MID, 0, 260);
 
     // Airport-plate browser: add/filter list + live preview + update.
     plates_panel = lv_obj_create(scr_radar);
@@ -11172,21 +9607,6 @@ void ui_wait_splash(uint32_t ms) {
     }
 }
 
-void ui_load_sd_databases() {
-    Serial.println("[sd] mounting…");
-    if (!sd_mount()) {
-        Serial.println("[sd] mount failed (card missing?)");
-        return;
-    }
-    Serial.println("[sd] loading fr_data DBs…");
-    const bool ok = sd_db_load();
-    Serial.printf("[sd] %s\n", sd_db_status_text());
-    if (!faa_plates_sd_ready()) {
-        Serial.println("[sd] plates missing — SD Card Setup → Update Data");
-    }
-    (void)ok;
-}
-
 void ui_init(SharedState *state) {
     g_state = state;
     capture_home_from_cfg();  // lock home before any pan overwrites cfg.location
@@ -11201,11 +9621,6 @@ void ui_init(SharedState *state) {
     build_radar();
     lv_scr_load(scr_radar);
     lvgl_port_set_pinch_zoom_cb(on_pinch_zoom);
-    if (g_state) {
-        update_screenshot_btn_label();
-    }
-    // SD mount + DB load happen after splash (see ui_load_sd_databases) so a slow
-    // card does not trip the watchdog while LVGL is locked in ui_init.
 }
 
 void ui_show_wifi() {
@@ -11444,9 +9859,9 @@ static bool radar_overlay_open() {
         return !o || lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN);
     };
     return !(hidden(detail) && hidden(wifi_panel) && hidden(loc_panel) && hidden(settings_panel) &&
-             hidden(sound_panel) && hidden(email_panel) && hidden(track_panel) && hidden(board_panel) &&
+             hidden(sound_panel) && hidden(track_panel) && hidden(board_panel) &&
              hidden(route_panel) && hidden(plates_panel) && hidden(wifi_kb) && hidden(loc_kb) &&
-             hidden(email_kb) && hidden(track_kb) && hidden(board_kb) && hidden(route_kb) &&
+             hidden(track_kb) && hidden(board_kb) && hidden(route_kb) &&
              hidden(plates_kb));
 }
 
@@ -11847,7 +10262,7 @@ void ui_notify_airport_board(bool ok, const char *msg) {
     }
 
     lvgl_port_lock(-1);
-    // Prefer lat/lon resolved during the board fetch (AWC/SD); fall back to local DB.
+    // Prefer lat/lon resolved during the board fetch (AWC); fall back to local DB.
     if (ok) {
         bool have_ll = false;
         float lat = 0, lon = 0;
@@ -11985,42 +10400,6 @@ void ui_notify_route_search(bool ok, const char *msg) {
     if (route_panel) {
         lv_obj_clear_flag(route_panel, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(route_panel);
-    }
-    lvgl_port_unlock();
-}
-
-void ui_notify_email_result(bool ok, const char *msg) {
-    lvgl_port_lock(-1);
-    ui_release_screenshot_bmp();
-    if (radar_status) {
-        lv_label_set_text(radar_status, msg ? msg : (ok ? "Email sent" : "Email failed"));
-    }
-    if (email_status && email_panel && !lv_obj_has_flag(email_panel, LV_OBJ_FLAG_HIDDEN)) {
-        lv_label_set_text(email_status, msg ? msg : (ok ? "Email sent" : "Email failed"));
-    }
-    lvgl_port_unlock();
-}
-
-void ui_notify_sd_data_result(bool ok, const char *msg) {
-    lvgl_port_lock(-1);
-    if (radar_status) {
-        lv_label_set_text(radar_status, msg ? msg : (ok ? "SD data updated" : "SD update failed"));
-    }
-    if (sd_status_lbl) {
-        if (ok) {
-            sd_refresh_status_lbl();
-            char line[160];
-            snprintf(line, sizeof(line), "%s — updated", sd_status_text());
-            lv_label_set_text(sd_status_lbl, line);
-        } else {
-            lv_label_set_text(sd_status_lbl, msg ? msg : "Update Data failed");
-        }
-    }
-    if (ok && sd_panel && !lv_obj_has_flag(sd_panel, LV_OBJ_FLAG_HIDDEN)) {
-        strncpy(s_sd_cwd, SD_MOUNT_POINT "/fr_data", sizeof(s_sd_cwd) - 1);
-        s_sd_cwd[sizeof(s_sd_cwd) - 1] = 0;
-        sd_clear_preview();
-        sd_refresh_file_list();
     }
     lvgl_port_unlock();
 }

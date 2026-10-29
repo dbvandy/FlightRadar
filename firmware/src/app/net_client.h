@@ -74,12 +74,4 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
 bool net_fetch_route_flights(const char *dep_icao, const char *arr_icao, AirportBoardRow *rows, int rows_max,
                              int *rows_n, char *label, size_t label_len);
 
-// Email (Screen Shot / Timelapse). SMTP over implicit TLS (port 465 style).
-bool net_send_email_attachment(const EmailConfig *email, const uint8_t *data, size_t len, const char *filename,
-                               const char *mime, const char *subject, const char *body_text);
-bool net_send_screenshot_email(const EmailConfig *email, const uint8_t *bmp, size_t bmp_len);
-
-/** Download the SD data pack (manifest.json + files) from FR_SD_DATA_BASE_URL to /sdcard/fr_data. */
-bool net_install_fr_data();
-
 void url_encode(const char *in, char *out, size_t out_len);
