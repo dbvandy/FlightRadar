@@ -65,7 +65,8 @@ static bool wifi_connect_sta(const char *ssid, const char *pass, uint32_t timeou
         delay(200);
     }
     if (WiFi.status() == WL_CONNECTED) {
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        // Multiple servers — clocks stay blank until time(nullptr) passes ~2023.
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
     }
     return WiFi.status() == WL_CONNECTED;
 }
@@ -756,8 +757,7 @@ static void handle_airport_board() {
     xSemaphoreTake(g_state.mutex, portMAX_DELAY);
     strncpy(icao, g_state.pending_board_icao, sizeof(icao) - 1);
     icao[sizeof(icao) - 1] = 0;
-    g_state.board_arr_n = 0;
-    g_state.board_dep_n = 0;
+    // Keep previous board rows until a successful fetch (reopen must not wipe UI).
     xSemaphoreGive(g_state.mutex);
 
     // Static — avoid ~6KB stack on net_task after a large timelapse AVI free (was rebooting).
@@ -769,23 +769,25 @@ static void handle_airport_board() {
     memset(s_dep, 0, sizeof(s_dep));
 
     ui_set_status("Loading airport board...");
+    ui_set_board_status("Loading FlightAware board...");
+    // Match GitHub flow: mute status spam during HTTPS (avoids LVGL lock fights).
     net_begin_psram_safe();
     const bool ok = net_fetch_airport_board(icao, s_arr, FR_MAX_BOARD_ROWS, &an, s_dep,
                                             FR_MAX_BOARD_ROWS, &dn, label, sizeof(label));
     net_end_psram_safe();
-
-    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
-    memcpy(g_state.board_arr, s_arr, sizeof(s_arr));
-    memcpy(g_state.board_dep, s_dep, sizeof(s_dep));
-    g_state.board_arr_n = an;
-    g_state.board_dep_n = dn;
-    strncpy(g_state.board_icao, icao, sizeof(g_state.board_icao) - 1);
-    g_state.board_icao[sizeof(g_state.board_icao) - 1] = 0;
-    strncpy(g_state.board_label, label[0] ? label : icao, sizeof(g_state.board_label) - 1);
-    g_state.board_label[sizeof(g_state.board_label) - 1] = 0;
-    xSemaphoreGive(g_state.mutex);
+    net_tls_reset();
 
     if (ok) {
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        memcpy(g_state.board_arr, s_arr, sizeof(s_arr));
+        memcpy(g_state.board_dep, s_dep, sizeof(s_dep));
+        g_state.board_arr_n = an;
+        g_state.board_dep_n = dn;
+        strncpy(g_state.board_icao, icao, sizeof(g_state.board_icao) - 1);
+        g_state.board_icao[sizeof(g_state.board_icao) - 1] = 0;
+        strncpy(g_state.board_label, label[0] ? label : icao, sizeof(g_state.board_label) - 1);
+        g_state.board_label[sizeof(g_state.board_label) - 1] = 0;
+        xSemaphoreGive(g_state.mutex);
         char msg[64];
         snprintf(msg, sizeof(msg), "%d arrivals · %d departures", an, dn);
         ui_notify_airport_board(true, msg);
@@ -963,6 +965,7 @@ static void handle_track_flight() {
     } else {
         cpy(sched_key, sizeof(sched_key), icao_cs);
     }
+    ui_set_status("Flight stats...");
     net_fetch_flight_schedule(sched_key, &fi);
     // Only fill missing endpoints — net_fetch_route clears its buffers and must not wipe FlightStats.
     if ((!fi.origin[0] || !fi.dest[0]) && icao_cs[0]) {
@@ -999,14 +1002,6 @@ static void handle_track_flight() {
             cpy(fi.reg, sizeof(fi.reg), meta_reg);
         }
     }
-    // Filed IFR waypoints + historical alt/gs track (FlightAware).
-    static FlightTrackPt s_fa_track2[FR_MAX_TRACK_PTS];
-    int track_n = 0;
-    if (icao_cs[0] || (iata_al[0] && iata_num[0])) {
-        const char *plan_key = icao_cs[0] ? icao_cs : sched_key;
-        net_fetch_flight_plan(plan_key, &fi, s_fa_track2, FR_MAX_TRACK_PTS, &track_n);
-    }
-    net_end_psram_safe();
 
     // Not departed (or no ADS-B): pin to departing airport and keep FlightStats status.
     const bool pin_origin = fi.origin[0] && (n <= 0 || (fi.schedule_ok && !fi.departed));
@@ -1038,6 +1033,7 @@ static void handle_track_flight() {
     }
 
     if (n <= 0) {
+        net_end_psram_safe();
         xSemaphoreTake(g_state.mutex, portMAX_DELAY);
         g_state.flight_info = fi;
         g_state.tracked_ok = false;
@@ -1056,17 +1052,12 @@ static void handle_track_flight() {
     }
     cpy(fi.flight, sizeof(fi.flight), ac.flight[0] ? ac.flight : icao_cs);
 
+    // Publish track ASAP so the UI is not stuck during the large FA HTML download.
     xSemaphoreTake(g_state.mutex, portMAX_DELAY);
     g_state.tracked_ac = ac;
     g_state.tracked_ok = true;
     g_state.flight_info = fi;
-    if (track_n > 0) {
-        const int ncopy = (track_n > FR_MAX_TRACK_PTS) ? FR_MAX_TRACK_PTS : track_n;
-        memcpy(g_state.flight_track, s_fa_track2, sizeof(FlightTrackPt) * (size_t)ncopy);
-        g_state.flight_track_n = ncopy;
-    } else {
-        g_state.flight_track_n = 0;
-    }
+    g_state.flight_track_n = 0;
     xSemaphoreGive(g_state.mutex);
     if (fi.schedule_ok && !fi.departed) {
         char msg[64];
@@ -1078,6 +1069,30 @@ static void handle_track_flight() {
         ui_notify_track_result(true, msg);
     } else {
         ui_notify_track_result(true, "Tracking");
+    }
+    ui_notify_flight_info();
+
+    // Filed IFR waypoints + historical alt/gs track (FlightAware) — after UI is live.
+    static FlightTrackPt s_fa_track2[FR_MAX_TRACK_PTS];
+    int track_n = 0;
+    if (icao_cs[0] || (iata_al[0] && iata_num[0])) {
+        ui_set_status("Loading route…");
+        const char *plan_key = icao_cs[0] ? icao_cs : sched_key;
+        net_fetch_flight_plan(plan_key, &fi, s_fa_track2, FR_MAX_TRACK_PTS, &track_n);
+    }
+    net_end_psram_safe();
+
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    g_state.flight_info = fi;
+    if (track_n > 0) {
+        const int ncopy = (track_n > FR_MAX_TRACK_PTS) ? FR_MAX_TRACK_PTS : track_n;
+        memcpy(g_state.flight_track, s_fa_track2, sizeof(FlightTrackPt) * (size_t)ncopy);
+        g_state.flight_track_n = ncopy;
+    }
+    xSemaphoreGive(g_state.mutex);
+    if (track_n > 0 || fi.route_wpt_n > 0) {
+        ui_notify_flight_info();
+        ui_set_status("Route loaded");
     }
 }
 

@@ -15,6 +15,7 @@
 #include "net_client.h"
 #include "splash_img.h"
 #include "board_config.h"
+#include <WiFi.h>
 #include <ctype.h>
 #include <esp_heap_caps.h>
 #include <math.h>
@@ -72,6 +73,7 @@ static lv_obj_t *email_kb_target = nullptr;
 static lv_timer_t *s_timelapse_finalize_timer = nullptr;  // one-shot: email AVI 5 min after land
 static lv_timer_t *s_timelapse_btn_flash_timer = nullptr;  // restore Timelapse btn after grab flash
 static bool s_timelapse_active = false;  // recording; started by Timelapse button
+static char s_tl_grab_folder[160] = {0};  // SD folder holding tl_NNN.jpg + timelapse.avi
 static bool s_email_syncing = false;
 static lv_obj_t *wifi_list = nullptr;
 static lv_obj_t *wifi_status = nullptr;
@@ -521,7 +523,7 @@ static int s_max_alt = 45000;
 static bool s_show_airports = true;
 static bool s_show_counties = true;
 static bool s_show_cities = true;
-static uint64_t s_county_mask = kCountyMaskDefault;
+static uint64_t s_county_mask = (1ULL << 50) - 1;  // all 50 states until config loads
 static lv_obj_t *apt_toggle_btn = nullptr;
 static lv_obj_t *cty_toggle_btn = nullptr;
 static lv_obj_t *city_toggle_btn = nullptr;
@@ -1247,6 +1249,28 @@ static void board_set_airport_ll(const char *icao) {
             }
         }
     }
+    // Fallback: last airport-search hits (have lat/lon even if SD DB missed).
+    if (!s_board_ll_ok) {
+        for (int i = 0; i < s_apt_hit_n; i++) {
+            if (!s_apt_hits[i].valid) {
+                continue;
+            }
+            if (strcasecmp(s_apt_hits[i].icao, icao) != 0 &&
+                strcasecmp(s_apt_hits[i].iata, icao) != 0) {
+                continue;
+            }
+            if (fabsf(s_apt_hits[i].lat) + fabsf(s_apt_hits[i].lon) > 0.01f) {
+                s_board_lat = s_apt_hits[i].lat;
+                s_board_lon = s_apt_hits[i].lon;
+                s_board_ll_ok = true;
+                if (s_apt_hits[i].icao[0]) {
+                    strncpy(s_board_icao, s_apt_hits[i].icao, sizeof(s_board_icao) - 1);
+                    s_board_icao[sizeof(s_board_icao) - 1] = 0;
+                }
+            }
+            break;
+        }
+    }
     refresh_board_clock_time();
 }
 
@@ -1284,6 +1308,18 @@ static void refresh_local_time_lbl() {
 
 static void clock_timer_cb(lv_timer_t *t) {
     LV_UNUSED(t);
+    // Retry NTP in the background if boot sync missed (clocks stay frozen otherwise).
+    static uint32_t s_ntp_retry_ms = 0;
+    const time_t now = time(nullptr);
+    if (now < 1700000000) {
+        const uint32_t ms = millis();
+        if (s_ntp_retry_ms == 0 || (ms - s_ntp_retry_ms) > 15000u) {
+            s_ntp_retry_ms = ms;
+            if (WiFi.status() == WL_CONNECTED) {
+                configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+            }
+        }
+    }
     refresh_local_time_lbl();
 }
 
@@ -2167,7 +2203,68 @@ static void timelapse_flash_button() {
     }
 }
 
-/** Capture one JPEG frame into the timelapse buffer; also write grab_NNN.bmp to SD. */
+/** Screen position (snapshot pixels) of the followed aircraft, using the radar projection. */
+static bool timelapse_follow_screen_xy(int *out_x, int *out_y) {
+    if (!out_x || !out_y || !s_follow_ac_ok || !radar_plot) {
+        return false;
+    }
+    lv_coord_t px, py;
+    // Plot-local position (same call the PPI draw uses); ignore the in-range flag so a
+    // slightly off-scope aircraft still biases the crop toward its edge.
+    map_point_ll(s_follow_ac.lat, s_follow_ac.lon, s_olat, s_olon, s_range, kRadarPlot, kRadarPlot, &px, &py);
+    lv_area_t plot_a, scr_a;
+    lv_obj_t *scr = scr_radar ? scr_radar : lv_scr_act();
+    lv_obj_get_coords(radar_plot, &plot_a);
+    lv_obj_get_coords(scr, &scr_a);
+    *out_x = (int)(plot_a.x1 - scr_a.x1) + (int)px;
+    *out_y = (int)(plot_a.y1 - scr_a.y1) + (int)py;
+    return true;
+}
+
+/**
+ * Copy a FR_TL_W x FR_TL_H RGB565 window out of a full-screen snapshot, centered on
+ * (cx,cy) and clamped to the snapshot bounds. Caller frees *out_buf with heap_caps_free.
+ */
+static bool timelapse_crop_rgb565(const lv_img_dsc_t *snap, int cx, int cy, uint16_t **out_buf) {
+    if (!snap || !snap->data || !out_buf) {
+        return false;
+    }
+    const int sw = snap->header.w;
+    const int sh = snap->header.h;
+    if (sw < FR_TL_W || sh < FR_TL_H) {
+        return false;
+    }
+    int x0 = cx - FR_TL_W / 2;
+    int y0 = cy - FR_TL_H / 2;
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (x0 > sw - FR_TL_W) {
+        x0 = sw - FR_TL_W;
+    }
+    if (y0 > sh - FR_TL_H) {
+        y0 = sh - FR_TL_H;
+    }
+    const size_t bytes = (size_t)FR_TL_W * (size_t)FR_TL_H * sizeof(uint16_t);
+    uint16_t *dst = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!dst) {
+        dst = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    }
+    if (!dst) {
+        return false;
+    }
+    const uint16_t *src = (const uint16_t *)snap->data;
+    for (int y = 0; y < FR_TL_H; y++) {
+        memcpy(dst + (size_t)y * FR_TL_W, src + (size_t)(y0 + y) * sw + x0, (size_t)FR_TL_W * sizeof(uint16_t));
+    }
+    *out_buf = dst;
+    return true;
+}
+
+/** Capture one 200x200 aircraft-centered JPEG frame; also write Gnnn.BMP (same crop) to SD. */
 static void timelapse_capture_frame(bool flash_btn) {
     if (!g_state || !s_follow || !s_timelapse_active) {
         return;
@@ -2181,12 +2278,32 @@ static void timelapse_capture_frame(bool flash_btn) {
         return;
     }
 
+    // Crop center: followed aircraft on screen; fall back to snapshot center if unknown.
+    int cx = snap->header.w / 2;
+    int cy = snap->header.h / 2;
+    timelapse_follow_screen_xy(&cx, &cy);
+    uint16_t *crop = nullptr;
+    if (!timelapse_crop_rgb565(snap, cx, cy, &crop)) {
+        lv_snapshot_free(snap);
+        if (radar_status) {
+            lv_label_set_text(radar_status, "Timelapse crop failed");
+        }
+        return;
+    }
+    lv_snapshot_free(snap);  // full-screen snapshot no longer needed
+    lv_img_dsc_t crop_dsc{};
+    crop_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+    crop_dsc.header.w = FR_TL_W;
+    crop_dsc.header.h = FR_TL_H;
+    crop_dsc.data_size = (uint32_t)FR_TL_W * FR_TL_H * sizeof(uint16_t);
+    crop_dsc.data = (const uint8_t *)crop;
+
     // Persist a BMP on SD as each frame lands so the viewer lists files during capture.
     char sd_name[32] = {0};
     if (sd_mount()) {
         char folder[160];
         size_t bmp_len = 0;
-        uint8_t *bmp = rgb565_snapshot_to_bmp(snap, &bmp_len);
+        uint8_t *bmp = rgb565_snapshot_to_bmp(&crop_dsc, &bmp_len);
         if (bmp && sd_current_grab_folder(folder, sizeof(folder)) &&
             sd_write_grab_bmp(folder, bmp, bmp_len, sd_name, sizeof(sd_name))) {
             sd_viewer_show_folder(folder);
@@ -2194,11 +2311,16 @@ static void timelapse_capture_frame(bool flash_btn) {
         if (bmp) {
             heap_caps_free(bmp);
         }
+        // JPEG frames are staged on SD next to the BMPs; finalize streams them into the AVI.
+        if (sd_current_grab_folder(folder, sizeof(folder))) {
+            tl_set_storage_dir(folder);
+            strncpy(s_tl_grab_folder, folder, sizeof(s_tl_grab_folder) - 1);
+            s_tl_grab_folder[sizeof(s_tl_grab_folder) - 1] = 0;
+        }
     }
 
-    const bool ok =
-        tl_add_rgb565_frame((const uint16_t *)snap->data, snap->header.w, snap->header.h);
-    lv_snapshot_free(snap);
+    const bool ok = tl_add_rgb565_frame(crop, FR_TL_W, FR_TL_H);
+    heap_caps_free(crop);
     // Flash only after the grab is done so the flash itself is not in this frame.
     if (ok && flash_btn) {
         timelapse_flash_button();
@@ -2257,6 +2379,7 @@ static void timelapse_start_from_button() {
         return;
     }
     tl_clear();
+    s_tl_grab_folder[0] = 0;
     timelapse_cancel_finalize_timer();
     s_timelapse_active = true;
     audio_projector_play(1000);  // 1 s start cue
@@ -2265,6 +2388,30 @@ static void timelapse_start_from_button() {
                           s_follow ? "Timelapse started — press again to end"
                                    : "Timelapse armed — follow a flight; press again to end");
     }
+}
+
+/** Read a finished AVI back from SD into PSRAM for the SMTP task (caller/net frees it). */
+static uint8_t *tl_read_avi_file(const char *path, size_t len) {
+    if (!path || !path[0] || len == 0) {
+        return nullptr;
+    }
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        return nullptr;
+    }
+    sd_lock();
+    FILE *f = fopen(path, "rb");
+    size_t got = 0;
+    if (f) {
+        got = fread(buf, 1, len, f);
+        fclose(f);
+    }
+    sd_unlock();
+    if (got != len) {
+        heap_caps_free(buf);
+        return nullptr;
+    }
+    return buf;
 }
 
 /** Build AVI, email once, stop recording (keep Timelapse button preference). */
@@ -2304,15 +2451,29 @@ static void timelapse_finalize_and_email() {
     if (radar_status) {
         lv_label_set_text(radar_status, "Building timelapse AVI…");
     }
+    // Stream SD JPEG frames -> /<grab folder>/timelapse.avi (one frame in RAM at a time).
     uint8_t *avi = nullptr;
     size_t avi_len = 0;
-    if (!tl_build_avi(&avi, &avi_len, 5) || !avi || avi_len == 0) {
-        // Frames may already be cleared by a partial build attempt.
+    char avi_path[192] = {0};
+    bool built = false;
+    if (s_tl_grab_folder[0]) {
+        snprintf(avi_path, sizeof(avi_path), "%s/timelapse.avi", s_tl_grab_folder);
+        built = tl_build_avi_to_file(avi_path, 5, &avi_len) && avi_len > 0;
+    }
+    if (!built) {
         timelapse_stop_recording();
         if (radar_status) {
-            lv_label_set_text(radar_status, "AVI build failed (low memory)");
+            lv_label_set_text(radar_status, "AVI build failed (SD)");
         }
         return;
+    }
+    const bool saved_sd = true;  // AVI is already on SD
+    // Only read the file back into RAM when we are going to email it.
+    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+    const bool can_email = g_state->wifi_connected && email_cfg_ready(&g_state->cfg.email);
+    xSemaphoreGive(g_state->mutex);
+    if (can_email) {
+        avi = tl_read_avi_file(avi_path, avi_len);
     }
     char fname[40];
     const char *id = s_follow_label[0] ? s_follow_label : (s_follow_hex[0] ? s_follow_hex : "flight");
@@ -2331,21 +2492,7 @@ static void timelapse_finalize_and_email() {
     }
     snprintf(fname, sizeof(fname), "%s_timelapse.avi", safe);
 
-    // Always try SD first (folder mmddyy FLIGHT).
-    bool saved_sd = false;
-    if (sd_mount()) {
-        char folder[160];
-        if (sd_current_grab_folder(folder, sizeof(folder)) &&
-            sd_write_timelapse_avi(folder, avi, avi_len)) {
-            saved_sd = true;
-        }
-    }
-
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    const bool can_email = g_state->wifi_connected && email_cfg_ready(&g_state->cfg.email);
-    xSemaphoreGive(g_state->mutex);
-
-    if (can_email) {
+    if (can_email && avi) {
         xSemaphoreTake(g_state->mutex, portMAX_DELAY);
         ui_release_screenshot_bmp_unlocked();
         g_state->screenshot_bmp = avi;
@@ -2364,7 +2511,9 @@ static void timelapse_finalize_and_email() {
         return;
     }
 
-    heap_caps_free(avi);
+    if (avi) {
+        heap_caps_free(avi);
+    }
     timelapse_stop_recording();
     audio_projector_play(400);
     if (radar_status) {
@@ -7675,6 +7824,10 @@ static void board_load_icao(const char *icao) {
     }
     board_history_push(icao);
     board_set_airport_ll(icao);
+    // Kick NTP if clock still cold — board clock needs a valid epoch.
+    if (WiFi.status() == WL_CONNECTED && time(nullptr) < 1700000000) {
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+    }
     xSemaphoreTake(g_state->mutex, portMAX_DELAY);
     strncpy(g_state->pending_board_icao, icao, sizeof(g_state->pending_board_icao) - 1);
     g_state->pending_board_icao[sizeof(g_state->pending_board_icao) - 1] = 0;
@@ -7886,11 +8039,13 @@ static void open_airport_board(lv_event_t *e) {
         lv_label_set_text(board_title_lbl, "Airport Board");
     }
     s_apt_hit_n = 0;
-    s_board_arr_n = 0;
-    s_board_dep_n = 0;
     board_clear_selection();
     refresh_airport_hits_ui();
-    refresh_airport_board_tables();
+    // Keep last board tables visible while a refresh runs (avoids empty "stuck" feel).
+    const bool have_cache = (s_board_arr_n > 0 || s_board_dep_n > 0);
+    if (!have_cache) {
+        refresh_airport_board_tables();
+    }
     lv_obj_clear_flag(board_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(board_panel);
 
@@ -7900,6 +8055,9 @@ static void open_airport_board(lv_event_t *e) {
             lv_textarea_set_text(board_ta, s_board_hist[0]);
         }
         board_hide_keyboard();
+        if (have_cache && board_status) {
+            lv_label_set_text(board_status, "Refreshing FlightAware…");
+        }
         board_load_icao(s_board_hist[0]);
     } else {
         if (board_status) {
@@ -11670,23 +11828,63 @@ void ui_notify_airport_search(bool ok, const char *msg) {
     lvgl_port_unlock();
 }
 
+void ui_set_board_status(const char *msg) {
+    if (!msg) {
+        return;
+    }
+    // Throttle — net-task progress spam + LVGL lock was a reopen hang risk.
+    static uint32_t s_board_st_ms = 0;
+    const uint32_t now = millis();
+    if (s_board_st_ms != 0 && (now - s_board_st_ms) < 400) {
+        return;
+    }
+    s_board_st_ms = now;
+    lvgl_port_lock(-1);
+    if (board_status) {
+        lv_label_set_text(board_status, msg);
+    }
+    lvgl_port_unlock();
+}
+
 void ui_notify_airport_board(bool ok, const char *msg) {
     char label[48] = {0};
-    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-    s_board_arr_n = g_state->board_arr_n;
-    s_board_dep_n = g_state->board_dep_n;
-    if (s_board_arr_n > FR_MAX_BOARD_ROWS) {
-        s_board_arr_n = FR_MAX_BOARD_ROWS;
+    char icao[8] = {0};
+    if (ok) {
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        s_board_arr_n = g_state->board_arr_n;
+        s_board_dep_n = g_state->board_dep_n;
+        if (s_board_arr_n > FR_MAX_BOARD_ROWS) {
+            s_board_arr_n = FR_MAX_BOARD_ROWS;
+        }
+        if (s_board_dep_n > FR_MAX_BOARD_ROWS) {
+            s_board_dep_n = FR_MAX_BOARD_ROWS;
+        }
+        memcpy(s_board_arr, g_state->board_arr, sizeof(AirportBoardRow) * s_board_arr_n);
+        memcpy(s_board_dep, g_state->board_dep, sizeof(AirportBoardRow) * s_board_dep_n);
+        strncpy(label, g_state->board_label, sizeof(label) - 1);
+        strncpy(icao, g_state->board_icao[0] ? g_state->board_icao : g_state->pending_board_icao,
+                sizeof(icao) - 1);
+        xSemaphoreGive(g_state->mutex);
+    } else {
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        strncpy(label, g_state->board_label, sizeof(label) - 1);
+        strncpy(icao, g_state->board_icao[0] ? g_state->board_icao : g_state->pending_board_icao,
+                sizeof(icao) - 1);
+        xSemaphoreGive(g_state->mutex);
     }
-    if (s_board_dep_n > FR_MAX_BOARD_ROWS) {
-        s_board_dep_n = FR_MAX_BOARD_ROWS;
-    }
-    memcpy(s_board_arr, g_state->board_arr, sizeof(AirportBoardRow) * s_board_arr_n);
-    memcpy(s_board_dep, g_state->board_dep, sizeof(AirportBoardRow) * s_board_dep_n);
-    strncpy(label, g_state->board_label, sizeof(label) - 1);
-    xSemaphoreGive(g_state->mutex);
 
     lvgl_port_lock(-1);
+    // Re-resolve airport LL after fetch (SD / search hits may be ready now).
+    if (ok) {
+        const char *ll_code = icao[0] ? icao : label;
+        if (ll_code && ll_code[0]) {
+            board_set_airport_ll(ll_code);
+        }
+        if (WiFi.status() == WL_CONNECTED && time(nullptr) < 1700000000) {
+            configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+        }
+        refresh_board_clock_time();
+    }
     if (board_status) {
         lv_label_set_text(board_status, msg ? msg : (ok ? "Select a flight to follow" : "Board failed"));
     }

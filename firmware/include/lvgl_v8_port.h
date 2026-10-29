@@ -169,6 +169,16 @@ bool lvgl_port_lock(int timeout_ms);
  */
 bool lvgl_port_unlock(void);
 
+/**
+ * @brief True while two fingers are down (pinch gesture); single-touch is suppressed meanwhile.
+ */
+bool lvgl_port_pinch_active(void);
+
+/**
+ * @brief Register the pinch-zoom callback. dir is +1 when fingers spread, -1 when they pinch in.
+ */
+void lvgl_port_set_pinch_zoom_cb(void (*cb)(int dir));
+
 #ifdef __cplusplus
 }
 #endif

@@ -22380,3 +22380,6 @@ static const MapPoly kMapPolys[] = {
   {21570, 55},
 };
 static const uint16_t kMapPolyCount = 746;
+// Compat for ui.cpp: this table keeps state outlines mixed into the thin layer (no separate state range).
+static const uint16_t kMapStatePolyStart = kMapPolyCount;
+static const uint16_t kMapStatePolyCount = 0;

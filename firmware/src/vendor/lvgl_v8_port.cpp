@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 
+#include <math.h>
 #include "esp_timer.h"
 #undef ESP_UTILS_LOG_TAG
 #define ESP_UTILS_LOG_TAG "LvPort"
@@ -642,10 +643,27 @@ static lv_disp_t *display_init(LCD *lcd)
 
 static SemaphoreHandle_t touch_detected;
 
+/* Two-finger pinch -> zoom callback (dir: +1 spread, -1 pinch-in). Single-touch input is
+ * hidden from LVGL while a pinch is active so pan/click handlers do not fire. */
+static bool s_pinch_active = false;
+static float s_pinch_last_d = 0.0f;
+static void (*s_pinch_zoom_cb)(int dir) = nullptr;
+static constexpr float kPinchStepPx = 70.0f;
+
+bool lvgl_port_pinch_active(void)
+{
+    return s_pinch_active;
+}
+
+void lvgl_port_set_pinch_zoom_cb(void (*cb)(int dir))
+{
+    s_pinch_zoom_cb = cb;
+}
+
 static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
     Touch *tp = (Touch *)indev_drv->user_data;
-    TouchPoint point;
+    TouchPoint points[2];
     data->state = LV_INDEV_STATE_RELEASED;
 
     /* if we are interrupt driven wait for the ISR to fire */
@@ -653,12 +671,29 @@ static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
         return;
     }
 
-    /* Read data from touch controller */
-    int read_touch_result = tp->readPoints(&point, 1, 0);
-    if (read_touch_result > 0) {
-        data->point.x = point.x;
-        data->point.y = point.y;
+    /* Read data from touch controller (up to two fingers for pinch zoom) */
+    int read_touch_result = tp->readPoints(points, 2, 0);
+    if (read_touch_result >= 2) {
+        const float dx = (float)points[0].x - (float)points[1].x;
+        const float dy = (float)points[0].y - (float)points[1].y;
+        const float d = sqrtf(dx * dx + dy * dy);
+        if (!s_pinch_active) {
+            s_pinch_active = true;
+            s_pinch_last_d = d;
+        } else if (fabsf(d - s_pinch_last_d) >= kPinchStepPx) {
+            if (s_pinch_zoom_cb) {
+                s_pinch_zoom_cb(d > s_pinch_last_d ? 1 : -1);
+            }
+            s_pinch_last_d = d;
+        }
+        return;  /* report released while pinching */
+    }
+    if (read_touch_result == 1 && !s_pinch_active) {
+        data->point.x = points[0].x;
+        data->point.y = points[0].y;
         data->state = LV_INDEV_STATE_PRESSED;
+    } else if (read_touch_result <= 0) {
+        s_pinch_active = false;
     }
 }
 
