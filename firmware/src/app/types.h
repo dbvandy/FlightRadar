@@ -4,7 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 
-#define FR_VERSION_STR "1.1.3"
+#define FR_VERSION_STR "1.1.7"
 
 #define FR_MAX_AIRCRAFT 64
 #define FR_TRACK_NEARBY_MAX 40  // when following with Show Ac: closest N to tracked
@@ -86,7 +86,7 @@ struct Weather {
     bool ok;
 };
 
-#define FR_MAX_ROUTE_WPTS 32
+#define FR_MAX_ROUTE_WPTS 64
 struct RouteWaypoint {
     char name[14];  // e.g. NOBAR or 4500N/07300W
     float lat;
@@ -192,6 +192,12 @@ struct AppConfig {
     uint64_t county_mask;  // bit i = show counties for kCountyStateAbbr[i] (0=AL ... 49=WY)
     int brightness;  // 0-100 backlight
     int volume;      // 0-100 click / UI audio
+    // Touch calibration: mapped = offset + scale * raw (identity defaults).
+    float touch_ox;
+    float touch_oy;
+    float touch_sx;
+    float touch_sy;
+    int touch_pressure_sens;  // 60-100 (100 = most sensitive; floor 60)
 };
 
 // Persisted id lists (NVS) used by the plates / board / track pickers.

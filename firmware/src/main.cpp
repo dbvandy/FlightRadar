@@ -11,6 +11,7 @@
 #include "board_ctrl.h"
 #include "app/audio_click.h"
 #include "app/config_store.h"
+#include "app/faa_plate_db.h"
 #include "app/net_client.h"
 #include "app/ui.h"
 
@@ -24,7 +25,7 @@ using namespace esp_panel::board;
 
 static SharedState g_state;
 static Board *g_board = nullptr;
-static int g_brightness = 100;
+static int g_brightness = 50;
 
 void board_set_brightness(int percent) {
     if (percent < 0) {
@@ -573,6 +574,11 @@ static void handle_weather() {
     Weather w{};
     net_begin_psram_safe();
     const bool ok = net_fetch_weather(icao, &w);
+    // AWC radios here (net task) — ui_notify_weather must not HTTPS under LVGL lock.
+    AirportRadios radios{};
+    if (icao[0] && net_lookup_airport_radios(icao, &radios)) {
+        w.radios = radios;
+    }
     net_end_psram_safe();
     xSemaphoreTake(g_state.mutex, portMAX_DELAY);
     g_state.weather = w;
@@ -602,52 +608,137 @@ static void handle_flight_info() {
     strncpy(fi.flight, flight, sizeof(fi.flight) - 1);
     strncpy(fi.reg, reg, sizeof(fi.reg) - 1);
     strncpy(fi.hex, hex, sizeof(fi.hex) - 1);
-    ui_set_status(flight[0] ? "Looking up flight..." : "Looking up aircraft...");
+
+    // Prefer ICAO callsign for FlightStats / FlightAware (DAL3161 vs DL3161).
+    char icao_cs[16] = {0}, iata_al[4] = {0}, iata_num[8] = {0};
+    char sched_key[16] = {0};
+    if (flight[0] &&
+        net_parse_flight_number(flight, icao_cs, sizeof(icao_cs), iata_al, sizeof(iata_al), iata_num,
+                                sizeof(iata_num))) {
+        if (icao_cs[0]) {
+            strncpy(fi.flight, icao_cs, sizeof(fi.flight) - 1);
+        }
+        if (iata_al[0] && iata_num[0]) {
+            snprintf(sched_key, sizeof(sched_key), "%s%s", iata_al, iata_num);
+        } else {
+            strncpy(sched_key, icao_cs[0] ? icao_cs : flight, sizeof(sched_key) - 1);
+        }
+    } else if (flight[0]) {
+        strncpy(sched_key, flight, sizeof(sched_key) - 1);
+    }
+
+    auto push_fi = [&]() {
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        g_state.flight_info = fi;
+        xSemaphoreGive(g_state.mutex);
+        ui_notify_flight_info();
+    };
+
+    // Track / board often already filled OD / FlightStats — seed so a failed FS
+    // retry cannot wipe dep/arr already on screen, then jump to FA for waypoints.
+    bool have_sched = false;
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    if (g_state.follow_active) {
+        const char *ff = g_state.flight_info.flight;
+        const char *fh = g_state.flight_info.hex;
+        const bool hex_same = hex[0] && fh[0] && strcasecmp(hex, fh) == 0;
+        const bool flt_same =
+            flight[0] && ff[0] &&
+            (strcasecmp(flight, ff) == 0 ||
+             (icao_cs[0] && strcasecmp(icao_cs, ff) == 0) ||
+             (sched_key[0] && strcasecmp(sched_key, ff) == 0));
+        if ((hex_same || flt_same) &&
+            (g_state.flight_info.schedule_ok || g_state.flight_info.route_ok ||
+             g_state.flight_info.origin[0] || g_state.flight_info.dest[0] ||
+             g_state.flight_info.route_wpt_n > 0)) {
+            fi = g_state.flight_info;
+            have_sched = fi.schedule_ok && (fi.origin[0] || fi.dest[0]);
+        }
+    }
+    xSemaphoreGive(g_state.mutex);
+
+    if (net_abort_requested()) {
+        ui_set_status("Tracking");
+        return;
+    }
+
+    ui_set_status(have_sched ? "Loading route…" : (flight[0] ? "Looking up flight..." : "Looking up aircraft..."));
     net_begin_psram_safe();
-    // Resolve registration from hexdb when ADS-B did not provide `r`.
-    if (hex[0]) {
-        char meta_reg[12] = {0};
-        fi.meta_ok = net_fetch_aircraft_meta(hex, fi.manufacturer, sizeof(fi.manufacturer), fi.type_name,
-                                             sizeof(fi.type_name), fi.owner, sizeof(fi.owner), meta_reg,
-                                             sizeof(meta_reg));
-        if (!reg[0] && meta_reg[0]) {
-            strncpy(reg, meta_reg, sizeof(reg) - 1);
-            reg[sizeof(reg) - 1] = 0;
-        }
-    }
-    strncpy(fi.reg, reg, sizeof(fi.reg) - 1);
-    // Schedule first (has airports). Route API only fills gaps — it clears buffers.
-    if (flight[0]) {
-        net_fetch_flight_schedule(flight, &fi);
-    }
-    if ((!fi.origin[0] || !fi.dest[0]) && flight[0]) {
-        char o[8] = {0}, d[8] = {0};
-        if (net_fetch_route(flight, o, sizeof(o), d, sizeof(d))) {
-            if (!fi.origin[0] && o[0]) {
-                strncpy(fi.origin, o, sizeof(fi.origin) - 1);
-            }
-            if (!fi.dest[0] && d[0]) {
-                strncpy(fi.dest, d, sizeof(fi.dest) - 1);
+    net_tls_reset();
+    delay(300);
+
+    if (!have_sched && !net_abort_requested()) {
+        // Resolve registration from hexdb when ADS-B did not provide `r`.
+        if (hex[0]) {
+            char meta_reg[12] = {0};
+            fi.meta_ok = net_fetch_aircraft_meta(hex, fi.manufacturer, sizeof(fi.manufacturer), fi.type_name,
+                                                 sizeof(fi.type_name), fi.owner, sizeof(fi.owner), meta_reg,
+                                                 sizeof(meta_reg));
+            if (!reg[0] && meta_reg[0]) {
+                strncpy(reg, meta_reg, sizeof(reg) - 1);
+                reg[sizeof(reg) - 1] = 0;
             }
         }
-    }
-    if ((!fi.origin[0] || !fi.dest[0]) && reg[0]) {
-        char o[8] = {0}, d[8] = {0};
-        if (net_fetch_route(reg, o, sizeof(o), d, sizeof(d))) {
-            if (!fi.origin[0] && o[0]) {
-                strncpy(fi.origin, o, sizeof(fi.origin) - 1);
-            }
-            if (!fi.dest[0] && d[0]) {
-                strncpy(fi.dest, d, sizeof(fi.dest) - 1);
+        if (reg[0]) {
+            strncpy(fi.reg, reg, sizeof(fi.reg) - 1);
+        }
+
+        // FlightStats first — publish so dep/arr appear before the slow FA scrape.
+        if (sched_key[0] && !net_abort_requested()) {
+            ui_set_status("Flight stats...");
+            net_tls_reset();
+            delay(250);
+            net_fetch_flight_schedule(sched_key, &fi);
+        }
+        if ((!fi.origin[0] || !fi.dest[0]) && (icao_cs[0] || flight[0]) && !net_abort_requested()) {
+            const char *rk = icao_cs[0] ? icao_cs : flight;
+            char o[8] = {0}, d[8] = {0};
+            if (net_fetch_route(rk, o, sizeof(o), d, sizeof(d))) {
+                if (!fi.origin[0] && o[0]) {
+                    strncpy(fi.origin, o, sizeof(fi.origin) - 1);
+                }
+                if (!fi.dest[0] && d[0]) {
+                    strncpy(fi.dest, d, sizeof(fi.dest) - 1);
+                }
             }
         }
+        if ((!fi.origin[0] || !fi.dest[0]) && reg[0] && !net_abort_requested()) {
+            char o[8] = {0}, d[8] = {0};
+            if (net_fetch_route(reg, o, sizeof(o), d, sizeof(d))) {
+                if (!fi.origin[0] && o[0]) {
+                    strncpy(fi.origin, o, sizeof(fi.origin) - 1);
+                }
+                if (!fi.dest[0] && d[0]) {
+                    strncpy(fi.dest, d, sizeof(fi.dest) - 1);
+                }
+            }
+        }
+        if (fi.origin[0] && fi.dest[0]) {
+            fi.route_ok = true;
+        }
+        if ((fi.origin[0] || fi.dest[0]) && (!fi.origin_name[0] || !fi.dest_name[0])) {
+            net_fetch_airport_names(fi.origin, fi.dest, fi.origin_name, sizeof(fi.origin_name), fi.dest_name,
+                                    sizeof(fi.dest_name));
+        }
+        push_fi();  // dep/arr on radar while FA loads
+
+        // Live ADS-B between FlightStats and FA.
+        net_end_psram_safe();
+        handle_traffic();
+        net_begin_psram_safe();
     }
-    if (fi.origin[0] && fi.dest[0]) {
-        fi.route_ok = true;
-    }
-    if ((fi.origin[0] || fi.dest[0]) && (!fi.origin_name[0] || !fi.dest_name[0])) {
-        net_fetch_airport_names(fi.origin, fi.dest, fi.origin_name, sizeof(fi.origin_name), fi.dest_name,
-                                sizeof(fi.dest_name));
+
+    // Filed IFR waypoints + historical alt/gs track from FlightAware (TLS-heavy).
+    static FlightTrackPt s_fa_track[FR_MAX_TRACK_PTS];
+    int track_n = 0;
+    const char *plan_key = icao_cs[0] ? icao_cs : (flight[0] ? flight : nullptr);
+    if (plan_key && !net_abort_requested()) {
+        ui_set_status("Loading route…");
+        net_tls_reset();
+        delay(400);
+        if (!net_abort_requested()) {
+            net_fetch_flight_plan(plan_key, &fi, s_fa_track, FR_MAX_TRACK_PTS, &track_n);
+        }
     }
     // Filed IFR waypoints + historical alt/gs track from FlightAware.
     // Static: keep large track buffer off the net-task stack.
@@ -658,7 +749,23 @@ static void handle_flight_info() {
     }
     net_end_psram_safe();
 
+    // Merge into shared state — never blank out OD already published for this flight.
     xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    if (g_state.follow_active &&
+        (g_state.flight_info.origin[0] || g_state.flight_info.dest[0]) &&
+        (!fi.origin[0] || !fi.dest[0])) {
+        if (!fi.origin[0] && g_state.flight_info.origin[0]) {
+            strncpy(fi.origin, g_state.flight_info.origin, sizeof(fi.origin) - 1);
+            strncpy(fi.origin_name, g_state.flight_info.origin_name, sizeof(fi.origin_name) - 1);
+        }
+        if (!fi.dest[0] && g_state.flight_info.dest[0]) {
+            strncpy(fi.dest, g_state.flight_info.dest, sizeof(fi.dest) - 1);
+            strncpy(fi.dest_name, g_state.flight_info.dest_name, sizeof(fi.dest_name) - 1);
+        }
+        if (fi.origin[0] && fi.dest[0]) {
+            fi.route_ok = true;
+        }
+    }
     g_state.flight_info = fi;
     if (track_n > 0) {
         const int ncopy = (track_n > FR_MAX_TRACK_PTS) ? FR_MAX_TRACK_PTS : track_n;
@@ -667,16 +774,654 @@ static void handle_flight_info() {
     }
     xSemaphoreGive(g_state.mutex);
     ui_notify_flight_info();
-    if (fi.schedule_ok) {
-        ui_set_status("Schedule ready");
-    } else if (fi.route_wpt_n > 0) {
-        ui_set_status("Route waypoints ready");
-    } else if (fi.route_ok) {
-        ui_set_status("Route ready");
+
+    // ADS-B + chart samples right after FA (queued refresh alone often waits behind plates).
+    if (!net_abort_requested()) {
+        net_tls_reset();
+        delay(350);
+        handle_traffic();
+        __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_REFRESH_TRAFFIC);
+    }
+
+    // Never leave the PPI stuck on "Loading route…" — Update ADS-B must be able to recover.
+    if (net_abort_requested()) {
+        ui_set_status("Tracking");
+    } else if (track_n > 0 || fi.route_wpt_n > 0 || fi.schedule_ok || fi.route_ok) {
+        ui_set_status("Tracking");
     } else if (fi.meta_ok) {
         ui_set_status("Aircraft info ready");
     } else {
-        ui_set_status("Route unavailable");
+        ui_set_status("Tracking");
+    }
+}
+
+static void cpy(char *dst, size_t n, const char *src) {
+    if (!dst || n == 0) {
+        return;
+    }
+    strncpy(dst, src ? src : "", n - 1);
+    dst[n - 1] = 0;
+}
+
+static void handle_search_airports() {
+    char q[96];
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    strncpy(q, g_state.pending_query, sizeof(q) - 1);
+    q[sizeof(q) - 1] = 0;
+    g_state.apt_hit_n = 0;
+    xSemaphoreGive(g_state.mutex);
+
+    AptSearchHit hits[FR_MAX_APT_SEARCH];
+    memset(hits, 0, sizeof(hits));
+    net_begin_psram_safe();
+    const int n = net_search_airports(q, hits, FR_MAX_APT_SEARCH);
+    net_end_psram_safe();
+
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    memcpy(g_state.apt_hits, hits, sizeof(AptSearchHit) * (n > 0 ? n : 0));
+    g_state.apt_hit_n = n > 0 ? n : 0;
+    xSemaphoreGive(g_state.mutex);
+    if (n > 0) {
+        ui_notify_airport_search(true, "Select an airport");
+    } else {
+        ui_notify_airport_search(false, "No airports found");
+    }
+}
+
+static void handle_refresh_plate_cities() {
+    char icaos[24][8];
+    char cities[24][28];
+    int n = 0;
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    n = g_state.plate_city_n;
+    if (n > 24) {
+        n = 24;
+    }
+    for (int i = 0; i < n; i++) {
+        strncpy(icaos[i], g_state.plate_city_icao[i], sizeof(icaos[i]) - 1);
+        icaos[i][sizeof(icaos[i]) - 1] = 0;
+        cities[i][0] = 0;
+    }
+    xSemaphoreGive(g_state.mutex);
+    if (n <= 0) {
+        ui_notify_plate_cities(false);
+        return;
+    }
+    ui_set_status("Refreshing plate cities...");
+    net_begin_psram_safe();
+    const int hits = net_fetch_airport_cities(icaos, cities, n);
+    net_end_psram_safe();
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    for (int i = 0; i < n; i++) {
+        strncpy(g_state.plate_city_name[i], cities[i], sizeof(g_state.plate_city_name[i]) - 1);
+        g_state.plate_city_name[i][sizeof(g_state.plate_city_name[i]) - 1] = 0;
+    }
+    xSemaphoreGive(g_state.mutex);
+    ui_notify_plate_cities(hits > 0);
+}
+
+static void handle_airport_board() {
+    char icao[8];
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    strncpy(icao, g_state.pending_board_icao, sizeof(icao) - 1);
+    icao[sizeof(icao) - 1] = 0;
+    // Keep previous board rows until a successful fetch (reopen must not wipe UI).
+    xSemaphoreGive(g_state.mutex);
+
+    // Static — keep board rows off the net_task stack.
+    static AirportBoardRow s_arr[FR_MAX_BOARD_ROWS];
+    static AirportBoardRow s_dep[FR_MAX_BOARD_ROWS];
+    char label[48] = {0};
+    int an = 0, dn = 0;
+    memset(s_arr, 0, sizeof(s_arr));
+    memset(s_dep, 0, sizeof(s_dep));
+
+    ui_set_status("Loading airport board...");
+    ui_set_board_status("Loading board…");
+    float board_lat = 0, board_lon = 0;
+
+    // Clear sticky abort left by Update ADS-B / plate thrash so FA board can run.
+    net_abort_clear();
+
+    // FlightAware live/airport/{ICAO} — Ident/Type/From|To/Depart/Arrive in one page.
+    // Do not fall back to local ADS-B (wrong columns + misleading "No traffic near airport").
+    const bool ok = net_fetch_airport_board(icao, s_arr, FR_MAX_BOARD_ROWS, &an, s_dep, FR_MAX_BOARD_ROWS, &dn,
+                                            label, sizeof(label), &board_lat, &board_lon);
+
+    if (ok) {
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        memcpy(g_state.board_arr, s_arr, sizeof(s_arr));
+        memcpy(g_state.board_dep, s_dep, sizeof(s_dep));
+        g_state.board_arr_n = an;
+        g_state.board_dep_n = dn;
+        g_state.board_lat = board_lat;
+        g_state.board_lon = board_lon;
+        g_state.board_ll_ok = (fabsf(board_lat) + fabsf(board_lon) > 0.01f);
+        strncpy(g_state.board_icao, icao, sizeof(g_state.board_icao) - 1);
+        g_state.board_icao[sizeof(g_state.board_icao) - 1] = 0;
+        strncpy(g_state.board_label, label[0] ? label : icao, sizeof(g_state.board_label) - 1);
+        g_state.board_label[sizeof(g_state.board_label) - 1] = 0;
+        xSemaphoreGive(g_state.mutex);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%d arrivals · %d departures", an, dn);
+        ui_notify_airport_board(true, msg);
+    } else {
+        ui_notify_airport_board(false, net_last_error()[0] ? net_last_error() : "Board fetch failed");
+    }
+}
+
+static void handle_route_search() {
+    char dep_q[48], arr_q[48];
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    strncpy(dep_q, g_state.pending_route_dep, sizeof(dep_q) - 1);
+    dep_q[sizeof(dep_q) - 1] = 0;
+    strncpy(arr_q, g_state.pending_route_arr, sizeof(arr_q) - 1);
+    arr_q[sizeof(arr_q) - 1] = 0;
+    g_state.route_dep_hit_n = 0;
+    g_state.route_arr_hit_n = 0;
+    g_state.route_row_n = 0;
+    g_state.route_dep_icao[0] = 0;
+    g_state.route_arr_icao[0] = 0;
+    xSemaphoreGive(g_state.mutex);
+
+    // Keep large hit/row buffers off the net-task stack.
+    static AptSearchHit s_dep_hits[FR_MAX_APT_SEARCH];
+    static AptSearchHit s_arr_hits[FR_MAX_APT_SEARCH];
+    static AirportBoardRow s_route_rows[FR_MAX_BOARD_ROWS];
+    memset(s_dep_hits, 0, sizeof(s_dep_hits));
+    memset(s_arr_hits, 0, sizeof(s_arr_hits));
+
+    ui_set_status("Searching airports...");
+    net_begin_psram_safe();
+    const int dn = net_search_airports(dep_q, s_dep_hits, FR_MAX_APT_SEARCH);
+    const int an = net_search_airports(arr_q, s_arr_hits, FR_MAX_APT_SEARCH);
+    net_end_psram_safe();
+
+    char dep_icao[8] = {0}, arr_icao[8] = {0};
+    if (dn == 1) {
+        strncpy(dep_icao, s_dep_hits[0].icao, sizeof(dep_icao) - 1);
+    }
+    if (an == 1) {
+        strncpy(arr_icao, s_arr_hits[0].icao, sizeof(arr_icao) - 1);
+    }
+
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    memcpy(g_state.route_dep_hits, s_dep_hits, sizeof(AptSearchHit) * (dn > 0 ? dn : 0));
+    g_state.route_dep_hit_n = dn > 0 ? dn : 0;
+    memcpy(g_state.route_arr_hits, s_arr_hits, sizeof(AptSearchHit) * (an > 0 ? an : 0));
+    g_state.route_arr_hit_n = an > 0 ? an : 0;
+    if (dep_icao[0]) {
+        strncpy(g_state.route_dep_icao, dep_icao, sizeof(g_state.route_dep_icao) - 1);
+    }
+    if (arr_icao[0]) {
+        strncpy(g_state.route_arr_icao, arr_icao, sizeof(g_state.route_arr_icao) - 1);
+    }
+    xSemaphoreGive(g_state.mutex);
+
+    if (dn <= 0) {
+        ui_notify_route_search(false, "No departure airport found");
+        return;
+    }
+    if (an <= 0) {
+        ui_notify_route_search(false, "No arrival airport found");
+        return;
+    }
+    if (dn > 1 || an > 1) {
+        ui_notify_route_search(true, "Select departure and arrival airports");
+        return;
+    }
+
+    // Both resolved uniquely — fetch flights.
+    char label[48] = {0};
+    int rn = 0;
+    memset(s_route_rows, 0, sizeof(s_route_rows));
+    ui_set_status("Loading route flights...");
+    net_begin_psram_safe();
+    const bool ok =
+        net_fetch_route_flights(dep_icao, arr_icao, s_route_rows, FR_MAX_BOARD_ROWS, &rn, label, sizeof(label));
+    net_end_psram_safe();
+
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    memcpy(g_state.route_rows, s_route_rows, sizeof(s_route_rows));
+    g_state.route_row_n = rn;
+    strncpy(g_state.route_label, label[0] ? label : "", sizeof(g_state.route_label) - 1);
+    g_state.route_dep_hit_n = 0;
+    g_state.route_arr_hit_n = 0;
+    xSemaphoreGive(g_state.mutex);
+
+    if (ok) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "%d flights - select one to follow", rn);
+        ui_notify_route_flights(true, msg);
+    } else {
+        ui_notify_route_flights(false, net_last_error()[0] ? net_last_error() : "No flights found");
+    }
+}
+
+static void handle_fetch_route_flights() {
+    char dep[8], arr[8];
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    strncpy(dep, g_state.route_dep_icao, sizeof(dep) - 1);
+    dep[sizeof(dep) - 1] = 0;
+    strncpy(arr, g_state.route_arr_icao, sizeof(arr) - 1);
+    arr[sizeof(arr) - 1] = 0;
+    g_state.route_row_n = 0;
+    xSemaphoreGive(g_state.mutex);
+
+    if (!dep[0] || !arr[0]) {
+        ui_notify_route_flights(false, "Select departure and arrival airports");
+        return;
+    }
+
+    static AirportBoardRow s_fetch_rows[FR_MAX_BOARD_ROWS];
+    char label[48] = {0};
+    int rn = 0;
+    memset(s_fetch_rows, 0, sizeof(s_fetch_rows));
+    ui_set_status("Loading route flights...");
+    net_begin_psram_safe();
+    const bool ok = net_fetch_route_flights(dep, arr, s_fetch_rows, FR_MAX_BOARD_ROWS, &rn, label, sizeof(label));
+    net_end_psram_safe();
+
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    memcpy(g_state.route_rows, s_fetch_rows, sizeof(s_fetch_rows));
+    g_state.route_row_n = rn;
+    strncpy(g_state.route_label, label[0] ? label : "", sizeof(g_state.route_label) - 1);
+    xSemaphoreGive(g_state.mutex);
+
+    if (ok) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "%d flights - select one to follow", rn);
+        ui_notify_route_flights(true, msg);
+    } else {
+        ui_notify_route_flights(false, net_last_error()[0] ? net_last_error() : "No flights found");
+    }
+}
+
+static void handle_track_flight() {
+    char query[96];
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    strncpy(query, g_state.pending_query, sizeof(query) - 1);
+    query[sizeof(query) - 1] = 0;
+    g_state.tracked_ok = false;
+    memset(&g_state.tracked_ac, 0, sizeof(g_state.tracked_ac));
+    xSemaphoreGive(g_state.mutex);
+
+    char icao_cs[16] = {0}, iata_al[4] = {0}, iata_num[8] = {0};
+    if (!net_parse_flight_number(query, icao_cs, sizeof(icao_cs), iata_al, sizeof(iata_al), iata_num,
+                                 sizeof(iata_num))) {
+        ui_notify_track_result(false, "Enter a flight like UA100 or UAL100");
+        return;
+    }
+
+    ui_set_status(icao_cs[0] ? "Tracking flight..." : "Looking up flight...");
+    Aircraft ac{};
+    FlightInfo fi{};
+    cpy(fi.flight, sizeof(fi.flight), icao_cs[0] ? icao_cs : query);
+
+    char sched_key[16];
+    if (iata_al[0] && iata_num[0]) {
+        snprintf(sched_key, sizeof(sched_key), "%s%s", iata_al, iata_num);
+    } else {
+        cpy(sched_key, sizeof(sched_key), icao_cs);
+    }
+
+    net_begin_psram_safe();
+    // After FA board / plan thrash, settle TLS before the first track HTTPS.
+    net_tls_reset();
+    delay(350);
+
+    // Live ADS-B position FIRST — publish immediately so Track isn't stuck behind
+    // FlightStats / FlightAware (common hang after airport board).
+    int n = -1;
+    if (icao_cs[0]) {
+        n = net_fetch_aircraft_by_callsign(icao_cs, &ac);
+    }
+    if (n <= 0 && iata_al[0] && iata_num[0]) {
+        char iata_cs[16];
+        snprintf(iata_cs, sizeof(iata_cs), "%s%s", iata_al, iata_num);
+        n = net_fetch_aircraft_by_callsign(iata_cs, &ac);
+        if (n > 0 && !icao_cs[0]) {
+            cpy(icao_cs, sizeof(icao_cs), iata_cs);
+        }
+    }
+
+    bool published = false;
+    auto publish_track = [&](const char *msg) {
+        if (!ac.flight[0] && icao_cs[0]) {
+            cpy(ac.flight, sizeof(ac.flight), icao_cs);
+        }
+        if (!fi.flight[0]) {
+            cpy(fi.flight, sizeof(fi.flight), ac.flight[0] ? ac.flight : icao_cs);
+        }
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        g_state.tracked_ac = ac;
+        g_state.tracked_ok = true;
+        g_state.flight_info = fi;
+        if (!published) {
+            g_state.flight_track_n = 0;
+        }
+        xSemaphoreGive(g_state.mutex);
+        ui_notify_track_result(true, msg);
+        ui_notify_flight_info();
+        published = true;
+    };
+
+    if (n > 0) {
+        // Airborne / ADS-B hit — open follow now; route + schedule fill in after.
+        publish_track("Tracking");
+    }
+
+    auto push_fi = [&]() {
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        g_state.flight_info = fi;
+        if (ac.hex[0]) {
+            g_state.tracked_ac = ac;
+        }
+        xSemaphoreGive(g_state.mutex);
+        ui_notify_flight_info();
+    };
+
+    // FlightStats next — gates/times used to be near-instant; do not wait on FA.
+    if (!net_abort_requested()) {
+        ui_set_status("Flight stats...");
+        net_tls_reset();
+        delay(300);
+        net_fetch_flight_schedule(sched_key, &fi);
+    }
+    if (fi.origin[0] || fi.dest[0]) {
+        fi.route_ok = fi.origin[0] && fi.dest[0];
+        if (!fi.origin_name[0] || !fi.dest_name[0]) {
+            net_fetch_airport_names(fi.origin, fi.dest, fi.origin_name, sizeof(fi.origin_name), fi.dest_name,
+                                    sizeof(fi.dest_name));
+        }
+    }
+    // HexDB OD when FS fails / leaves gaps — needed for dep–arr line + overview zoom.
+    if ((!fi.origin[0] || !fi.dest[0]) && icao_cs[0] && !net_abort_requested()) {
+        char o[8] = {0}, d[8] = {0};
+        if (net_fetch_route(icao_cs, o, sizeof(o), d, sizeof(d))) {
+            if (!fi.origin[0] && o[0]) {
+                cpy(fi.origin, sizeof(fi.origin), o);
+            }
+            if (!fi.dest[0] && d[0]) {
+                cpy(fi.dest, sizeof(fi.dest), d);
+            }
+        }
+    }
+    if ((!fi.origin[0] || !fi.dest[0]) && iata_al[0] && iata_num[0] && !net_abort_requested()) {
+        char iata_cs[16];
+        snprintf(iata_cs, sizeof(iata_cs), "%s%s", iata_al, iata_num);
+        char o[8] = {0}, d[8] = {0};
+        if (net_fetch_route(iata_cs, o, sizeof(o), d, sizeof(d))) {
+            if (!fi.origin[0] && o[0]) {
+                cpy(fi.origin, sizeof(fi.origin), o);
+            }
+            if (!fi.dest[0] && d[0]) {
+                cpy(fi.dest, sizeof(fi.dest), d);
+            }
+        }
+    }
+    if (fi.origin[0] && fi.dest[0]) {
+        fi.route_ok = true;
+        if (!fi.origin_name[0] || !fi.dest_name[0]) {
+            net_fetch_airport_names(fi.origin, fi.dest, fi.origin_name, sizeof(fi.origin_name), fi.dest_name,
+                                    sizeof(fi.dest_name));
+        }
+    }
+    if (published) {
+        push_fi();  // dep/arr (or empty) on radar before FA — clears "Flight stats…"
+        ui_set_status("Tracking");
+    }
+
+    if (n > 0 && ac.hex[0] && !fi.meta_ok) {
+        char meta_reg[12] = {0};
+        fi.meta_ok = net_fetch_aircraft_meta(ac.hex, fi.manufacturer, sizeof(fi.manufacturer), fi.type_name,
+                                             sizeof(fi.type_name), fi.owner, sizeof(fi.owner), meta_reg,
+                                             sizeof(meta_reg));
+        cpy(fi.hex, sizeof(fi.hex), ac.hex);
+        if (meta_reg[0] && !ac.reg[0]) {
+            cpy(ac.reg, sizeof(ac.reg), meta_reg);
+        }
+        if (meta_reg[0]) {
+            cpy(fi.reg, sizeof(fi.reg), meta_reg);
+        }
+    }
+
+    // Not departed (or no ADS-B): pin to departing airport and keep FlightStats status.
+    const bool pin_origin = fi.origin[0] && (n <= 0 || (fi.schedule_ok && !fi.departed));
+    if (pin_origin) {
+        float lat = 0, lon = 0;
+        if (net_lookup_airport(fi.origin, &lat, &lon, nullptr) ||
+            net_lookup_airport_iata(fi.origin, nullptr, 0, &lat, &lon)) {
+            Aircraft ground = ac;
+            if (n <= 0) {
+                memset(&ground, 0, sizeof(ground));
+            }
+            if (!ground.flight[0]) {
+                cpy(ground.flight, sizeof(ground.flight), icao_cs[0] ? icao_cs : sched_key);
+            }
+            ground.lat = lat;
+            ground.lon = lon;
+            ground.on_ground = true;
+            ground.alt_ft = 0;
+            ground.gs_kts = 0;
+            ground.vrate_fpm = 0;
+            ground.valid = true;
+            if (n <= 0) {
+                ground.hex[0] = 0;
+            }
+            ac = ground;
+            n = 1;
+        }
+    }
+
+    if (n <= 0) {
+        net_end_psram_safe();
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        g_state.flight_info = fi;
+        g_state.tracked_ok = false;
+        xSemaphoreGive(g_state.mutex);
+        if (fi.schedule_ok) {
+            ui_notify_flight_info();
+            ui_notify_track_result(false, "Schedule found, but no airport position");
+        } else {
+            ui_notify_track_result(false, "Flight not found");
+        }
+        return;
+    }
+
+    if (!published) {
+        if (fi.schedule_ok && !fi.departed) {
+            char msg[64];
+            if (fi.status[0]) {
+                snprintf(msg, sizeof(msg), "%s @ %s", fi.status, fi.origin[0] ? fi.origin : "origin");
+            } else {
+                snprintf(msg, sizeof(msg), "At %s (not departed)", fi.origin[0] ? fi.origin : "origin");
+            }
+            publish_track(msg);
+        } else {
+            publish_track("Tracking");
+        }
+    } else {
+        push_fi();
+    }
+
+    net_end_psram_safe();
+
+    // Same as airport-board enrich: get onto radar with ADS-B + FlightStats first,
+    // then defer FlightAware so the net task can keep polling ADS-B (FA used to
+    // freeze the PPI on "Loading route…" / Collecting samples).
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    strncpy(g_state.pending_flight, icao_cs[0] ? icao_cs : sched_key, sizeof(g_state.pending_flight) - 1);
+    g_state.pending_flight[sizeof(g_state.pending_flight) - 1] = 0;
+    if (ac.reg[0]) {
+        strncpy(g_state.pending_reg, ac.reg, sizeof(g_state.pending_reg) - 1);
+        g_state.pending_reg[sizeof(g_state.pending_reg) - 1] = 0;
+    }
+    if (ac.hex[0]) {
+        strncpy(g_state.pending_hex, ac.hex, sizeof(g_state.pending_hex) - 1);
+        g_state.pending_hex[sizeof(g_state.pending_hex) - 1] = 0;
+    }
+    xSemaphoreGive(g_state.mutex);
+
+    net_tls_reset();
+    delay(350);
+    handle_traffic();
+    __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_REFRESH_TRAFFIC);
+    // FA route + chart seed on the next net-loop turn (after ADS-B gets a slot).
+    // Skip if Update ADS-B already asked to abort — keep the plane moving.
+    if (!net_abort_requested() && (icao_cs[0] || (iata_al[0] && iata_num[0]))) {
+        __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_FETCH_FLIGHT_INFO);
+    }
+    ui_set_status("Tracking");
+}
+
+/** Update ADS-B companion: refresh FlightStats Sch/Act/Est into the followed flight.
+ *  Non-empty incoming fields win; blanks leave whatever was already in flight_info. */
+static void handle_refresh_schedule() {
+    char flight[16] = {0};
+    FlightInfo keep{};
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    const bool following = g_state.follow_active;
+    if (following) {
+        keep = g_state.flight_info;
+        if (g_state.follow_flight[0]) {
+            strncpy(flight, g_state.follow_flight, sizeof(flight) - 1);
+        } else if (keep.flight[0]) {
+            strncpy(flight, keep.flight, sizeof(flight) - 1);
+        } else if (g_state.tracked_ok && g_state.tracked_ac.flight[0]) {
+            strncpy(flight, g_state.tracked_ac.flight, sizeof(flight) - 1);
+        }
+    }
+    xSemaphoreGive(g_state.mutex);
+    if (!following || !flight[0]) {
+        ui_set_status(following ? "No flight id for schedule" : "Tracking");
+        return;
+    }
+
+    char icao_cs[16] = {0}, iata_al[4] = {0}, iata_num[8] = {0};
+    char sched_key[16] = {0};
+    if (net_parse_flight_number(flight, icao_cs, sizeof(icao_cs), iata_al, sizeof(iata_al), iata_num,
+                                sizeof(iata_num))) {
+        if (iata_al[0] && iata_num[0]) {
+            snprintf(sched_key, sizeof(sched_key), "%s%s", iata_al, iata_num);
+        } else {
+            strncpy(sched_key, icao_cs[0] ? icao_cs : flight, sizeof(sched_key) - 1);
+        }
+    } else {
+        strncpy(sched_key, flight, sizeof(sched_key) - 1);
+    }
+    if (!sched_key[0]) {
+        ui_set_status("Bad flight id");
+        return;
+    }
+
+    if (net_abort_requested()) {
+        ui_set_status("Tracking");
+        return;
+    }
+    ui_set_status("Updating schedule…");
+    FlightInfo neu{};
+    strncpy(neu.flight, icao_cs[0] ? icao_cs : flight, sizeof(neu.flight) - 1);
+    if (keep.hex[0]) {
+        strncpy(neu.hex, keep.hex, sizeof(neu.hex) - 1);
+    }
+    if (keep.reg[0]) {
+        strncpy(neu.reg, keep.reg, sizeof(neu.reg) - 1);
+    }
+
+    net_begin_psram_safe();
+    net_tls_reset();
+    delay(200);
+    bool ok = false;
+    if (!net_abort_requested()) {
+        // Fast path: one FS page only (no otherDays refetch) so Update can't hang.
+        ok = net_fetch_flight_schedule(sched_key, &neu, false);
+    }
+    // OD fallback when FS fails — still get dep/arr airports for the line / panel.
+    if ((!neu.origin[0] || !neu.dest[0]) && icao_cs[0] && !net_abort_requested()) {
+        char o[8] = {0}, d[8] = {0};
+        if (net_fetch_route(icao_cs, o, sizeof(o), d, sizeof(d))) {
+            if (!neu.origin[0] && o[0]) {
+                strncpy(neu.origin, o, sizeof(neu.origin) - 1);
+            }
+            if (!neu.dest[0] && d[0]) {
+                strncpy(neu.dest, d, sizeof(neu.dest) - 1);
+            }
+        }
+    }
+    if ((neu.origin[0] || neu.dest[0]) && (!neu.origin_name[0] || !neu.dest_name[0]) &&
+        !net_abort_requested()) {
+        net_fetch_airport_names(neu.origin, neu.dest, neu.origin_name, sizeof(neu.origin_name), neu.dest_name,
+                                sizeof(neu.dest_name));
+    }
+    net_end_psram_safe();
+    if (net_abort_requested()) {
+        ui_set_status("Tracking");
+        return;
+    }
+
+    auto take_str = [](char *dst, size_t n, const char *src) {
+        if (src && src[0]) {
+            strncpy(dst, src, n - 1);
+            dst[n - 1] = 0;
+        }
+    };
+    // Merge: fill/replace only when FlightStats / hexdb returned a value.
+    take_str(keep.origin, sizeof(keep.origin), neu.origin);
+    take_str(keep.origin_name, sizeof(keep.origin_name), neu.origin_name);
+    take_str(keep.dest, sizeof(keep.dest), neu.dest);
+    take_str(keep.dest_name, sizeof(keep.dest_name), neu.dest_name);
+    take_str(keep.dep_gate, sizeof(keep.dep_gate), neu.dep_gate);
+    take_str(keep.dep_terminal, sizeof(keep.dep_terminal), neu.dep_terminal);
+    take_str(keep.arr_gate, sizeof(keep.arr_gate), neu.arr_gate);
+    take_str(keep.arr_terminal, sizeof(keep.arr_terminal), neu.arr_terminal);
+    take_str(keep.dep_time, sizeof(keep.dep_time), neu.dep_time);
+    take_str(keep.dep_act, sizeof(keep.dep_act), neu.dep_act);
+    take_str(keep.dep_est, sizeof(keep.dep_est), neu.dep_est);
+    take_str(keep.arr_time, sizeof(keep.arr_time), neu.arr_time);
+    take_str(keep.arr_act, sizeof(keep.arr_act), neu.arr_act);
+    take_str(keep.arr_est, sizeof(keep.arr_est), neu.arr_est);
+    take_str(keep.status, sizeof(keep.status), neu.status);
+    take_str(keep.flight_date, sizeof(keep.flight_date), neu.flight_date);
+    if (neu.dep_act_epoch) {
+        keep.dep_act_epoch = neu.dep_act_epoch;
+    }
+    if (neu.arr_act_epoch) {
+        keep.arr_act_epoch = neu.arr_act_epoch;
+    }
+    if (neu.arr_est_epoch) {
+        keep.arr_est_epoch = neu.arr_est_epoch;
+    }
+    if (neu.schedule_ok) {
+        keep.schedule_ok = true;
+    }
+    if (neu.departed) {
+        keep.departed = true;
+    }
+    if (keep.origin[0] && keep.dest[0]) {
+        keep.route_ok = true;
+    }
+    if (neu.flight[0]) {
+        take_str(keep.flight, sizeof(keep.flight), neu.flight);
+    }
+    if (!keep.flight[0]) {
+        strncpy(keep.flight, icao_cs[0] ? icao_cs : flight, sizeof(keep.flight) - 1);
+        keep.flight[sizeof(keep.flight) - 1] = 0;
+    }
+
+    const bool got_dep_arr = keep.origin[0] || keep.dest[0] || keep.dep_time[0] || keep.arr_time[0] ||
+                             keep.dep_act[0] || keep.arr_est[0] || keep.dep_gate[0] || keep.arr_gate[0];
+    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+    g_state.flight_info = keep;
+    xSemaphoreGive(g_state.mutex);
+    ui_notify_flight_info();
+    delay(450);  // beat ui_set_status LVGL throttle so the result replaces "Updating schedule…"
+    if (ok) {
+        ui_set_status("Schedule updated");
+    } else if (got_dep_arr) {
+        ui_set_status("Airports updated");
+    } else {
+        ui_set_status("Schedule refresh failed");
     }
 }
 
@@ -1135,10 +1880,30 @@ static void net_task(void *arg) {
         if (req & UI_REQ_GEOCODE) {
             handle_geocode();
         }
+        // Update ADS-B: clear wedged TLS/HTTP before the traffic poll.
+        if (req & UI_REQ_NET_RECOVER) {
+            ui_set_status("Resetting network…");
+            net_stack_recover();  // also clears net_abort so ADS-B/schedule can run
+            ui_set_status("Updating ADS-B…");
+        }
         // Traffic before airports so the PPI paints flights as soon as ADS-B answers.
         if (req & UI_REQ_REFRESH_TRAFFIC) {
             handle_traffic();
             last_traffic = millis();
+            if (req & UI_REQ_NET_RECOVER) {
+                ui_set_status((req & UI_REQ_REFRESH_SCHEDULE) ? "Updating schedule…" : "ADS-B updated");
+            }
+        }
+        if (req & UI_REQ_REFRESH_AIRPORTS) {
+            handle_airports();
+        }
+        // After ADS-B recover/poll: refresh Sch/Act/Est for the followed flight.
+        if (req & UI_REQ_REFRESH_SCHEDULE) {
+            handle_refresh_schedule();
+        }
+        // Never leave FETCH_FLIGHT_INFO queued across a recover — it re-locks Loading route.
+        if ((req & UI_REQ_NET_RECOVER) && (req & UI_REQ_FETCH_FLIGHT_INFO)) {
+            req &= ~UI_REQ_FETCH_FLIGHT_INFO;
         }
         if (req & UI_REQ_REFRESH_AIRPORTS) {
             handle_airports();
@@ -1152,7 +1917,24 @@ static void net_task(void *arg) {
             handle_track_flight();
         }
         if (req & UI_REQ_FETCH_FLIGHT_INFO) {
-            handle_flight_info();
+            // Skip only when Track already loaded THIS flight's schedule+route.
+            // (Old check skipped any follow with leftover waypoints — radar select stuck.)
+            bool skip = false;
+            xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+            if (g_state.follow_active && g_state.flight_info.schedule_ok &&
+                (g_state.flight_info.route_wpt_n > 0 || g_state.flight_track_n > 0)) {
+                const char *pf = g_state.pending_flight;
+                const char *ph = g_state.pending_hex;
+                const char *ff = g_state.flight_info.flight;
+                const char *fh = g_state.flight_info.hex;
+                const bool hex_same = ph[0] && fh[0] && strcasecmp(ph, fh) == 0;
+                const bool flt_same = pf[0] && ff[0] && strcasecmp(pf, ff) == 0;
+                skip = hex_same || flt_same;
+            }
+            xSemaphoreGive(g_state.mutex);
+            if (!skip) {
+                handle_flight_info();
+            }
         }
         if (req & UI_REQ_SEARCH_AIRPORTS) {
             handle_search_airports();
@@ -1168,11 +1950,85 @@ static void net_task(void *arg) {
         if (req & UI_REQ_REFRESH_PLATE_CITIES) {
             handle_refresh_plate_cities();
         }
+        if (req & UI_REQ_FETCH_PLATE_RADIOS) {
+            // Don't steal TLS while FA board / track is in this tick or newly queued.
+            const uint32_t busy = g_state.requests;
+            if ((req | busy) & (UI_REQ_FETCH_AIRPORT_BOARD | UI_REQ_TRACK_FLIGHT |
+                                UI_REQ_FETCH_FLIGHT_INFO | UI_REQ_FETCH_ROUTE_FLIGHTS)) {
+                __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_FETCH_PLATE_RADIOS);
+            } else {
+                char icao[8] = {0};
+                xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+                strncpy(icao, g_state.pending_plate_radios_icao, sizeof(icao) - 1);
+                xSemaphoreGive(g_state.mutex);
+                AirportRadios radios{};
+                const bool ok = icao[0] && net_lookup_airport_radios(icao, &radios);
+                xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+                if (ok && strcasecmp(icao, g_state.pending_plate_radios_icao) == 0) {
+                    g_state.plate_radios = radios;
+                    g_state.plate_radios_ok = true;
+                } else {
+                    g_state.plate_radios_ok = false;
+                }
+                xSemaphoreGive(g_state.mutex);
+                ui_notify_plate_radios(ok);
+            }
+        }
         if (req & UI_REQ_ROUTE_SEARCH) {
             handle_route_search();
         }
         if (req & UI_REQ_FETCH_ROUTE_FLIGHTS) {
             handle_fetch_route_flights();
+        }
+        if (req & UI_REQ_UPDATE_PLATES) {
+            ui_set_status("Updating plates…");
+            net_begin_psram_safe();
+            char icaos[48][8];
+            int n = 0;
+            const bool ok = net_fetch_plate_manifest(icaos, 48, &n);
+            net_end_psram_safe();
+            xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+            g_state.plate_pack_n = 0;
+            if (ok && n > 0) {
+                const int copy_n = (n > 48) ? 48 : n;
+                memcpy(g_state.plate_pack_icao, icaos, sizeof(char[8]) * (size_t)copy_n);
+                g_state.plate_pack_n = copy_n;
+            }
+            xSemaphoreGive(g_state.mutex);
+            if (ok && n > 0) {
+                faa_plates_queue_refresh(icaos, n);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Downloading %d plates…", n);
+                ui_notify_plates_updated(true, msg);
+                __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_FETCH_PLATE);
+            } else {
+                ui_notify_plates_updated(false, "Could not fetch plate list");
+                ui_set_status("Plate update failed");
+            }
+        }
+        // Plate downloads ONLY while Update Plates left FETCH_PLATE set — never auto-grab.
+        if (req & UI_REQ_FETCH_PLATE) {
+            const uint32_t busy = g_state.requests;
+            const uint32_t defer_mask = UI_REQ_FETCH_AIRPORT_BOARD | UI_REQ_TRACK_FLIGHT |
+                                        UI_REQ_FETCH_FLIGHT_INFO | UI_REQ_FETCH_ROUTE_FLIGHTS |
+                                        UI_REQ_NET_RECOVER;
+            if ((req | busy) & defer_mask) {
+                __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_FETCH_PLATE);
+            } else if (faa_plates_pending()) {
+                net_begin_psram_safe();
+                ui_set_status("Updating plates…");
+                const bool got = faa_plates_service();
+                net_end_psram_safe();
+                if (got) {
+                    ui_notify_plate_bitmap();
+                }
+                if (faa_plates_pending()) {
+                    __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_FETCH_PLATE);
+                } else if (faa_plates_bulk_finished()) {
+                    ui_notify_plates_updated(true, "Plates updated");
+                    ui_set_status("Plates updated");
+                }
+            }
         }
         // Wait until the radar screen is live so the first successful ADS-B
         // response is painted (fetching during the Wi-Fi splash skipped redraw).
@@ -1260,8 +2116,7 @@ void setup() {
         board_set_brightness(g_state.cfg.brightness);
     }
 
-    // Volume from NVS before init so boot chirp uses the user's level.
-    audio_set_volume(g_state.cfg.volume);
+    audio_set_volume(g_state.cfg.volume);  // default 50% on quieter scale
     audio_init();
 
 #ifndef BOARD_CROWPANEL_P4

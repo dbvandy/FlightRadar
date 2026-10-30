@@ -650,6 +650,16 @@ static float s_pinch_last_d = 0.0f;
 static void (*s_pinch_zoom_cb)(int dir) = nullptr;
 static constexpr float kPinchStepPx = 70.0f;
 
+/* User touch calibration (location mapping + pressure). */
+static float s_touch_ox = 0.0f;
+static float s_touch_oy = 0.0f;
+static float s_touch_sx = 1.0f;
+static float s_touch_sy = 1.0f;
+static int s_touch_pressure_min = 0;
+static int s_last_raw_x = 0;
+static int s_last_raw_y = 0;
+static int s_last_raw_strength = 0;
+
 bool lvgl_port_pinch_active(void)
 {
     return s_pinch_active;
@@ -658,6 +668,73 @@ bool lvgl_port_pinch_active(void)
 void lvgl_port_set_pinch_zoom_cb(void (*cb)(int dir))
 {
     s_pinch_zoom_cb = cb;
+}
+
+void lvgl_port_set_touch_map(float ox, float oy, float sx, float sy)
+{
+    s_touch_ox = ox;
+    s_touch_oy = oy;
+    s_touch_sx = (fabsf(sx) < 1e-4f) ? 1.0f : sx;
+    s_touch_sy = (fabsf(sy) < 1e-4f) ? 1.0f : sy;
+}
+
+void lvgl_port_get_touch_map(float *ox, float *oy, float *sx, float *sy)
+{
+    if (ox) {
+        *ox = s_touch_ox;
+    }
+    if (oy) {
+        *oy = s_touch_oy;
+    }
+    if (sx) {
+        *sx = s_touch_sx;
+    }
+    if (sy) {
+        *sy = s_touch_sy;
+    }
+}
+
+void lvgl_port_set_touch_pressure_min(int strength_min)
+{
+    if (strength_min < 0) {
+        strength_min = 0;
+    }
+    if (strength_min > 500) {
+        strength_min = 500;
+    }
+    s_touch_pressure_min = strength_min;
+}
+
+int lvgl_port_get_touch_pressure_min(void)
+{
+    return s_touch_pressure_min;
+}
+
+void lvgl_port_get_last_touch_raw(int *x, int *y, int *strength)
+{
+    if (x) {
+        *x = s_last_raw_x;
+    }
+    if (y) {
+        *y = s_last_raw_y;
+    }
+    if (strength) {
+        *strength = s_last_raw_strength;
+    }
+}
+
+static inline void map_touch_xy(int raw_x, int raw_y, lv_coord_t *out_x, lv_coord_t *out_y)
+{
+    float mx = s_touch_ox + s_touch_sx * (float)raw_x;
+    float my = s_touch_oy + s_touch_sy * (float)raw_y;
+    if (mx < 0.0f) {
+        mx = 0.0f;
+    }
+    if (my < 0.0f) {
+        my = 0.0f;
+    }
+    *out_x = (lv_coord_t)(mx + 0.5f);
+    *out_y = (lv_coord_t)(my + 0.5f);
 }
 
 static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
@@ -673,6 +750,11 @@ static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 
     /* Read data from touch controller (up to two fingers for pinch zoom) */
     int read_touch_result = tp->readPoints(points, 2, 0);
+    if (read_touch_result >= 1) {
+        s_last_raw_x = points[0].x;
+        s_last_raw_y = points[0].y;
+        s_last_raw_strength = points[0].strength;
+    }
     if (read_touch_result >= 2) {
         const float dx = (float)points[0].x - (float)points[1].x;
         const float dy = (float)points[0].y - (float)points[1].y;
@@ -689,6 +771,14 @@ static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
         return;  /* report released while pinching */
     }
     if (read_touch_result == 1 && !s_pinch_active) {
+        // Pass controller coordinates straight through (pre-calib behavior).
+        // map_touch_xy / pressure_min stay available for the calibrate UI but
+        // must not alter the live path — a bad remap locks the whole panel.
+        (void)s_touch_pressure_min;
+        (void)s_touch_ox;
+        (void)s_touch_oy;
+        (void)s_touch_sx;
+        (void)s_touch_sy;
         data->point.x = points[0].x;
         data->point.y = points[0].y;
         data->state = LV_INDEV_STATE_PRESSED;

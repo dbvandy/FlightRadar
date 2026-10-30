@@ -26,7 +26,8 @@
 #define AUDIO_GPIO_BCLK     (22)
 #define AUDIO_GPIO_SDATA    (23)  // DOUT
 #define AUDIO_GPIO_CTRL     (30)  // PA enable
-// Elecrow MicroPython speaker.py: pin.value(not state) → active-low (LOW = amp on).
+// Elecrow bsp_audio set_Audio_ctrl(state): gpio_set_level(CTRL, !state)
+// → active-low (LOW = amp on). Kept for docs; audio_click.cpp drives it directly.
 #ifndef AUDIO_PA_ACTIVE_HIGH
 #define AUDIO_PA_ACTIVE_HIGH 0
 #endif
