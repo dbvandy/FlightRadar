@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <strings.h>
 #include <time.h>
 
@@ -120,7 +121,8 @@ static bool parse_url(const char *url, bool *tls, char *host, size_t host_len, u
 static char *g_http_buf = nullptr;
 static size_t g_http_cap = 0;
 static size_t g_http_len = 0;
-static constexpr size_t kHttpBufCap = 192 * 1024;
+// Steady-state: airport boards are ~170 KB now; 192 KB left no headroom after headers.
+static constexpr size_t kHttpBufCap = 256 * 1024;
 static constexpr size_t kHttpBufCapFa = 768 * 1024;
 
 static bool ensure_http_buf_sized(size_t need) {
@@ -131,6 +133,8 @@ static bool ensure_http_buf_sized(size_t need) {
         return true;
     }
     // Large bodies must stay in PSRAM — internal fallback starves esp-aes DMA.
+    // Allocate the new slab BEFORE freeing the old one so a failed grow never
+    // leaves g_http_buf null (that broke airport board after FA flight-plan).
     char *p = (char *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!p && need <= 64 * 1024) {
         p = (char *)heap_caps_malloc(need, MALLOC_CAP_8BIT);
@@ -157,11 +161,18 @@ static void http_buf_shrink_default() {
     if (!g_http_buf || g_http_cap <= kHttpBufCap) {
         return;
     }
+    // Alloc-before-free: never drop the large buffer unless the smaller one exists.
+    char *p = (char *)heap_caps_malloc(kHttpBufCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        Serial.printf("HTTP shrink skipped (keep %u KB)\n", (unsigned)(g_http_cap / 1024));
+        g_http_len = 0;
+        return;
+    }
     heap_caps_free(g_http_buf);
-    g_http_buf = nullptr;
-    g_http_cap = 0;
+    g_http_buf = p;
+    g_http_cap = kHttpBufCap;
     g_http_len = 0;
-    ensure_http_buf();
+    Serial.printf("HTTP body buf: %u KB\n", (unsigned)(g_http_cap / 1024));
 }
 
 void net_init_buffers() {
@@ -2727,6 +2738,63 @@ static void fs_apply_flight(JsonObjectConst fl, FlightInfo *fi) {
                       fi->arr_terminal[0] || fi->status[0] || fi->route_ok || fi->flight_date[0];
 }
 
+/** True when the FlightStats page is the airborne/current sortie (not landed, not next scheduled). */
+static bool fs_flight_is_current_airborne(JsonObjectConst fl) {
+    if (fl.isNull()) {
+        return false;
+    }
+    if (fl["isLanded"] | false) {
+        return false;  // previous leg already on the ground
+    }
+    if (fl["isTracking"] | false) {
+        return true;
+    }
+    JsonObjectConst note = fl["flightNote"];
+    if (!note.isNull()) {
+        if (note["landed"] | false) {
+            return false;
+        }
+        if ((note["tracking"] | false) || (note["hasDepartedRunway"] | false) ||
+            (note["hasDepartedGate"] | false)) {
+            return true;
+        }
+    }
+    const char *st = fl["status"]["status"] | "";
+    const char *code = fl["status"]["statusCode"] | "";
+    const char *state = fl["flightState"] | "";
+    if (strcasecmp(code, "S") == 0 || strcasecmp(st, "Scheduled") == 0 ||
+        strcasecmp(state, "scheduled") == 0 || strcasecmp(state, "future") == 0) {
+        return false;
+    }
+    if (st[0] && (strcasestr(st, "en route") || strcasestr(st, "enroute") || strcasestr(st, "airborne") ||
+                  strcasestr(st, "active"))) {
+        return true;
+    }
+    if (state[0] && (strcasecmp(state, "airborne") == 0 || strcasecmp(state, "active") == 0)) {
+        return true;
+    }
+    return false;
+}
+
+/** Decode a few JSON \\uXXXX escapes in-place (FlightStats URLs use \\u0026 for &). */
+static void fs_unescape_url(char *s) {
+    if (!s) {
+        return;
+    }
+    char *r = s, *w = s;
+    while (*r) {
+        if (r[0] == '\\' && r[1] == 'u' && isxdigit((unsigned char)r[2]) && isxdigit((unsigned char)r[3]) &&
+            isxdigit((unsigned char)r[4]) && isxdigit((unsigned char)r[5])) {
+            const int v = (int)strtol(r + 2, nullptr, 16);
+            *w++ = (char)(v & 0xff);
+            r += 6;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = 0;
+}
+
 static bool fs_pick_current_url(JsonObjectConst tracker, char *url_out, size_t url_len) {
     if (url_out && url_len) {
         url_out[0] = 0;
@@ -2735,8 +2803,10 @@ static bool fs_pick_current_url(JsonObjectConst tracker, char *url_out, size_t u
         return false;
     }
     JsonObjectConst cur = tracker["flight"];
-    if (fs_flight_is_live(cur)) {
-        return false;  // already on the current page
+    // Default FS page is often the *next* scheduled OR a just-landed prior turn.
+    // Only skip the otherDays scan when we're clearly on the airborne leg.
+    if (fs_flight_is_current_airborne(cur)) {
+        return false;
     }
 
     const time_t now = time(nullptr);
@@ -2768,7 +2838,12 @@ static bool fs_pick_current_url(JsonObjectConst tracker, char *url_out, size_t u
                 }
                 if (clock_ok) {
                     // Latest departure at or before ~now+2h (covers airborne / just departed).
+                    // Ignore far-future scheduled turns (tomorrow's ATL-ORD, etc.).
                     if (ts > (long)now + 2 * 3600) {
+                        continue;
+                    }
+                    // Ignore ancient history (keep the current operating day ± prior turn).
+                    if (ts < (long)now - 18 * 3600) {
                         continue;
                     }
                 } else if (cur_ts > 0) {
@@ -2789,12 +2864,15 @@ static bool fs_pick_current_url(JsonObjectConst tracker, char *url_out, size_t u
         return false;
     }
     // Relative path like /flight-tracker/AA/100?year=...
-    if (best_url[0] == '/') {
-        snprintf(url_out, url_len, "https://www.flightstats.com/v2%s", best_url);
-    } else if (strncmp(best_url, "http", 4) == 0) {
-        copy_trunc(url_out, url_len, best_url);
+    char path[192];
+    copy_trunc(path, sizeof(path), best_url);
+    fs_unescape_url(path);
+    if (path[0] == '/') {
+        snprintf(url_out, url_len, "https://www.flightstats.com/v2%s", path);
+    } else if (strncmp(path, "http", 4) == 0) {
+        copy_trunc(url_out, url_len, path);
     } else {
-        snprintf(url_out, url_len, "https://www.flightstats.com/v2/flight-tracker/%s", best_url);
+        snprintf(url_out, url_len, "https://www.flightstats.com/v2/flight-tracker/%s", path);
     }
     return true;
 }
@@ -3041,22 +3119,70 @@ static bool fa_nearest_airport_name(char *out, size_t out_len, float lat, float 
     return true;
 }
 
-static bool fa_is_airway_or_proc(const char *t) {
-    // Airways (B474, Q140) and SID/STAR (HTOWN3): letters + digits, not pure alpha.
-    if (!t || !t[0]) {
+/** True jet/victor/RNAV airway designator (Q118, J80, V8, T295…) — not a SID/STAR. */
+static bool fa_is_airway(const char *t) {
+    if (!t || !t[0] || !t[1]) {
         return false;
     }
-    bool has_alpha = false, has_digit = false;
-    for (const char *p = t; *p; p++) {
-        if (isalpha((unsigned char)*p)) {
-            has_alpha = true;
-        } else if (isdigit((unsigned char)*p)) {
-            has_digit = true;
-        } else {
+    const char c0 = (char)toupper((unsigned char)t[0]);
+    // Single-letter airways: A/B/G/J/L/Q/R/T/V/W + digits.
+    if ((c0 == 'A' || c0 == 'B' || c0 == 'G' || c0 == 'J' || c0 == 'L' || c0 == 'Q' || c0 == 'R' ||
+         c0 == 'T' || c0 == 'V' || c0 == 'W') &&
+        isdigit((unsigned char)t[1])) {
+        for (const char *p = t + 1; *p; p++) {
+            if (!isdigit((unsigned char)*p)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // Two-letter continental airways (UG1, UL612, UA35…).
+    if (isalpha((unsigned char)t[0]) && isalpha((unsigned char)t[1])) {
+        bool dig = false;
+        for (const char *p = t + 2; *p; p++) {
+            if (isdigit((unsigned char)*p)) {
+                dig = true;
+            } else if (!isalpha((unsigned char)*p)) {
+                return false;
+            } else if (dig) {
+                return false;
+            }
+        }
+        return dig && strlen(t) <= 6;
+    }
+    return false;
+}
+
+/** SID/STAR like VARNM2 / VEECK5 / CHPPR1 — letters then trailing version digits. */
+static bool fa_sid_star_base(const char *t, char *base, size_t base_len) {
+    if (!t || !base || base_len < 3) {
+        return false;
+    }
+    size_t n = strlen(t);
+    if (n < 4 || n > 10) {
+        return false;
+    }
+    size_t i = n;
+    while (i > 0 && isdigit((unsigned char)t[i - 1])) {
+        i--;
+    }
+    if (i < 3 || i == n) {
+        return false;  // need ≥3 letters and ≥1 trailing digit
+    }
+    for (size_t k = 0; k < i; k++) {
+        if (!isalpha((unsigned char)t[k])) {
             return false;
         }
     }
-    return has_alpha && has_digit;
+    if (i + 1 > base_len) {
+        return false;
+    }
+    memcpy(base, t, i);
+    base[i] = 0;
+    for (char *q = base; *q; q++) {
+        *q = (char)toupper((unsigned char)*q);
+    }
+    return true;
 }
 
 static bool net_lookup_waypoint(const char *name, float *lat, float *lon) {
@@ -3145,6 +3271,11 @@ static bool fa_resolve_named_fix(const char *name, float *lat, float *lon) {
     if (net_lookup_waypoint(name, lat, lon)) {
         return true;
     }
+    // SID/STAR designator → underlying fix (VARNM2→VARNM, VEECK5→VEECK).
+    char base[12];
+    if (fa_sid_star_base(name, base, sizeof(base)) && net_lookup_waypoint(base, lat, lon)) {
+        return true;
+    }
     return false;
 }
 
@@ -3205,16 +3336,51 @@ static int fa_parse_waypoints_array(const char *html, float *lats, float *lons, 
     return n;
 }
 
+/** Copy a JSON \"route\":\"…\" value at p (points at first char after opening quote). */
+static bool fa_copy_route_value(const char *p, char *out, size_t out_len) {
+    if (!p || !out || out_len < 8) {
+        return false;
+    }
+    size_t i = 0;
+    while (p[i] && p[i] != '"' && i + 1 < out_len) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = 0;
+    return i > 0;
+}
+
 static bool fa_extract_route_string(const char *html, char *out, size_t out_len) {
     if (!html || !out || out_len < 8) {
         return false;
     }
     out[0] = 0;
+    // Prefer the airborne flightPlan (activityLog lists future legs first with empty routes).
+    const char *air = strstr(html, "\"flightStatus\":\"airborne\"");
+    if (air && air > html + 200) {
+        const char *fp = nullptr;
+        for (const char *q = air - 14; q >= html && (size_t)(air - q) < 3000; q--) {
+            if (strncmp(q, "\"flightPlan\":{", 14) == 0) {
+                fp = q;
+                break;
+            }
+        }
+        if (fp) {
+            const char *p = strstr(fp, "\"route\":\"");
+            if (p && (size_t)(p - fp) < 800) {
+                p += strlen("\"route\":\"");
+                if (fa_copy_route_value(p, out, out_len)) {
+                    return true;
+                }
+            }
+        }
+    }
+
     // FlightAware Flight Data → Route is flightPlan.route in trackpollBootstrap.
     // Live/scheduled legs often have "route":"" — skip empties and keep scanning
     // (history page / prior activity entries carry the filed IFR string).
     const char *search = html;
-    for (int attempt = 0; attempt < 12; attempt++) {
+    for (int attempt = 0; attempt < 24; attempt++) {
         const char *fp = strstr(search, "\"flightPlan\":{");
         if (!fp) {
             break;
@@ -3225,33 +3391,208 @@ static bool fa_extract_route_string(const char *html, char *out, size_t out_len)
             continue;
         }
         p += strlen("\"route\":\"");
-        size_t i = 0;
-        while (p[i] && p[i] != '"' && i + 1 < out_len) {
-            out[i] = p[i];
-            i++;
-        }
-        out[i] = 0;
-        if (i > 0) {
-            return true;  // filed IFR route from Flight Data
+        if (fa_copy_route_value(p, out, out_len)) {
+            return true;
         }
         search = fp + 14;
     }
     return false;
 }
 
+/** True when a FA times object has a numeric \"actual\" (not null). */
+static bool fa_times_actual_set(const char *obj, size_t span) {
+    if (!obj) {
+        return false;
+    }
+    const char *limit = obj + (span ? span : 160);
+    const char *a = strstr(obj, "\"actual\":");
+    if (!a || a >= limit) {
+        return false;
+    }
+    a += 9;
+    while (*a == ' ' || *a == '\t') {
+        a++;
+    }
+    if (strncmp(a, "null", 4) == 0) {
+        return false;
+    }
+    return (*a >= '0' && *a <= '9');
+}
+
+/** Extract ICAO pair from FA history path …/history/YYYYMMDD/HHMMZ/KATL/KORD. */
+static bool fa_hist_path_airports(const char *path, char *origin, size_t origin_len, char *dest,
+                                  size_t dest_len) {
+    if (!path || !origin || !dest) {
+        return false;
+    }
+    const char *h = strstr(path, "/history/");
+    if (!h) {
+        return false;
+    }
+    // /history/20261029/2337Z/KATL/KORD
+    const char *p = h + 9;
+    int slash = 0;
+    const char *o = nullptr;
+    const char *d = nullptr;
+    for (; *p; p++) {
+        if (*p == '/') {
+            slash++;
+            if (slash == 2) {
+                o = p + 1;
+            } else if (slash == 3) {
+                d = p + 1;
+                break;
+            }
+        }
+    }
+    if (!o || !d) {
+        return false;
+    }
+    size_t ol = 0;
+    while (o[ol] && o[ol] != '/' && o[ol] != '"' && ol + 1 < origin_len) {
+        ol++;
+    }
+    size_t dl = 0;
+    while (d[dl] && d[dl] != '/' && d[dl] != '"' && d[dl] != '?' && dl + 1 < dest_len) {
+        dl++;
+    }
+    if (ol < 3 || ol > 4 || dl < 3 || dl > 4) {
+        return false;
+    }
+    memcpy(origin, o, ol);
+    origin[ol] = 0;
+    memcpy(dest, d, dl);
+    dest[dl] = 0;
+    for (char *q = origin; *q; q++) {
+        *q = (char)toupper((unsigned char)*q);
+    }
+    for (char *q = dest; *q; q++) {
+        *q = (char)toupper((unsigned char)*q);
+    }
+    return true;
+}
+
+/**
+ * Pick the current activityLog leg: prefer airborne (actual takeoff, no actual landing).
+ * Falls back to the most recent completed takeoff. Fills ICAO origin/dest + history path.
+ * \"operated\" on the live page often points at a *future* scheduled turn — do not use it.
+ */
+static bool fa_pick_current_activity(const char *html, char *origin, size_t origin_len, char *dest,
+                                     size_t dest_len, char *hist_path, size_t hist_len) {
+    if (origin && origin_len) {
+        origin[0] = 0;
+    }
+    if (dest && dest_len) {
+        dest[0] = 0;
+    }
+    if (hist_path && hist_len) {
+        hist_path[0] = 0;
+    }
+    if (!html || !origin || !dest || !hist_path || origin_len < 5 || dest_len < 5 || hist_len < 24) {
+        return false;
+    }
+    const char *log = strstr(html, "\"activityLog\"");
+    if (!log) {
+        return false;
+    }
+    // activityLog sits near the end of the bootstrap blob (~60–80 KB of flights).
+    const char *end = log + 90000;
+    const char *boot = strstr(log, "trackpollBootstrap");
+    if (boot && boot < end) {
+        end = boot;
+    }
+
+    const char *best_air_to = nullptr;
+    const char *best_done_to = nullptr;
+    for (const char *p = log; p && p < end;) {
+        const char *to = strstr(p, "\"takeoffTimes\":{");
+        if (!to || to >= end) {
+            break;
+        }
+        if (!fa_times_actual_set(to, 160)) {
+            p = to + 16;
+            continue;
+        }
+        const char *ld = strstr(to, "\"landingTimes\":{");
+        if (!ld || ld > to + 240) {
+            p = to + 16;
+            continue;
+        }
+        const bool landed = fa_times_actual_set(ld, 160);
+        if (!landed) {
+            // activityLog is newest-first — first airborne entry is the current leg.
+            best_air_to = to;
+            break;
+        }
+        if (!best_done_to) {
+            best_done_to = to;  // first completed = most recent landing
+        }
+        p = to + 16;
+    }
+
+    const char *pick = best_air_to ? best_air_to : best_done_to;
+    if (!pick) {
+        return false;
+    }
+
+    // History URL is usually after the times objects in the same flight record.
+    const char *url = nullptr;
+    for (const char *u = pick; u && u < pick + 2500 && u < end;) {
+        const char *hit = strstr(u, "\"/live/flight/");
+        if (!hit || hit >= pick + 2500 || hit >= end) {
+            break;
+        }
+        if (strstr(hit, "/history/") && hit < pick + 2500) {
+            url = hit + 1;  // skip leading quote
+            break;
+        }
+        u = hit + 14;
+    }
+    // Also search backward a bit (URL can precede times in some payloads).
+    if (!url) {
+        const char *window = pick - 2000;
+        if (window < log) {
+            window = log;
+        }
+        for (const char *u = window; u && u < pick;) {
+            const char *hit = strstr(u, "\"/live/flight/");
+            if (!hit || hit >= pick) {
+                break;
+            }
+            if (strstr(hit, "/history/")) {
+                url = hit + 1;
+            }
+            u = hit + 14;
+        }
+    }
+    if (!url) {
+        return false;
+    }
+
+    size_t pi = 0;
+    while (url[pi] && url[pi] != '"' && pi + 1 < hist_len) {
+        hist_path[pi] = url[pi];
+        pi++;
+    }
+    hist_path[pi] = 0;
+
+    if (!fa_hist_path_airports(hist_path, origin, origin_len, dest, dest_len)) {
+        return false;
+    }
+    Serial.printf("FlightAware activity leg %s→%s %s\n", origin, dest, hist_path);
+    return true;
+}
+
 static void fa_push_route_wpt(FlightInfo *fi, const char *name, float lat, float lon) {
     if (!fi || fi->route_wpt_n >= FR_MAX_ROUTE_WPTS) {
         return;
     }
-    // Skip duplicates (same name or nearly same position).
+    // Skip nearly-identical positions; allow the same fix name only if far apart
+    // (nearest-FAA labeling often repeats a name across consecutive polyline samples).
     for (int i = 0; i < fi->route_wpt_n; i++) {
-        if (name && name[0] && strcasecmp(fi->route_wpts[i].name, name) == 0) {
-            return;
-        }
         float dlat = fi->route_wpts[i].lat - lat;
         float dlon = fi->route_wpts[i].lon - lon;
-        if (dlat * dlat + dlon * dlon < 1e-6f) {
-            // Upgrade blank label if we now have a real name.
+        if (dlat * dlat + dlon * dlon < 1e-4f) {  // ~0.6 nm
             if (name && name[0] && !fi->route_wpts[i].name[0]) {
                 copy_trunc(fi->route_wpts[i].name, sizeof(fi->route_wpts[i].name), name);
                 for (char *q = fi->route_wpts[i].name; *q; q++) {
@@ -3259,6 +3600,13 @@ static void fa_push_route_wpt(FlightInfo *fi, const char *name, float lat, float
                 }
             }
             return;
+        }
+        if (name && name[0] && fi->route_wpts[i].name[0] &&
+            strcasecmp(fi->route_wpts[i].name, name) == 0) {
+            // Same label already on path — keep the earlier pin unless this is distant.
+            if (dlat * dlat + dlon * dlon < 0.25f) {  // < ~30 nm
+                return;
+            }
         }
     }
     RouteWaypoint &w = fi->route_wpts[fi->route_wpt_n++];
@@ -3275,6 +3623,39 @@ static void fa_push_route_wpt(FlightInfo *fi, const char *name, float lat, float
     w.ok = true;
 }
 
+/** Approx great-circle distance in nm (flat-earth); local helper for snap threshold. */
+static float wpt_dist_proxy_nm(float lat1, float lon1, float lat2, float lon2) {
+    const float mid = (lat1 + lat2) * 0.5f;
+    float cos_lat = cosf(mid * FR_DEG2RAD);
+    if (cos_lat < 0.15f) {
+        cos_lat = 0.15f;
+    }
+    const float dlat = (lat2 - lat1) * 60.0f;
+    const float dlon = (lon2 - lon1) * 60.0f * cos_lat;
+    return sqrtf(dlat * dlat + dlon * dlon);
+}
+
+/** Label a polyline vertex from the FAA fix DB (preferred) or a nearby airport. */
+static void fa_label_path_point(float lat, float lon, char *lbl, size_t lbl_len) {
+    if (!lbl || lbl_len < 4) {
+        return;
+    }
+    lbl[0] = 0;
+    // Prefer enroute fixes over airports so the path isn't all "Kxxx".
+    if (net_nearest_waypoint(lat, lon, 35.0f, lbl, lbl_len) && lbl[0]) {
+        return;
+    }
+    if (fa_nearest_airport_name(lbl, lbl_len, lat, lon, 12.0f) && lbl[0]) {
+        return;
+    }
+    copy_trunc(lbl, lbl_len, "WPT");
+}
+
+/**
+ * Build follow waypoints: FA path polyline → many points, each named from the
+ * flash FAA NASR fix DB. Filed IFR tokens (GLAZR, VOSTK, …) are force-included
+ * when resolvable; airways (Q118) are skipped (geometry comes from the polyline).
+ */
 static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *wlats, const float *wlons,
                                int wn) {
     if (!fi) {
@@ -3283,44 +3664,66 @@ static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *w
     fi->route_wpt_n = 0;
     memset(fi->route_wpts, 0, sizeof(fi->route_wpts));
 
-    // Seed with origin / destination airports when known.
-    if (fi->origin[0]) {
-        float lat = 0, lon = 0;
-        if (net_lookup_airport(fi->origin, &lat, &lon, nullptr) ||
-            net_lookup_airport_iata(fi->origin, nullptr, 0, &lat, &lon)) {
-            fa_push_route_wpt(fi, fi->origin, lat, lon);
+    auto push_origin = [&]() {
+        if (fi->origin[0]) {
+            float lat = 0, lon = 0;
+            if (net_lookup_airport(fi->origin, &lat, &lon, nullptr) ||
+                net_lookup_airport_iata(fi->origin, nullptr, 0, &lat, &lon)) {
+                fa_push_route_wpt(fi, fi->origin, lat, lon);
+            } else if (wn > 0) {
+                fa_push_route_wpt(fi, fi->origin, wlats[0], wlons[0]);
+            }
         } else if (wn > 0) {
-            fa_push_route_wpt(fi, fi->origin, wlats[0], wlons[0]);
+            fa_push_route_wpt(fi, "DEP", wlats[0], wlons[0]);
         }
-    } else if (wn > 0) {
-        fa_push_route_wpt(fi, "DEP", wlats[0], wlons[0]);
-    }
+    };
+    auto push_dest = [&]() {
+        if (fi->dest[0]) {
+            float lat = 0, lon = 0;
+            if (net_lookup_airport(fi->dest, &lat, &lon, nullptr) ||
+                net_lookup_airport_iata(fi->dest, nullptr, 0, &lat, &lon)) {
+                fa_push_route_wpt(fi, fi->dest, lat, lon);
+            } else if (wn > 0) {
+                fa_push_route_wpt(fi, fi->dest, wlats[wn - 1], wlons[wn - 1]);
+            }
+        } else if (wn > 0) {
+            fa_push_route_wpt(fi, "ARR", wlats[wn - 1], wlons[wn - 1]);
+        }
+    };
 
-    int wp_cursor = (fi->route_wpt_n > 0 && wn > 1) ? 1 : 0;
-    if (!route || !route[0]) {
-        // No filed string — draw FA polyline; name via nearby airport or lat/lon fix style.
-        const int last = wn - (wn > 1 ? 1 : 0);
-        const int span = last - wp_cursor;
-        const int step = (span > 20) ? (span / 16) : 1;
-        for (int i = wp_cursor; i < last; i++) {
-            if (fi->route_wpt_n >= FR_MAX_ROUTE_WPTS - 1) {
-                break;
+    push_origin();
+
+    // --- Primary: dense FlightAware path, named via FAA fix DB ---
+    // Walk the polyline; emit a pin when the nearest FAA fix changes or we've
+    // traveled far enough — yields many named enroute points without an airway DB.
+    if (wn >= 3) {
+        char prev_lbl[14] = {0};
+        float prev_lat = 0, prev_lon = 0;
+        bool have_prev = false;
+        for (int i = 1; i < wn - 1 && fi->route_wpt_n < FR_MAX_ROUTE_WPTS - 1; i++) {
+            char lbl[14];
+            fa_label_path_point(wlats[i], wlons[i], lbl, sizeof(lbl));
+            float flat = wlats[i], flon = wlons[i];
+            float dlat = 0, dlon = 0;
+            if (lbl[0] && strcmp(lbl, "WPT") != 0 && net_lookup_waypoint(lbl, &dlat, &dlon)) {
+                if (wpt_dist_proxy_nm(wlats[i], wlons[i], dlat, dlon) < 20.0f) {
+                    flat = dlat;
+                    flon = dlon;
+                }
             }
-            if (i != wp_cursor && i != last - 1 && step > 1 && ((i - wp_cursor) % step) != 0) {
-                continue;
-            }
-            char lbl[12];
-            // Prefer nearby airport, else nearest 5-letter FAA fix — never W# / raw lat-lon tags.
-            if (fa_nearest_airport_name(lbl, sizeof(lbl), wlats[i], wlons[i], 8.0f)) {
-                fa_push_route_wpt(fi, lbl, wlats[i], wlons[i]);
-            } else if (net_nearest_waypoint(wlats[i], wlons[i], 25.0f, lbl, sizeof(lbl))) {
-                fa_push_route_wpt(fi, lbl, wlats[i], wlons[i]);
-            } else {
-                // Keep geometry without a fake name; UI skips empty labels.
-                fa_push_route_wpt(fi, "", wlats[i], wlons[i]);
+            const bool same_fix = have_prev && lbl[0] && prev_lbl[0] && strcasecmp(lbl, prev_lbl) == 0;
+            const float since = have_prev ? wpt_dist_proxy_nm(prev_lat, prev_lon, flat, flon) : 999.0f;
+            // New fix name, or same fix but we've moved ≥25 nm along track.
+            if (!have_prev || !same_fix || since >= 25.0f) {
+                fa_push_route_wpt(fi, lbl, flat, flon);
+                copy_trunc(prev_lbl, sizeof(prev_lbl), lbl);
+                prev_lat = flat;
+                prev_lon = flon;
+                have_prev = true;
             }
         }
-    } else {
+    } else if (route && route[0]) {
+        // No polyline — resolve filed tokens against FAA DB / airports.
         char buf[384];
         copy_trunc(buf, sizeof(buf), route);
         char *save = nullptr;
@@ -3328,75 +3731,82 @@ static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *w
             if (!tok[0] || strcasecmp(tok, "DCT") == 0) {
                 continue;
             }
-            // Only strip /M082F290-style altitude — keep 4500N/07300W intact.
             char *slash = strchr(tok, '/');
             if (slash && fa_is_speed_alt_token(slash + 1)) {
                 *slash = 0;
             }
-            if (!tok[0] || fa_is_speed_alt_token(tok)) {
+            if (!tok[0] || fa_is_speed_alt_token(tok) || fa_is_airway(tok)) {
                 continue;
             }
-
-            float lat = 0, lon = 0;
-            bool have = false;
             char label[14];
             copy_trunc(label, sizeof(label), tok);
             for (char *q = label; *q; q++) {
                 *q = (char)toupper((unsigned char)*q);
             }
-
-            // Lat/lon fixes first (23S163E or 4500N/07300W).
+            float lat = 0, lon = 0;
+            char base[12];
             if (decode_icao_ll_fix(label, &lat, &lon)) {
-                have = true;
-            } else if (fa_is_airway_or_proc(label)) {
-                continue;
-            } else if (fa_resolve_named_fix(label, &lat, &lon)) {
-                have = true;
-            } else if (wn > 0 && wp_cursor < wn) {
-                // Unresolved named fix (GREKI, NOBAR, …): place on FA polyline, keep the name.
-                lat = wlats[wp_cursor];
-                lon = wlons[wp_cursor];
-                wp_cursor++;
-                have = true;
-            }
-
-            if (have) {
-                if (wn > 0) {
-                    float best_d = 1e30f;
-                    int best_i = wp_cursor;
-                    for (int i = wp_cursor; i < wn; i++) {
-                        float dlat = wlats[i] - lat;
-                        float dlon = wlons[i] - lon;
-                        float d = dlat * dlat + dlon * dlon;
-                        if (d < best_d) {
-                            best_d = d;
-                            best_i = i;
-                        }
-                        if (i > wp_cursor + 2 && d > best_d * 4.0f && best_d < 25.0f) {
-                            break;
-                        }
-                    }
-                    if (best_i + 1 > wp_cursor) {
-                        wp_cursor = best_i + 1;
-                    }
-                }
                 fa_push_route_wpt(fi, label, lat, lon);
+            } else if (fa_resolve_named_fix(label, &lat, &lon)) {
+                if (fa_sid_star_base(label, base, sizeof(base)) && net_lookup_waypoint(base, &lat, &lon)) {
+                    fa_push_route_wpt(fi, base, lat, lon);
+                } else {
+                    fa_push_route_wpt(fi, label, lat, lon);
+                }
             }
         }
     }
 
-    if (fi->dest[0]) {
-        float lat = 0, lon = 0;
-        if (net_lookup_airport(fi->dest, &lat, &lon, nullptr) ||
-            net_lookup_airport_iata(fi->dest, nullptr, 0, &lat, &lon)) {
-            fa_push_route_wpt(fi, fi->dest, lat, lon);
-        } else if (wn > 0) {
-            fa_push_route_wpt(fi, fi->dest, wlats[wn - 1], wlons[wn - 1]);
+    // --- Upgrade / inject filed IFR fix names onto the path ---
+    if (route && route[0] && wn >= 2) {
+        char buf[384];
+        copy_trunc(buf, sizeof(buf), route);
+        char *save = nullptr;
+        for (char *tok = strtok_r(buf, " ", &save); tok; tok = strtok_r(nullptr, " ", &save)) {
+            if (!tok[0] || strcasecmp(tok, "DCT") == 0 || fa_is_airway(tok) || fa_is_speed_alt_token(tok)) {
+                continue;
+            }
+            char *slash = strchr(tok, '/');
+            if (slash && fa_is_speed_alt_token(slash + 1)) {
+                *slash = 0;
+            }
+            char label[14];
+            copy_trunc(label, sizeof(label), tok);
+            for (char *q = label; *q; q++) {
+                *q = (char)toupper((unsigned char)*q);
+            }
+            float lat = 0, lon = 0;
+            char use_name[14];
+            copy_trunc(use_name, sizeof(use_name), label);
+            char base[12];
+            if (fa_sid_star_base(label, base, sizeof(base)) && net_lookup_waypoint(base, &lat, &lon)) {
+                copy_trunc(use_name, sizeof(use_name), base);
+            } else if (!fa_resolve_named_fix(label, &lat, &lon)) {
+                continue;
+            }
+            // If already near an existing path point, just rename it; else insert.
+            int best_i = -1;
+            float best_d = 1e30f;
+            for (int i = 0; i < fi->route_wpt_n; i++) {
+                float dlat = fi->route_wpts[i].lat - lat;
+                float dlon = fi->route_wpts[i].lon - lon;
+                float d = dlat * dlat + dlon * dlon;
+                if (d < best_d) {
+                    best_d = d;
+                    best_i = i;
+                }
+            }
+            if (best_i >= 0 && best_d < (0.35f * 0.35f)) {  // ~20 nm @ mid-lat-ish
+                copy_trunc(fi->route_wpts[best_i].name, sizeof(fi->route_wpts[best_i].name), use_name);
+                fi->route_wpts[best_i].lat = lat;
+                fi->route_wpts[best_i].lon = lon;
+            } else if (fi->route_wpt_n < FR_MAX_ROUTE_WPTS) {
+                fa_push_route_wpt(fi, use_name, lat, lon);
+            }
         }
-    } else if (wn > 0) {
-        fa_push_route_wpt(fi, "ARR", wlats[wn - 1], wlons[wn - 1]);
     }
 
+    push_dest();
     return fi->route_wpt_n;
 }
 
@@ -3542,52 +3952,93 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
         Serial.printf("FlightAware track pts=%d\n", tn);
     }
 
+    // Prefer the airborne activityLog leg over \"operated\" (often tomorrow's schedule).
+    char act_origin[8] = {0};
+    char act_dest[8] = {0};
+    char hist_path[160] = {0};
+    const bool have_act =
+        fa_pick_current_activity(html, act_origin, sizeof(act_origin), act_dest, sizeof(act_dest),
+                                 hist_path, sizeof(hist_path));
+    if (have_act) {
+        const bool od_changed =
+            !fi->origin[0] || !fi->dest[0] || strcasecmp(fi->origin, act_origin) != 0 ||
+            strcasecmp(fi->dest, act_dest) != 0;
+        if (od_changed) {
+            // Drop times/gates/names from a wrong (future or prior) FlightStats leg.
+            fi->dep_time[0] = fi->dep_act[0] = fi->dep_est[0] = 0;
+            fi->arr_time[0] = fi->arr_act[0] = fi->arr_est[0] = 0;
+            fi->dep_gate[0] = fi->arr_gate[0] = 0;
+            fi->dep_terminal[0] = fi->arr_terminal[0] = 0;
+            fi->dep_act_epoch = fi->arr_act_epoch = fi->arr_est_epoch = 0;
+            fi->origin_name[0] = fi->dest_name[0] = 0;
+        }
+        // Overwrite schedule OD when FA has a clearer current/airborne turn.
+        copy_trunc(fi->origin, sizeof(fi->origin), act_origin);
+        copy_trunc(fi->dest, sizeof(fi->dest), act_dest);
+        fi->departed = true;
+        fi->schedule_ok = true;
+        fi->route_ok = true;
+        if (!fi->status[0] || strcasecmp(fi->status, "Scheduled") == 0) {
+            copy_trunc(fi->status, sizeof(fi->status), "En Route");
+        }
+        if (!fi->origin_name[0] || !fi->dest_name[0]) {
+            net_fetch_airport_names(fi->origin, fi->dest, fi->origin_name, sizeof(fi->origin_name),
+                                    fi->dest_name, sizeof(fi->dest_name));
+        }
+    }
+
     char route[384] = {0};
     fa_extract_route_string(html, route, sizeof(route));
 
-    float wlats[96];
-    float wlons[96];
-    int wn = fa_parse_waypoints_array(html, wlats, wlons, 96);
+    constexpr int kFaPolyMax = 128;
+    float wlats[kFaPolyMax];
+    float wlons[kFaPolyMax];
+    int wn = fa_parse_waypoints_array(html, wlats, wlons, kFaPolyMax);
     Serial.printf("FlightAware route_len=%u waypoints=%d\n", (unsigned)strlen(route), wn);
 
-    // Live legs often have empty flightPlan.route — try the operated history URL for the filed string.
-    if (!route[0]) {
+    // Live/future pages often have empty flightPlan.route — pull filed string + path
+    // from the current activity history URL (not \"operated\", which may be future).
+    if (!hist_path[0]) {
         const char *op = strstr(html, "\"operated\":\"/live/flight/");
         if (op) {
             op += strlen("\"operated\":\"");
-            char path[160];
             size_t pi = 0;
-            while (op[pi] && op[pi] != '"' && pi + 1 < sizeof(path)) {
-                path[pi] = op[pi];
+            while (op[pi] && op[pi] != '"' && pi + 1 < sizeof(hist_path)) {
+                hist_path[pi] = op[pi];
                 pi++;
             }
-            path[pi] = 0;
-            if (path[0] == '/') {
-                char hist_url[192];
-                snprintf(hist_url, sizeof(hist_url), "https://www.flightaware.com%s", path);
-                Serial.printf("FlightAware history %s\n", path);
-                status_msg("FlightAware filed route...");
-                if (https_get(hist_url, nullptr, kUaBrowser, 10000, 90000,
-                              "text/html,application/xhtml+xml,*/*", true)) {
-                    size_t hlen = 0;
-                    const char *hhtml = http_body_buf(&hlen);
-                    if (hhtml && hlen > 800) {
-                        fa_extract_route_string(hhtml, route, sizeof(route));
-                        if (wn <= 0) {
-                            wn = fa_parse_waypoints_array(hhtml, wlats, wlons, 96);
-                        }
-                        // Prefer history-page track when live page had few/no samples.
-                        if (track_out && track_max > 0 && (!track_n || *track_n < 8)) {
-                            const int tn = fa_parse_track_array(hhtml, track_out, track_max);
-                            if (track_n) {
-                                *track_n = tn;
-                            }
-                            Serial.printf("FlightAware history track pts=%d\n", tn);
-                        }
-                        Serial.printf("FlightAware history route_len=%u waypoints=%d\n",
-                                      (unsigned)strlen(route), wn);
-                    }
+            hist_path[pi] = 0;
+        }
+    }
+    if (hist_path[0] == '/') {
+        char hist_url[192];
+        snprintf(hist_url, sizeof(hist_url), "https://www.flightaware.com%s", hist_path);
+        Serial.printf("FlightAware history %s\n", hist_path);
+        status_msg("FlightAware filed route...");
+        if (https_get(hist_url, nullptr, kUaBrowser, 10000, 90000, "text/html,application/xhtml+xml,*/*",
+                      true)) {
+            size_t hlen = 0;
+            const char *hhtml = http_body_buf(&hlen);
+            if (hhtml && hlen > 800) {
+                char hist_route[384] = {0};
+                fa_extract_route_string(hhtml, hist_route, sizeof(hist_route));
+                if (hist_route[0]) {
+                    copy_trunc(route, sizeof(route), hist_route);
                 }
+                const int hwn = fa_parse_waypoints_array(hhtml, wlats, wlons, kFaPolyMax);
+                if (hwn > 0) {
+                    wn = hwn;  // history page path is for this leg
+                }
+                // Prefer history-page track when live page had few/no samples.
+                if (track_out && track_max > 0 && (!track_n || *track_n < 8)) {
+                    const int tn = fa_parse_track_array(hhtml, track_out, track_max);
+                    if (track_n) {
+                        *track_n = tn;
+                    }
+                    Serial.printf("FlightAware history track pts=%d\n", tn);
+                }
+                Serial.printf("FlightAware history route_len=%u waypoints=%d\n", (unsigned)strlen(route),
+                              wn);
             }
         }
     }
@@ -4094,7 +4545,7 @@ static bool fa_board_body_ok(const char *buf, size_t len) {
     //   arrivals → departures (~70–90 KB) → enroute (~100–120 KB) → scheduled (~125 KB+)
     // We need enroute + departures. Stopping at arrivals-board (~50–70 KB) left both
     // parsers empty ("FA board: no flights"). scheduled-board means enroute is complete.
-    if (!buf || len < 100 * 1024) {
+    if (!buf || len < 80 * 1024) {
         return false;
     }
     if (strstr(buf, "id=\"scheduled-board\"") != nullptr) {
@@ -4605,6 +5056,13 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
     // One page: https://www.flightaware.com/live/airport/KATL
     // Arrivals column ← En Route (airborne inbound; Arrivals table is already landed).
     // Departures column ← Departures (left gate; Scheduled are still on the ground).
+    // Settle TLS after FA flight-plan (768 KB) thrash; ensure body buffer is alive.
+    net_tls_reset();
+    delay(400);
+    if (!ensure_http_buf()) {
+        set_err(g_last_err[0] ? g_last_err : "No HTTP buffer");
+        return false;
+    }
     status_msg("FlightAware board...");
     char url[96];
     snprintf(url, sizeof(url), "https://www.flightaware.com/live/airport/%s", code);

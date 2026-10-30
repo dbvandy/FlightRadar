@@ -1426,7 +1426,7 @@ static void follow_waypoints_rebuild() {
         w.ok = true;
     };
 
-    // Prefer filed IFR waypoints from FlightAware flight data.
+    // Filed / polyline waypoints (named from FAA NASR fix DB when possible).
     if (s_follow_fi.route_wpt_n > 0) {
         for (int i = 0; i < s_follow_fi.route_wpt_n; i++) {
             const RouteWaypoint &rw = s_follow_fi.route_wpts[i];
@@ -1435,7 +1435,11 @@ static void follow_waypoints_rebuild() {
             }
             push_wpt(rw.lat, rw.lon, rw.name[0] ? rw.name : "WPT");
         }
-        follow_waypoints_prune_outliers();
+        // Only prune when we have a short named-fix list; dense polyline paths
+        // are already on-route and pruning can wipe legitimate doglegs.
+        if (s_follow_wpt_n > 0 && s_follow_wpt_n <= 16) {
+            follow_waypoints_prune_outliers();
+        }
         return;
     }
 
@@ -8563,6 +8567,42 @@ static void format_follow_airport(char *out, size_t n, const char *icao, const c
 static void merge_follow_fi(const FlightInfo &fi) {
     FlightInfo keep = s_follow_fi;
     s_follow_fi = fi;
+    // Board/ADS-B often seeds the airborne leg (departed + OD). A later FlightStats
+    // hit can be tomorrow's scheduled turn (!departed, reversed OD) — do not clobber.
+    const bool keep_active = keep.departed && keep.origin[0] && keep.dest[0];
+    const bool incoming_future = !fi.departed && fi.schedule_ok;
+    if (keep_active && incoming_future) {
+        strncpy(s_follow_fi.origin, keep.origin, sizeof(s_follow_fi.origin) - 1);
+        strncpy(s_follow_fi.origin_name, keep.origin_name, sizeof(s_follow_fi.origin_name) - 1);
+        strncpy(s_follow_fi.dest, keep.dest, sizeof(s_follow_fi.dest) - 1);
+        strncpy(s_follow_fi.dest_name, keep.dest_name, sizeof(s_follow_fi.dest_name) - 1);
+        strncpy(s_follow_fi.dep_gate, keep.dep_gate, sizeof(s_follow_fi.dep_gate) - 1);
+        strncpy(s_follow_fi.dep_terminal, keep.dep_terminal, sizeof(s_follow_fi.dep_terminal) - 1);
+        strncpy(s_follow_fi.arr_gate, keep.arr_gate, sizeof(s_follow_fi.arr_gate) - 1);
+        strncpy(s_follow_fi.arr_terminal, keep.arr_terminal, sizeof(s_follow_fi.arr_terminal) - 1);
+        if (keep.dep_time[0]) {
+            strncpy(s_follow_fi.dep_time, keep.dep_time, sizeof(s_follow_fi.dep_time) - 1);
+        }
+        if (keep.dep_act[0]) {
+            strncpy(s_follow_fi.dep_act, keep.dep_act, sizeof(s_follow_fi.dep_act) - 1);
+        }
+        if (keep.arr_time[0]) {
+            strncpy(s_follow_fi.arr_time, keep.arr_time, sizeof(s_follow_fi.arr_time) - 1);
+        }
+        if (keep.arr_est[0]) {
+            strncpy(s_follow_fi.arr_est, keep.arr_est, sizeof(s_follow_fi.arr_est) - 1);
+        }
+        if (keep.dep_act_epoch) {
+            s_follow_fi.dep_act_epoch = keep.dep_act_epoch;
+        }
+        if (keep.arr_est_epoch) {
+            s_follow_fi.arr_est_epoch = keep.arr_est_epoch;
+        }
+        s_follow_fi.departed = true;
+        if (keep.status[0] && (!fi.status[0] || strcasecmp(fi.status, "Scheduled") == 0)) {
+            strncpy(s_follow_fi.status, keep.status, sizeof(s_follow_fi.status) - 1);
+        }
+    }
     if (!s_follow_fi.origin[0] && keep.origin[0]) {
         strncpy(s_follow_fi.origin, keep.origin, sizeof(s_follow_fi.origin) - 1);
         strncpy(s_follow_fi.origin_name, keep.origin_name, sizeof(s_follow_fi.origin_name) - 1);

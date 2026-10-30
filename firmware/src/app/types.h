@@ -86,7 +86,7 @@ struct Weather {
     bool ok;
 };
 
-#define FR_MAX_ROUTE_WPTS 32
+#define FR_MAX_ROUTE_WPTS 64
 struct RouteWaypoint {
     char name[14];  // e.g. NOBAR or 4500N/07300W
     float lat;
