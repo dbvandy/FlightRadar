@@ -4,7 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 
-#define FR_VERSION_STR "1.1.2"
+#define FR_VERSION_STR "1.1.3"
 
 #define FR_MAX_AIRCRAFT 64
 #define FR_TRACK_NEARBY_MAX 40  // when following with Show Ac: closest N to tracked
@@ -166,8 +166,8 @@ struct AptSearchHit {
 
 struct GeoFix {
     char query[96];
-    char label[96];   // place name above clock (city, or airport id/name)
-    char icao[8];     // non-empty => home is this airport
+    char label[96];   // place name above clock (city, or ICAO when airport home)
+    char icao[8];     // non-empty => home is this airport (label should match ICAO)
     float lat;
     float lon;
     bool valid;

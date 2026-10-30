@@ -295,6 +295,7 @@ static const lv_color_t COL_APT_LG = lv_color_hex(0x4DA6FF);
 static const lv_color_t COL_APT_MD = lv_color_hex(0xD45CFF);
 static const lv_color_t COL_APT_SM = lv_color_hex(0x8A9A84);
 static const lv_color_t COL_MAP = lv_color_hex(0x4A554E);  // state/coast lines + city labels
+static const lv_color_t COL_HOME = lv_color_hex(0x7EC8FF);  // home city / airport highlight
 // Control buttons: darker blue face + border with a raised 3D bevel.
 static const lv_color_t COL_BTN = lv_color_hex(0x0E3A78);
 static const lv_color_t COL_BTN_HI = lv_color_hex(0x1E5A9C);  // top of vertical gradient
@@ -594,6 +595,7 @@ static void open_route_search(lv_event_t *e);
 static void build_route_search();
 static void hide_route_search(lv_event_t *e);
 static void track_start_query(const char *q, bool show_kb);
+static void merge_follow_fi(const FlightInfo &fi);
 static void layout_follow_info_boxes();
 static void refresh_follow_sched_col();
 static void follow_live_status(const Aircraft *ac, const FlightInfo *fi, char *out, size_t n);
@@ -1862,8 +1864,15 @@ static void capture_home_from_cfg() {
 }
 
 static const char *home_place_label() {
+    // Airport homes show ICAO only (never facility name / street address).
+    if (s_home_ok && s_home_loc.icao[0]) {
+        return s_home_loc.icao;
+    }
     if (s_home_ok && s_home_loc.label[0]) {
         return s_home_loc.label;
+    }
+    if (g_state && g_state->cfg.location.icao[0]) {
+        return g_state->cfg.location.icao;
     }
     if (g_state && g_state->cfg.location.label[0]) {
         return g_state->cfg.location.label;
@@ -3262,11 +3271,10 @@ static void center_on_airport(lv_event_t *e) {
     stop_follow(false);
 
     GeoFix fix{};
-    if (s_detail_apt.name[0]) {
-        strncpy(fix.label, s_detail_apt.name, sizeof(fix.label) - 1);
-    } else {
-        strncpy(fix.label, s_detail_apt.icao, sizeof(fix.label) - 1);
-    }
+    // Home airport: ICAO only — never facility name / address on the map or place label.
+    strncpy(fix.icao, s_detail_apt.icao, sizeof(fix.icao) - 1);
+    fix.icao[sizeof(fix.icao) - 1] = 0;
+    strncpy(fix.label, s_detail_apt.icao, sizeof(fix.label) - 1);
     fix.label[sizeof(fix.label) - 1] = 0;
     strncpy(fix.query, s_detail_apt.icao, sizeof(fix.query) - 1);
     fix.query[sizeof(fix.query) - 1] = 0;
@@ -3278,11 +3286,13 @@ static void center_on_airport(lv_event_t *e) {
     g_state->cfg.location = fix;
     xSemaphoreGive(g_state->mutex);
 
+    s_home_loc = fix;
+    s_home_ok = true;
     s_olat = fix.lat;
     s_olon = fix.lon;
     map_cache_mark_dirty();
     map_cache_ensure(kRadarPlot, kRadarPlot, s_olat, s_olon, s_range);
-    update_loc_label(fix.label, fix.lat, fix.lon);
+    update_loc_label(fix.icao, fix.lat, fix.lon);
 
     hide_detail(nullptr);
     if (radar_plot) {
@@ -3532,9 +3542,25 @@ static void radar_draw(lv_event_t *e) {
     // Airport toggle works even while tracking (enter-follow starts with airports off).
     // Solo home mark uses locked s_home_loc (not pan center) so dragging away moves it off-center.
     {
-        const char *home_icao =
-            (!s_follow && s_home_ok && s_home_loc.icao[0] && !s_show_airports) ? s_home_loc.icao : nullptr;
-        auto draw_apt_mark = [&](float alat, float alon, const char *code, lv_color_t col, lv_coord_t sz) {
+        const char *home_icao = (!s_follow && s_home_ok && s_home_loc.icao[0]) ? s_home_loc.icao : nullptr;
+        auto is_home_apt = [&](const Airport *a) -> bool {
+            if (!home_icao || !a) {
+                return false;
+            }
+            if (strcasecmp(a->icao, home_icao) == 0) {
+                return true;
+            }
+            if (a->iata[0] && strcasecmp(a->iata, home_icao) == 0) {
+                return true;
+            }
+            if (strlen(home_icao) == 4 && (home_icao[0] == 'K' || home_icao[0] == 'k') && a->iata[0] &&
+                strcasecmp(a->iata, home_icao + 1) == 0) {
+                return true;
+            }
+            return false;
+        };
+        auto draw_apt_mark = [&](float alat, float alon, const char *code, lv_color_t col, lv_coord_t sz,
+                                 const lv_font_t *font, lv_color_t text_col) {
             lv_coord_t x, y;
             if (!map_point_ll(alat, alon, s_olat, s_olon, s_range, w, h, &x, &y)) {
                 return;
@@ -3549,15 +3575,20 @@ static void radar_draw(lv_event_t *e) {
             lv_area_t m = {(lv_coord_t)(x - sz / 2), (lv_coord_t)(y - sz / 2), (lv_coord_t)(x + sz / 2),
                            (lv_coord_t)(y + sz / 2)};
             lv_draw_rect(ctx, &mark, &m);
-            // Name text matches city labels (Montserrat 10 + map gray).
             lv_draw_label_dsc_t apt_lab;
             lv_draw_label_dsc_init(&apt_lab);
-            apt_lab.font = &lv_font_montserrat_10;
-            apt_lab.color = COL_MAP;
-            lv_area_t ta = {(lv_coord_t)(x + 4), (lv_coord_t)(y - 6), (lv_coord_t)(x + 100), (lv_coord_t)(y + 8)};
+            apt_lab.font = font;
+            apt_lab.color = text_col;
+            const lv_coord_t th = font ? font->line_height : 12;
+            lv_area_t ta = {(lv_coord_t)(x + 5), (lv_coord_t)(y - th / 2), (lv_coord_t)(x + 120),
+                            (lv_coord_t)(y + th / 2 + 2)};
             lv_draw_label(ctx, &apt_lab, &ta, code, nullptr);
         };
-        // City/ZIP home: city name centered on the home point (radar center after Home).
+        // Home airport: light blue + larger than normal airport labels (10 → 14).
+        auto draw_home_apt = [&](float alat, float alon, const char *code) {
+            draw_apt_mark(alat, alon, code, COL_HOME, 6, &lv_font_montserrat_14, COL_HOME);
+        };
+        // City/ZIP home: light blue name, larger than airport codes.
         auto draw_home_city = [&]() {
             if (s_follow || !s_home_ok || s_home_loc.icao[0] || !s_home_loc.label[0]) {
                 return;
@@ -3568,37 +3599,30 @@ static void radar_draw(lv_event_t *e) {
             }
             x += coords.x1;
             y += coords.y1;
+            lv_draw_label_dsc_t home_lab;
+            lv_draw_label_dsc_init(&home_lab);
+            home_lab.font = &lv_font_montserrat_14;
+            home_lab.color = COL_HOME;
             lv_point_t sz;
-            lv_txt_get_size(&sz, s_home_loc.label, lab.font, lab.letter_space, lab.line_space, LV_COORD_MAX,
-                            lab.flag);
+            lv_txt_get_size(&sz, s_home_loc.label, home_lab.font, home_lab.letter_space, home_lab.line_space,
+                            LV_COORD_MAX, home_lab.flag);
             lv_area_t ta = {(lv_coord_t)(x - sz.x / 2), (lv_coord_t)(y - sz.y / 2 - 2),
                             (lv_coord_t)(x + sz.x / 2 + 1), (lv_coord_t)(y + sz.y / 2 + 2)};
-            lab.color = COL_TEXT;
-            lv_draw_label(ctx, &lab, &ta, s_home_loc.label, nullptr);
+            lv_draw_label(ctx, &home_lab, &ta, s_home_loc.label, nullptr);
         };
-        if (s_show_airports) {
-            for (int i = 0; i < s_apt_n; i++) {
-                const Airport *a = &s_apt[i];
-                const char *code = a->iata[0] ? a->iata : a->icao;
-                // Dot matches label (COL_MAP); slightly smaller than before (was 7/5).
-                draw_apt_mark(a->lat, a->lon, code, COL_MAP, a->iata[0] ? 4 : 3);
+        auto draw_home_airport_mark = [&]() {
+            if (!home_icao) {
+                return;
             }
-            // City/ZIP still gets a center name when airports are on.
-            draw_home_city();
-        } else if (home_icao) {
-            // Same text as Show Airports: IATA preferred, else ICAO (not facility/city string).
             const char *mark_txt = home_icao;
             bool drawn = false;
             for (int i = 0; i < s_apt_n; i++) {
                 const Airport *a = &s_apt[i];
-                if (strcasecmp(a->icao, home_icao) != 0 &&
-                    !(strlen(home_icao) == 4 && (home_icao[0] == 'K' || home_icao[0] == 'k') && a->iata[0] &&
-                      strcasecmp(a->iata, home_icao + 1) == 0) &&
-                    !(a->iata[0] && strcasecmp(a->iata, home_icao) == 0)) {
+                if (!is_home_apt(a)) {
                     continue;
                 }
                 mark_txt = a->iata[0] ? a->iata : a->icao;
-                draw_apt_mark(a->lat, a->lon, mark_txt, COL_MAP, a->iata[0] ? 4 : 3);
+                draw_home_apt(a->lat, a->lon, mark_txt);
                 drawn = true;
                 break;
             }
@@ -3607,8 +3631,22 @@ static void radar_draw(lv_event_t *e) {
                 if (strlen(home_icao) == 4 && (home_icao[0] == 'K' || home_icao[0] == 'k')) {
                     mark_txt = home_icao + 1;
                 }
-                draw_apt_mark(s_home_loc.lat, s_home_loc.lon, mark_txt, COL_MAP, 4);
+                draw_home_apt(s_home_loc.lat, s_home_loc.lon, mark_txt);
             }
+        };
+        if (s_show_airports) {
+            for (int i = 0; i < s_apt_n; i++) {
+                const Airport *a = &s_apt[i];
+                if (is_home_apt(a)) {
+                    continue;  // drawn highlighted below
+                }
+                const char *code = a->iata[0] ? a->iata : a->icao;
+                draw_apt_mark(a->lat, a->lon, code, COL_MAP, a->iata[0] ? 4 : 3, &lv_font_montserrat_10, COL_MAP);
+            }
+            draw_home_airport_mark();
+            draw_home_city();
+        } else if (home_icao) {
+            draw_home_airport_mark();
         } else {
             draw_home_city();
         }
@@ -5629,8 +5667,10 @@ static void loc_search_clicked(lv_event_t *e) {
     LV_UNUSED(e);
     const char *q = lv_textarea_get_text(loc_ta);
     strncpy(g_state->pending_query, q ? q : "", sizeof(g_state->pending_query) - 1);
+    g_state->pending_query[sizeof(g_state->pending_query) - 1] = 0;
+    trim_inplace(g_state->pending_query);
     if (g_state->pending_query[0] == 0) {
-        lv_label_set_text(loc_status, "Enter a zip, city, or address");
+        lv_label_set_text(loc_status, "Enter ICAO/IATA (KOCF), zip, or city");
         return;
     }
     lv_label_set_text(loc_status, "Looking up location...");
@@ -5648,14 +5688,26 @@ static void loc_pick_clicked(lv_event_t *e) {
     GeoFix pick = g_state->geo_results[idx];
     xSemaphoreGive(g_state->mutex);
     stop_follow(false);
+    // Airport picks already have icao+ICAO label from geocode; keep city/ZIP labels as-is.
     xSemaphoreTake(g_state->mutex, portMAX_DELAY);
     g_state->cfg.location = pick;
     xSemaphoreGive(g_state->mutex);
     s_home_loc = pick;
     s_home_ok = pick.valid;
+    // Must recenter PPI — cfg.location alone does not move s_olat/s_olon.
+    s_olat = pick.lat;
+    s_olon = pick.lon;
+    map_cache_mark_dirty();
+    map_cache_ensure(kRadarPlot, kRadarPlot, s_olat, s_olon, s_range);
     recalc_tz_offset();
     hide_location(nullptr);
     ui_show_radar();
+    if (pick.valid) {
+        update_loc_label(pick.icao[0] ? pick.icao : pick.label, pick.lat, pick.lon);
+    }
+    if (radar_plot) {
+        lv_obj_invalidate(radar_plot);
+    }
     request(UI_REQ_SAVE_LOCATION | UI_REQ_REFRESH_AIRPORTS | UI_REQ_REFRESH_TRAFFIC);
 }
 
@@ -5839,7 +5891,7 @@ static void build_location() {
     lv_obj_align(lclose, LV_ALIGN_TOP_RIGHT, -4, 4);
 
     lv_obj_t *hint = lv_label_create(loc_panel);
-    lv_label_set_text(hint, "Location: zip, city, or address. Boot zoom / altitude / overlays below.");
+    lv_label_set_text(hint, "Home: ICAO/IATA (KOCF/OCF), zip, or city. Airport homes show code only.");
     lv_obj_set_style_text_color(hint, COL_TEXT, 0);
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 8, 40);
@@ -5847,7 +5899,7 @@ static void build_location() {
     loc_ta = lv_textarea_create(loc_panel);
     lv_obj_set_size(loc_ta, 500, 36);
     lv_obj_align(loc_ta, LV_ALIGN_TOP_LEFT, 8, 62);
-    lv_textarea_set_placeholder_text(loc_ta, "e.g. 37203  or  Nashville, TN");
+    lv_textarea_set_placeholder_text(loc_ta, "e.g. KOCF  or  37203  or  Nashville, TN");
     lv_textarea_set_one_line(loc_ta, true);
     lv_obj_add_event_cb(loc_ta, loc_ta_clicked, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(loc_ta, loc_ta_clicked, LV_EVENT_FOCUSED, nullptr);
@@ -6369,22 +6421,26 @@ static void board_fill_table(lv_obj_t *table, AirportBoardRow *rows, int n, bool
     lv_table_set_row_cnt(table, (uint16_t)n);
     for (int i = 0; i < n; i++) {
         const AirportBoardRow &r = rows[i];
+        // FROM/TO: city name; fall back to airport code.
         char dest[48];
-        if (r.other_apt[0]) {
-            snprintf(dest, sizeof(dest), "%s", r.other_apt);
-        } else if (r.other_name[0]) {
+        if (r.other_name[0]) {
             snprintf(dest, sizeof(dest), "%s", r.other_name);
+        } else if (r.other_apt[0]) {
+            snprintf(dest, sizeof(dest), "%s", r.other_apt);
         } else {
             dest[0] = '-';
             dest[1] = 0;
         }
+        // DEP/ARR: prefer estimated/actual over scheduled (one time per column).
+        const char *dep = r.dep_est[0] ? r.dep_est : (r.dep_time[0] ? r.dep_time : "--");
+        const char *arr = r.arr_est[0] ? r.arr_est : (r.arr_time[0] ? r.arr_time : "--");
         char bar[16];
         format_air_bar(bar, sizeof(bar), r.progress_pct);
         lv_table_set_cell_value(table, i, 0, r.flight[0] ? r.flight : "--");
         lv_table_set_cell_value(table, i, 1, r.type[0] ? r.type : "--");
         lv_table_set_cell_value(table, i, 2, dest);
-        lv_table_set_cell_value(table, i, 3, r.dep_time[0] ? r.dep_time : "--");
-        lv_table_set_cell_value(table, i, 4, r.arr_time[0] ? r.arr_time : "--");
+        lv_table_set_cell_value(table, i, 3, dep);
+        lv_table_set_cell_value(table, i, 4, arr);
         lv_table_set_cell_value(table, i, 5, bar);
     }
 }
@@ -6686,13 +6742,81 @@ static void board_table_clicked(lv_event_t *e) {
     lv_obj_invalidate(table);
 
     board_hide_keyboard();
-    if (board_status) {
-        char msg[48];
-        snprintf(msg, sizeof(msg), "Tracking %s...", rows[idx].flight);
-        lv_label_set_text(board_status, msg);
+    const AirportBoardRow &br = rows[idx];
+
+    // Start follow immediately from the board row. Waiting on ADS-B/FlightStats/hexdb
+    // after a big FA board download often hangs on TLS/DNS while the UI sat on
+    // "Tracking…" forever.
+    Aircraft ac{};
+    FlightInfo fi{};
+    auto cpy = [](char *dst, size_t n, const char *src) {
+        if (!dst || n == 0) {
+            return;
+        }
+        strncpy(dst, src ? src : "", n - 1);
+        dst[n - 1] = 0;
+    };
+    cpy(ac.flight, sizeof(ac.flight), br.flight);
+    cpy(ac.type, sizeof(ac.type), br.type);
+    ac.valid = true;
+    ac.on_ground = false;
+    ac.alt_ft = 5000.0f;
+    // Pin near the board airport until ADS-B finds the live position.
+    if (s_board_ll_ok) {
+        ac.lat = s_board_lat;
+        ac.lon = s_board_lon;
+    } else if (br.other_apt[0]) {
+        float lat = 0, lon = 0;
+        if (net_lookup_airport(br.other_apt, &lat, &lon, nullptr) ||
+            net_lookup_airport_iata(br.other_apt, nullptr, 0, &lat, &lon)) {
+            ac.lat = lat;
+            ac.lon = lon;
+        }
     }
-    // Follow from the board without opening the Track Flight keyboard.
-    track_start_query(rows[idx].flight, false);
+    cpy(fi.flight, sizeof(fi.flight), br.flight);
+    if (arrivals) {
+        cpy(fi.origin, sizeof(fi.origin), br.other_apt);
+        cpy(fi.origin_name, sizeof(fi.origin_name), br.other_name);
+        cpy(fi.dest, sizeof(fi.dest), s_board_icao);
+    } else {
+        cpy(fi.origin, sizeof(fi.origin), s_board_icao);
+        cpy(fi.dest, sizeof(fi.dest), br.other_apt);
+        cpy(fi.dest_name, sizeof(fi.dest_name), br.other_name);
+    }
+    cpy(fi.dep_time, sizeof(fi.dep_time), br.dep_time[0] ? br.dep_time : br.dep_est);
+    cpy(fi.arr_time, sizeof(fi.arr_time), br.arr_time[0] ? br.arr_time : br.arr_est);
+    cpy(fi.dep_est, sizeof(fi.dep_est), br.dep_est);
+    cpy(fi.arr_est, sizeof(fi.arr_est), br.arr_est);
+    if (br.dep_epoch) {
+        fi.dep_act_epoch = br.dep_epoch;
+    }
+    if (br.arr_epoch) {
+        fi.arr_est_epoch = br.arr_epoch;
+    }
+    fi.departed = true;
+    fi.schedule_ok = fi.dep_time[0] || fi.arr_time[0] || fi.dep_est[0] || fi.arr_est[0];
+    fi.route_ok = fi.origin[0] && fi.dest[0];
+
+    track_history_push(br.flight);
+    hide_airport_board(nullptr);
+    hide_track(nullptr);
+    hide_route_search(nullptr);
+    s_detail_ac = ac;
+    s_detail_is_aircraft = true;
+    s_flight_info = fi;
+    if (g_state) {
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        g_state->tracked_ac = ac;
+        g_state->tracked_ok = true;
+        g_state->flight_info = fi;
+        xSemaphoreGive(g_state->mutex);
+    }
+    start_follow_aircraft(&ac, false);
+    merge_follow_fi(fi);
+    refresh_follow_panel();
+
+    // Background enrich: live ADS-B fix + full schedule/route (may be slow after FA).
+    track_start_query(br.flight, false);
 }
 
 static void open_airport_board(lv_event_t *e) {
@@ -9731,9 +9855,8 @@ void ui_show_radar() {
         snprintf(fl, sizeof(fl), "Following %s", s_follow_label[0] ? s_follow_label : s_follow_hex);
         update_loc_label(fl, g_state->cfg.location.lat, g_state->cfg.location.lon);
     } else {
-        const char *place = (g_state && g_state->cfg.location.label[0]) ? g_state->cfg.location.label
-                                                                        : home_place_label();
-        update_loc_label(place, g_state->cfg.location.lat, g_state->cfg.location.lon);
+        // Prefer ICAO for airport homes (never a facility name / street address).
+        update_loc_label(home_place_label(), g_state->cfg.location.lat, g_state->cfg.location.lon);
     }
     refresh_local_time_lbl();
     snprintf(buf, sizeof(buf), "%.0f nm", g_state->cfg.range_nm);
@@ -9846,8 +9969,23 @@ void ui_notify_home_label(const char *label) {
     }
     strncpy(s_home_loc.label, label, sizeof(s_home_loc.label) - 1);
     s_home_loc.label[sizeof(s_home_loc.label) - 1] = 0;
+    // Keep icao in sync when enrich rewrote label to the ICAO code.
+    if (strlen(label) <= 4) {
+        bool code = true;
+        for (const char *p = label; *p; p++) {
+            if (!isalnum((unsigned char)*p)) {
+                code = false;
+                break;
+            }
+        }
+        if (code) {
+            strncpy(s_home_loc.icao, label, sizeof(s_home_loc.icao) - 1);
+            s_home_loc.icao[sizeof(s_home_loc.icao) - 1] = 0;
+        }
+    }
     if (!s_follow) {
-        update_loc_label(s_home_loc.label, s_home_loc.lat, s_home_loc.lon);
+        update_loc_label(s_home_loc.icao[0] ? s_home_loc.icao : s_home_loc.label, s_home_loc.lat,
+                         s_home_loc.lon);
     }
     if (radar_plot) {
         lv_obj_invalidate(radar_plot);
@@ -10466,6 +10604,18 @@ void ui_notify_track_result(bool ok, const char *msg) {
     lvgl_port_lock(-1);
     if (track_status) {
         lv_label_set_text(track_status, msg ? msg : (ok ? "Tracking" : "Not found"));
+    }
+    if (board_status && board_panel && !lv_obj_has_flag(board_panel, LV_OBJ_FLAG_HIDDEN)) {
+        lv_label_set_text(board_status, msg ? msg : (ok ? "Tracking" : "Track failed"));
+    }
+    // Already following from an airport-board tap — keep that; only upgrade position/info.
+    if ((!ok || !have_ac) && s_follow) {
+        if (ok && fi.flight[0]) {
+            merge_follow_fi(fi);
+            refresh_follow_panel();
+        }
+        lvgl_port_unlock();
+        return;
     }
     if (!ok || !have_ac) {
         lvgl_port_unlock();

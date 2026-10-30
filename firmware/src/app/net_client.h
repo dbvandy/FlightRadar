@@ -24,7 +24,7 @@ void net_set_status_callback(void (*cb)(const char *msg));
 int net_tz_offset_for_ll(float lat, float lon, time_t when_utc = 0);
 
 int net_geocode(const char *query, GeoFix *out, size_t out_max);
-/** Airport homes: rewrite label to "CODE - City". Returns true if label changed. */
+/** Airport homes: label/icao become the ICAO code only (no city/address). Returns true if changed. */
 bool net_enrich_airport_home_label(GeoFix *fix);
 
 int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size_t out_max);
@@ -67,7 +67,7 @@ bool net_build_airport_board_from_traffic(const char *icao, const Aircraft *ac, 
                                           AirportBoardRow *dep, int dep_max, int *dep_n, char *label,
                                           size_t label_len, float *out_lat = nullptr,
                                           float *out_lon = nullptr);
-/** Arrivals/departures: prefer live ADS-B fetch around the airport (FA HTML is blocked on-device). */
+/** Arrivals/departures from FlightAware live/airport/{ICAO} (enroute + departures tables). */
 bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max, int *arr_n,
                              AirportBoardRow *dep, int dep_max, int *dep_n, char *label, size_t label_len,
                              float *out_lat = nullptr, float *out_lon = nullptr);

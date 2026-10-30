@@ -114,27 +114,54 @@ static bool parse_url(const char *url, bool *tls, char *host, size_t host_len, u
 }
 
 // HTTP body buffer — prefer PSRAM so internal DMA stays free for ESP-Hosted WiFi
-// + mbedTLS. Sized for ADS-B JSON / small HTML (FA scrape disabled).
+// + mbedTLS. Steady-state stays at 192 KB (ADS-B / boards). FlightAware live pages
+// are ~500–600 KB with Flight Data near EOF — grow to 768 KB only for that fetch,
+// then shrink. A permanent 768 KB allocation left int-dma fragmented and killed TLS.
 static char *g_http_buf = nullptr;
 static size_t g_http_cap = 0;
 static size_t g_http_len = 0;
 static constexpr size_t kHttpBufCap = 192 * 1024;
+static constexpr size_t kHttpBufCapFa = 768 * 1024;
 
-static bool ensure_http_buf() {
-    if (g_http_buf) {
+static bool ensure_http_buf_sized(size_t need) {
+    if (need < kHttpBufCap) {
+        need = kHttpBufCap;
+    }
+    if (g_http_buf && g_http_cap >= need) {
         return true;
     }
-    g_http_buf = (char *)heap_caps_malloc(kHttpBufCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!g_http_buf) {
-        g_http_buf = (char *)heap_caps_malloc(kHttpBufCap, MALLOC_CAP_8BIT);
+    // Large bodies must stay in PSRAM — internal fallback starves esp-aes DMA.
+    char *p = (char *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p && need <= 64 * 1024) {
+        p = (char *)heap_caps_malloc(need, MALLOC_CAP_8BIT);
     }
-    if (!g_http_buf) {
-        set_err("No HTTP body RAM");
+    if (!p) {
+        set_err(need > 64 * 1024 ? "No HTTP PSRAM" : "No HTTP body RAM");
         return false;
     }
-    g_http_cap = kHttpBufCap;
+    if (g_http_buf) {
+        heap_caps_free(g_http_buf);
+    }
+    g_http_buf = p;
+    g_http_cap = need;
+    g_http_len = 0;
     Serial.printf("HTTP body buf: %u KB\n", (unsigned)(g_http_cap / 1024));
     return true;
+}
+
+static bool ensure_http_buf() {
+    return ensure_http_buf_sized(kHttpBufCap);
+}
+
+static void http_buf_shrink_default() {
+    if (!g_http_buf || g_http_cap <= kHttpBufCap) {
+        return;
+    }
+    heap_caps_free(g_http_buf);
+    g_http_buf = nullptr;
+    g_http_cap = 0;
+    g_http_len = 0;
+    ensure_http_buf();
 }
 
 void net_init_buffers() {
@@ -972,6 +999,110 @@ static int geocode_nominatim(const char *query, GeoFix *out, size_t out_max) {
     return n;
 }
 
+static bool looks_like_airport_code(const char *q) {
+    if (!q || !q[0]) {
+        return false;
+    }
+    size_t n = 0;
+    for (const char *p = q; *p; p++) {
+        if (*p == ' ' || *p == '-' || *p == '/') {
+            continue;
+        }
+        if (!isalnum((unsigned char)*p)) {
+            return false;
+        }
+        n++;
+        if (n > 4) {
+            return false;
+        }
+    }
+    return n == 3 || n == 4;
+}
+
+static int geocode_airport_db(const char *query, GeoFix *out, size_t out_max) {
+    if (!query || !out || out_max == 0 || !kAptDb || K_APT_DB_COUNT == 0) {
+        return 0;
+    }
+    // First alphanumeric token only ("kocf", "OCF", "KOCF airport").
+    char tok[16];
+    size_t w = 0;
+    bool started = false;
+    for (size_t i = 0; query[i] && w + 1 < sizeof(tok); i++) {
+        const unsigned char c = (unsigned char)query[i];
+        if (!started && (c == ' ' || c == '\t' || c == '-' || c == '/')) {
+            continue;
+        }
+        if (!isalnum(c)) {
+            if (started) {
+                break;
+            }
+            continue;
+        }
+        started = true;
+        tok[w++] = (char)toupper(c);
+    }
+    tok[w] = 0;
+    if (w != 3 && w != 4) {
+        return 0;
+    }
+    // Reuse the same matcher as Airport Board / Dep-Arr search (exact + K-prefix).
+    AptSearchHit hits[4];
+    const int hn = net_search_airports(tok, hits, sizeof(hits) / sizeof(hits[0]));
+    int n = 0;
+    for (int i = 0; i < hn && (size_t)n < out_max; i++) {
+        // Exact / K-prefix only — drop prefix-pass noise like "KOC*" for "KOCF".
+        const bool exact = strcmp(hits[i].icao, tok) == 0 ||
+                           (hits[i].iata[0] && strcmp(hits[i].iata, tok) == 0) ||
+                           (w == 3 && hits[i].icao[0] == 'K' && strcmp(hits[i].icao + 1, tok) == 0);
+        if (!exact) {
+            continue;
+        }
+        memset(&out[n], 0, sizeof(out[n]));
+        copy_trunc(out[n].query, sizeof(out[n].query), query);
+        copy_trunc(out[n].icao, sizeof(out[n].icao), hits[i].icao);
+        copy_trunc(out[n].label, sizeof(out[n].label), hits[i].icao);  // ICAO only
+        out[n].lat = hits[i].lat;
+        out[n].lon = hits[i].lon;
+        out[n].valid = true;
+        n++;
+    }
+    return n;
+}
+
+/** If lat/lon sit on an airport, bind ICAO and replace label with that code. */
+static bool bind_nearest_airport_home(GeoFix *fix, float max_nm) {
+    if (!fix || !fix->valid || !kAptDb || K_APT_DB_COUNT == 0) {
+        return false;
+    }
+    const float max2 = max_nm * max_nm;
+    int best = -1;
+    float best_d2 = max2;
+    for (size_t i = 0; i < K_APT_DB_COUNT; i++) {
+        const AptRec &rec = kAptDb[i];
+        const float alat = rec.lat_c / 100.0f;
+        const float alon = rec.lon_c / 100.0f;
+        float east, north;
+        ll_to_nm(alat, alon, fix->lat, fix->lon, &east, &north);
+        const float d2 = east * east + north * north;
+        if (d2 <= best_d2) {
+            best_d2 = d2;
+            best = (int)i;
+        }
+    }
+    if (best < 0) {
+        return false;
+    }
+    const AptRec &rec = kAptDb[best];
+    char icao[8];
+    copy_trunc(icao, sizeof(icao), rec.icao);
+    const bool changed = strcmp(fix->icao, icao) != 0 || strcmp(fix->label, icao) != 0;
+    copy_trunc(fix->icao, sizeof(fix->icao), icao);
+    copy_trunc(fix->label, sizeof(fix->label), icao);
+    fix->lat = rec.lat_c / 100.0f;
+    fix->lon = rec.lon_c / 100.0f;
+    return changed;
+}
+
 int net_geocode(const char *query, GeoFix *out, size_t out_max) {
     char q[96];
     copy_trunc(q, sizeof(q), query);
@@ -979,12 +1110,41 @@ int net_geocode(const char *query, GeoFix *out, size_t out_max) {
         return 0;
     }
     int n = 0;
+    // ICAO/IATA first — never return a facility name / street address for airport homes.
+    if (looks_like_airport_code(q)) {
+        n = geocode_airport_db(q, out, out_max);
+        Serial.printf("[geo] code='%s' apt_hits=%d db=%u\n", q, n, (unsigned)K_APT_DB_COUNT);
+        // Pure airport codes must not fall through to Nominatim (addresses / wrong place).
+        if (n > 0) {
+            return n;
+        }
+        return 0;
+    }
     if (looks_like_us_zip(q)) {
         n = geocode_zippopotam(q, out, out_max);
     }
     if (n == 0) {
         n = geocode_nominatim(q, out, out_max);
+        // Snap Nominatim "… Airport …" rows to ICAO; leave cities/ZIPs alone.
+        auto label_looks_airport = [](const char *lab) -> bool {
+            if (!lab || !lab[0]) {
+                return false;
+            }
+            char up[96];
+            copy_trunc(up, sizeof(up), lab);
+            for (char *p = up; *p; p++) {
+                *p = (char)toupper((unsigned char)*p);
+            }
+            return strstr(up, "AIRPORT") || strstr(up, "AERODROME") || strstr(up, "AIRFIELD") ||
+                   strstr(up, " AIR ") || strstr(up, "INTL");
+        };
+        for (int i = 0; i < n; i++) {
+            if (label_looks_airport(out[i].label)) {
+                bind_nearest_airport_home(&out[i], 5.0f);
+            }
+        }
     }
+    Serial.printf("[geo] q='%s' hits=%d\n", q, n);
     return n;
 }
 
@@ -996,7 +1156,11 @@ static int parse_adsblol(const char *body, size_t body_len, Aircraft *out, size_
         Serial.printf("ADS-B JSON: %s len=%u\n", err.c_str(), (unsigned)body_len);
         return -1;
     }
+    // adsb.lol → "ac"; adsb.fi → "aircraft".
     JsonArray ac = doc["ac"].as<JsonArray>();
+    if (ac.isNull()) {
+        ac = doc["aircraft"].as<JsonArray>();
+    }
     if (ac.isNull()) {
         // Wrong payload (HTML/error) — not a valid empty traffic list.
         Serial.printf("ADS-B missing ac, body=%u head=%.40s\n",
@@ -1099,6 +1263,10 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
         if (n > 0) {
             g_adsb_pref = idx;
             return n;
+        }
+        if (n < 0) {
+            // Bad JSON / wrong shape — try the other host this poll.
+            continue;
         }
         // HTTP OK with 0 aircraft — do not open a second TLS session this poll.
         g_adsb_pref = idx;
@@ -1698,7 +1866,7 @@ int net_search_airports(const char *query, AptSearchHit *out, size_t out_max) {
 
 // ---- AWC airport feed: city names + radio frequencies -----------------------
 
-/** "JACKSONVILLE INTL" -> "Jacksonville". */
+/** "JACKSONVILLE INTL" / "ATLANTA/HARTSFIELD/..." -> "Jacksonville" / "Atlanta". */
 static void city_from_facility(const char *name, char *out, size_t out_len) {
     if (!out || out_len == 0) {
         return;
@@ -1709,6 +1877,11 @@ static void city_from_facility(const char *name, char *out, size_t out_len) {
     }
     char tmp[64];
     copy_trunc(tmp, sizeof(tmp), name);
+    // AWC often uses "CITY/FACILITY..." — city is the first segment.
+    if (char *slash = strchr(tmp, '/')) {
+        *slash = 0;
+        trim_inplace(tmp);
+    }
     static const char *kCut[] = {" INTL", " INTERNATIONAL", " RGNL", " REGIONAL", " MUNI", " MUNICIPAL", " AIRPORT",
                                  " FIELD", " FLD", " AIR", " ARPT", "/", ","};
     char up[64];
@@ -1828,23 +2001,42 @@ bool net_lookup_airport_radios(const char *icao, AirportRadios *out) {
 }
 
 bool net_enrich_airport_home_label(GeoFix *fix) {
-    if (!fix || !fix->icao[0] || strstr(fix->label, " - ")) {
+    if (!fix || !fix->valid) {
         return false;
     }
-    JsonDocument doc;
-    if (!awc_airports(fix->icao, doc) || doc.as<JsonArray>().size() == 0) {
-        return false;
+    char before_icao[8];
+    char before_label[96];
+    copy_trunc(before_icao, sizeof(before_icao), fix->icao);
+    copy_trunc(before_label, sizeof(before_label), fix->label);
+
+    // Resolve ICAO from query / existing icao / nearest DB airport.
+    if (!fix->icao[0] && looks_like_airport_code(fix->query)) {
+        GeoFix hit{};
+        if (geocode_airport_db(fix->query, &hit, 1) == 1) {
+            copy_trunc(fix->icao, sizeof(fix->icao), hit.icao);
+            fix->lat = hit.lat;
+            fix->lon = hit.lon;
+        }
     }
-    char city[40];
-    city_from_facility(doc[0]["name"] | "", city, sizeof(city));
-    if (!city[0]) {
-        return false;
+    if (!fix->icao[0] && looks_like_airport_code(fix->label)) {
+        GeoFix hit{};
+        if (geocode_airport_db(fix->label, &hit, 1) == 1) {
+            copy_trunc(fix->icao, sizeof(fix->icao), hit.icao);
+            fix->lat = hit.lat;
+            fix->lon = hit.lon;
+        }
     }
-    char icao[8];
-    copy_trunc(icao, sizeof(icao), fix->icao);
-    upper_inplace(icao);
-    snprintf(fix->label, sizeof(fix->label), "%s - %s", icao, city);
-    return true;
+    if (!fix->icao[0]) {
+        // Nominatim "… Airport …" / Center-without-icao: snap if sitting on a field.
+        bind_nearest_airport_home(fix, 2.0f);
+    }
+    if (!fix->icao[0]) {
+        return false;  // city/ZIP home — leave label alone
+    }
+    upper_inplace(fix->icao);
+    // Display + persist ICAO only (no facility name / city / street address).
+    copy_trunc(fix->label, sizeof(fix->label), fix->icao);
+    return strcmp(before_icao, fix->icao) != 0 || strcmp(before_label, fix->label) != 0;
 }
 
 int net_fetch_airport_cities(const char icaos[][8], char cities[][28], int n) {
@@ -3018,26 +3210,33 @@ static bool fa_extract_route_string(const char *html, char *out, size_t out_len)
         return false;
     }
     out[0] = 0;
-    // Prefer flightPlan.route inside trackpoll (filed IFR as shown in Flight Data).
-    const char *fp = strstr(html, "\"flightPlan\":{");
-    const char *p = nullptr;
-    if (fp) {
-        p = strstr(fp, "\"route\":\"");
-        if (p && (size_t)(p - fp) > 800) {
-            p = nullptr;
+    // FlightAware Flight Data → Route is flightPlan.route in trackpollBootstrap.
+    // Live/scheduled legs often have "route":"" — skip empties and keep scanning
+    // (history page / prior activity entries carry the filed IFR string).
+    const char *search = html;
+    for (int attempt = 0; attempt < 12; attempt++) {
+        const char *fp = strstr(search, "\"flightPlan\":{");
+        if (!fp) {
+            break;
         }
+        const char *p = strstr(fp, "\"route\":\"");
+        if (!p || (size_t)(p - fp) > 800) {
+            search = fp + 14;
+            continue;
+        }
+        p += strlen("\"route\":\"");
+        size_t i = 0;
+        while (p[i] && p[i] != '"' && i + 1 < out_len) {
+            out[i] = p[i];
+            i++;
+        }
+        out[i] = 0;
+        if (i > 0) {
+            return true;  // filed IFR route from Flight Data
+        }
+        search = fp + 14;
     }
-    if (!p) {
-        return false;
-    }
-    p += strlen("\"route\":\"");
-    size_t i = 0;
-    while (p[i] && p[i] != '"' && i + 1 < out_len) {
-        out[i] = p[i];
-        i++;
-    }
-    out[i] = 0;
-    return i > 0;  // empty string (common for some live legs) → false; use waypoints
+    return false;
 }
 
 static void fa_push_route_wpt(FlightInfo *fi, const char *name, float lat, float lon) {
@@ -3314,15 +3513,22 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
     url_encode(cs, enc, sizeof(enc));
     char url[160];
     snprintf(url, sizeof(url), "https://www.flightaware.com/live/flight/%s", enc);
-    // ~500 KB chunked HTML; 60s idle + partial-body OK in read_http_body.
-    if (!https_get(url, nullptr, kUaBrowser, 10000, 60000, "text/html,application/xhtml+xml,*/*", true)) {
+    // Grow to 768 KB only for this fetch (route/waypoints sit ~450 KB into the page).
+    // Shrink afterward so ADS-B / hexdb TLS keep contiguous int-dma.
+    if (!ensure_http_buf_sized(kHttpBufCapFa)) {
+        Serial.printf("FlightAware buf fail: %s\n", g_last_err);
+        return false;
+    }
+    if (!https_get(url, nullptr, kUaBrowser, 10000, 90000, "text/html,application/xhtml+xml,*/*", true)) {
         Serial.printf("FlightAware fetch fail: %s\n", g_last_err);
+        http_buf_shrink_default();
         return false;
     }
     size_t blen = 0;
     const char *html = http_body_buf(&blen);
     if (!html || blen < 800) {
         Serial.println("FlightAware: empty body");
+        http_buf_shrink_default();
         return false;
     }
     Serial.printf("FlightAware body %u KB\n", (unsigned)(blen / 1024));
@@ -3385,6 +3591,10 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
             }
         }
     }
+
+    // Drop the oversized FA buffer before route decode / next ADS-B poll.
+    html = nullptr;
+    http_buf_shrink_default();
 
     const int have_track = (track_n && *track_n > 0) ? *track_n : 0;
     if (!route[0] && wn <= 0 && have_track <= 0) {
@@ -3770,11 +3980,37 @@ static int fa_parse_airport_board_section(const char *html, const char *board_id
                     ri++;
                 }
                 raw[ri] = 0;
-                char *dash = strstr(raw, " - ");
-                if (dash) {
-                    *dash = 0;
+                // "Fort Lauderdale Intl (Fort Lauderdale, FL) - FLL" → city in parens.
+                char *lp = strchr(raw, '(');
+                char *rp = lp ? strchr(lp, ')') : nullptr;
+                if (lp && rp && rp > lp + 1) {
+                    *rp = 0;
+                    copy_trunc(row.other_name, sizeof(row.other_name), lp + 1);
+                    trim_inplace(row.other_name);
+                } else {
+                    char *dash = strstr(raw, " - ");
+                    if (dash) {
+                        *dash = 0;
+                    }
+                    copy_trunc(row.other_name, sizeof(row.other_name), raw);
                 }
-                copy_trunc(row.other_name, sizeof(row.other_name), raw);
+            }
+        }
+        // Live progress bar: style="width: N%"
+        bool have_bar = false;
+        const char *pf = strstr(rowbuf, "track-panel-progress-fill");
+        if (pf) {
+            const char *w = strstr(pf, "width:");
+            if (w) {
+                int pct = atoi(w + 6);
+                if (pct < 0) {
+                    pct = 0;
+                }
+                if (pct > 100) {
+                    pct = 100;
+                }
+                row.progress_pct = pct;
+                have_bar = true;
             }
         }
         if (!row.other_apt[0]) {
@@ -3843,7 +4079,9 @@ static int fa_parse_airport_board_section(const char *html, const char *board_id
 
         if (row.flight[0]) {
             row.valid = true;
-            fa_board_fill_progress(&row, landed_bias);
+            if (!have_bar) {
+                fa_board_fill_progress(&row, landed_bias);
+            }
             out[n++] = row;
         }
         p = tr_end + 5;
@@ -3852,18 +4090,20 @@ static int fa_parse_airport_board_section(const char *html, const char *board_id
 }
 
 static bool fa_board_body_ok(const char *buf, size_t len) {
-    // FA order: arrivals → departures (~83 KB) → enroute → scheduled.
-    // Prefer deps present; never hang forever waiting for a full 170 KB page.
-    if (!buf || len < 48 * 1024) {
+    // FA order on live/airport/{ICAO}:
+    //   arrivals → departures (~70–90 KB) → enroute (~100–120 KB) → scheduled (~125 KB+)
+    // We need enroute + departures. Stopping at arrivals-board (~50–70 KB) left both
+    // parsers empty ("FA board: no flights"). scheduled-board means enroute is complete.
+    if (!buf || len < 100 * 1024) {
         return false;
     }
-    if (strstr(buf, "id=\"departures-board\"") != nullptr ||
-        strstr(buf, "id=\"scheduled-board\"") != nullptr) {
+    if (strstr(buf, "id=\"scheduled-board\"") != nullptr) {
         return true;
     }
-    // Arrivals-only is better than a 90s failure if the stream dies early.
-    return strstr(buf, "id=\"arrivals-board\"") != nullptr ||
-           strstr(buf, "id=\"enroute-board\"") != nullptr;
+    const char *en = strstr(buf, "id=\"enroute-board\"");
+    const char *dep = strstr(buf, "id=\"departures-board\"");
+    // Enough bytes after enroute marker for a full inbound table (~20 rows).
+    return en && dep && (size_t)(buf + len - en) > 12 * 1024;
 }
 
 static void board_resolve_ll(const char *code, float *lat, float *lon) {
@@ -3913,6 +4153,156 @@ static void board_normalize_icao(const char *icao, char *code, size_t code_len) 
     }
 }
 
+/** Local HH:MM at apt for UTC + hours offset (ETA helper). */
+static void board_fmt_local_hm(char *out, size_t out_len, float apt_lat, float apt_lon, float hours_ahead) {
+    if (!out || out_len < 6) {
+        return;
+    }
+    out[0] = 0;
+    time_t now = time(nullptr);
+    if (now < 1700000000) {
+        return;
+    }
+    if (hours_ahead < 0.0f) {
+        hours_ahead = 0.0f;
+    }
+    if (hours_ahead > 48.0f) {
+        hours_ahead = 48.0f;
+    }
+    time_t when = now + (time_t)lroundf(hours_ahead * 3600.0f);
+    when += (time_t)net_tz_offset_for_ll(apt_lat, apt_lon, when);
+    struct tm t {};
+    gmtime_r(&when, &t);
+    snprintf(out, out_len, "%02d:%02d", t.tm_hour, t.tm_min);
+}
+
+static void board_apply_other_city(AirportBoardRow *rows, int n) {
+    if (!rows || n <= 0) {
+        return;
+    }
+    char icaos[FR_MAX_BOARD_ROWS][8];
+    char cities[FR_MAX_BOARD_ROWS][28];
+    int nu = 0;
+    for (int i = 0; i < n && nu < FR_MAX_BOARD_ROWS; i++) {
+        if (!rows[i].other_apt[0] || rows[i].other_name[0]) {
+            continue;
+        }
+        bool seen = false;
+        for (int j = 0; j < nu; j++) {
+            if (strcasecmp(icaos[j], rows[i].other_apt) == 0) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            copy_trunc(icaos[nu], sizeof(icaos[nu]), rows[i].other_apt);
+            cities[nu][0] = 0;
+            nu++;
+        }
+    }
+    if (nu <= 0) {
+        return;
+    }
+    status_msg("Board cities...");
+    net_fetch_airport_cities(icaos, cities, nu);
+    for (int i = 0; i < n; i++) {
+        if (!rows[i].other_apt[0] || rows[i].other_name[0]) {
+            continue;
+        }
+        for (int j = 0; j < nu; j++) {
+            if (strcasecmp(icaos[j], rows[i].other_apt) == 0 && cities[j][0]) {
+                copy_trunc(rows[i].other_name, sizeof(rows[i].other_name), cities[j]);
+                break;
+            }
+        }
+        if (!rows[i].other_name[0]) {
+            // Fallback: show the airport code rather than blank / distance.
+            copy_trunc(rows[i].other_name, sizeof(rows[i].other_name), rows[i].other_apt);
+        }
+    }
+}
+
+static void board_enrich_row_route_times(AirportBoardRow *row, bool inbound, const char *board_icao,
+                                         float apt_lat, float apt_lon, const Aircraft &ac, float dst_nm) {
+    if (!row || !row->flight[0]) {
+        return;
+    }
+
+    char origin[8] = {0}, dest[8] = {0};
+    if (net_fetch_route(row->flight, origin, sizeof(origin), dest, sizeof(dest))) {
+        const char *other = nullptr;
+        if (inbound) {
+            if (apt_codes_match(dest, board_icao)) {
+                other = origin;
+            } else if (apt_codes_match(origin, board_icao)) {
+                other = dest;
+            } else {
+                other = origin;
+            }
+        } else {
+            if (apt_codes_match(origin, board_icao)) {
+                other = dest;
+            } else if (apt_codes_match(dest, board_icao)) {
+                other = origin;
+            } else {
+                other = dest;
+            }
+        }
+        if (other && other[0]) {
+            copy_trunc(row->other_apt, sizeof(row->other_apt), other);
+        }
+    }
+
+    // FlightStats: scheduled / estimated dep + arr (and city names).
+    FlightInfo fi{};
+    if (net_fetch_flight_schedule(row->flight, &fi) && fi.schedule_ok) {
+        if (!row->other_apt[0]) {
+            const char *other = inbound ? fi.origin : fi.dest;
+            if (other && other[0]) {
+                copy_trunc(row->other_apt, sizeof(row->other_apt), other);
+            }
+        }
+        if (!row->other_name[0]) {
+            const char *nm = inbound ? fi.origin_name : fi.dest_name;
+            if (nm && nm[0]) {
+                city_from_facility(nm, row->other_name, sizeof(row->other_name));
+            }
+        }
+        copy_trunc(row->dep_time, sizeof(row->dep_time), fi.dep_time);
+        // Prefer actual wheels-up when airborne; else estimated; else scheduled (already in dep_time).
+        if (fi.dep_act[0]) {
+            copy_trunc(row->dep_est, sizeof(row->dep_est), fi.dep_act);
+        } else {
+            copy_trunc(row->dep_est, sizeof(row->dep_est), fi.dep_est);
+        }
+        copy_trunc(row->arr_time, sizeof(row->arr_time), fi.arr_time);
+        copy_trunc(row->arr_est, sizeof(row->arr_est), fi.arr_est);
+        if (fi.dep_act_epoch) {
+            row->dep_epoch = fi.dep_act_epoch;
+        }
+        if (fi.arr_est_epoch) {
+            row->arr_epoch = fi.arr_est_epoch;
+        } else if (fi.arr_act_epoch) {
+            row->arr_epoch = fi.arr_act_epoch;
+        }
+    }
+
+    // ETA fallback when schedule missing (still better than altitude / GS placeholders).
+    if (!row->arr_est[0] && !row->arr_time[0] && ac.gs_kts > 40.0f) {
+        float rem_nm = dst_nm;
+        if (!inbound && row->other_apt[0]) {
+            float olat = 0, olon = 0;
+            if (net_lookup_airport(row->other_apt, &olat, &olon, nullptr) ||
+                net_lookup_airport_iata(row->other_apt, nullptr, 0, &olat, &olon)) {
+                float east = 0, north = 0;
+                ll_to_nm(ac.lat, ac.lon, olat, olon, &east, &north);
+                rem_nm = sqrtf(east * east + north * north);
+            }
+        }
+        board_fmt_local_hm(row->arr_est, sizeof(row->arr_est), apt_lat, apt_lon, rem_nm / ac.gs_kts);
+    }
+}
+
 static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_lon, const Aircraft *acs,
                                      int n_ac, AirportBoardRow *arr, int arr_max, int *arr_n,
                                      AirportBoardRow *dep, int dep_max, int *dep_n) {
@@ -3946,15 +4336,7 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
             }
         }
         copy_trunc(row->type, sizeof(row->type), ac.type);
-        snprintf(row->other_name, sizeof(row->other_name), "%.0fnm", dst_nm);
-        if (ac.on_ground || ac.alt_ft < 50.0f) {
-            copy_trunc(row->dep_time, sizeof(row->dep_time), "GND");
-        } else {
-            snprintf(row->dep_time, sizeof(row->dep_time), "%.0f", ac.alt_ft);
-        }
-        if (ac.gs_kts > 0.5f) {
-            snprintf(row->arr_time, sizeof(row->arr_time), "%.0fk", ac.gs_kts);
-        }
+        // TO/FROM + DEP/ARR filled by enrichment (city + schedule). Do not stuff nm/alt/GS.
         int pct = inbound ? (int)lroundf(100.0f - dst_nm * 2.5f) : (int)lroundf(dst_nm * 2.5f);
         if (pct < 0) {
             pct = 0;
@@ -3964,6 +4346,7 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
         }
         row->progress_pct = pct;
         row->valid = row->flight[0] != 0;
+        (void)dst_nm;
     };
 
     struct Cand {
@@ -3977,6 +4360,10 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
         if (!acs[i].valid || (!acs[i].flight[0] && !acs[i].reg[0])) {
             continue;
         }
+        // Board is airborne-only — skip taxi / parked / ground returns.
+        if (acs[i].on_ground || acs[i].alt_ft < 200.0f) {
+            continue;
+        }
         float east = 0, north = 0;
         ll_to_nm(acs[i].lat, acs[i].lon, apt_lat, apt_lon, &east, &north);
         const float dst = sqrtf(east * east + north * north);
@@ -3986,9 +4373,7 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
         const float brg = atan2f(east, north) * 57.2957795f;
         const float dhdg = ang_diff(acs[i].track_deg, brg);
         bool inbound = false;
-        if (acs[i].on_ground || acs[i].alt_ft < 50.0f) {
-            inbound = false;
-        } else if (acs[i].vrate_fpm < -200.0f || dhdg < 70.0f) {
+        if (acs[i].vrate_fpm < -200.0f || dhdg < 70.0f) {
             inbound = true;
         } else if (acs[i].vrate_fpm > 200.0f || dhdg > 110.0f) {
             inbound = false;
@@ -4008,29 +4393,96 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
     }
 
     int na = 0, nd = 0;
+    // Remember aircraft index + distance for enrichment (ETA / route).
+    int arr_ac_idx[FR_MAX_BOARD_ROWS];
+    float arr_dst[FR_MAX_BOARD_ROWS];
+    int dep_ac_idx[FR_MAX_BOARD_ROWS];
+    float dep_dst[FR_MAX_BOARD_ROWS];
     for (int k = 0; k < nc; k++) {
         const Aircraft &ac = acs[cands[k].idx];
         if (cands[k].inbound) {
-            if (na < arr_max) {
+            if (na < arr_max && na < FR_MAX_BOARD_ROWS) {
                 fill_row(&arr[na], ac, cands[k].dst, true);
                 if (arr[na].valid) {
+                    arr_ac_idx[na] = cands[k].idx;
+                    arr_dst[na] = cands[k].dst;
                     na++;
                 }
             }
-        } else if (nd < dep_max) {
+        } else if (nd < dep_max && nd < FR_MAX_BOARD_ROWS) {
             fill_row(&dep[nd], ac, cands[k].dst, false);
             if (dep[nd].valid) {
+                dep_ac_idx[nd] = cands[k].idx;
+                dep_dst[nd] = cands[k].dst;
                 nd++;
             }
         }
     }
+
+    // Cap schedule lookups so a busy hub doesn't thrash TLS for minutes.
+    static constexpr int kBoardSchedMax = 8;
+    const int n_sched_arr = na < kBoardSchedMax ? na : kBoardSchedMax;
+    const int n_sched_dep = nd < kBoardSchedMax ? nd : kBoardSchedMax;
+    for (int i = 0; i < n_sched_arr; i++) {
+        char st[40];
+        snprintf(st, sizeof(st), "Board arr %d/%d…", i + 1, n_sched_arr);
+        status_msg(st);
+        board_enrich_row_route_times(&arr[i], true, code, apt_lat, apt_lon, acs[arr_ac_idx[i]], arr_dst[i]);
+    }
+    for (int i = 0; i < n_sched_dep; i++) {
+        char st[40];
+        snprintf(st, sizeof(st), "Board dep %d/%d…", i + 1, n_sched_dep);
+        status_msg(st);
+        board_enrich_row_route_times(&dep[i], false, code, apt_lat, apt_lon, acs[dep_ac_idx[i]], dep_dst[i]);
+    }
+    // Remaining rows: hexdb route only (city batch covers names).
+    for (int i = n_sched_arr; i < na; i++) {
+        char origin[8] = {0}, dest[8] = {0};
+        if (net_fetch_route(arr[i].flight, origin, sizeof(origin), dest, sizeof(dest))) {
+            const char *other = nullptr;
+            if (apt_codes_match(dest, code)) {
+                other = origin;
+            } else if (apt_codes_match(origin, code)) {
+                other = dest;
+            } else if (origin[0]) {
+                other = origin;
+            }
+            if (other && other[0]) {
+                copy_trunc(arr[i].other_apt, sizeof(arr[i].other_apt), other);
+            }
+        }
+        if (!arr[i].arr_est[0] && acs[arr_ac_idx[i]].gs_kts > 40.0f) {
+            board_fmt_local_hm(arr[i].arr_est, sizeof(arr[i].arr_est), apt_lat, apt_lon,
+                               arr_dst[i] / acs[arr_ac_idx[i]].gs_kts);
+        }
+    }
+    for (int i = n_sched_dep; i < nd; i++) {
+        char origin[8] = {0}, dest[8] = {0};
+        if (net_fetch_route(dep[i].flight, origin, sizeof(origin), dest, sizeof(dest))) {
+            const char *other = nullptr;
+            if (apt_codes_match(origin, code)) {
+                other = dest;
+            } else if (apt_codes_match(dest, code)) {
+                other = origin;
+            } else if (dest[0]) {
+                other = dest;
+            }
+            if (other && other[0]) {
+                copy_trunc(dep[i].other_apt, sizeof(dep[i].other_apt), other);
+            }
+        }
+    }
+
+    board_apply_other_city(arr, na);
+    board_apply_other_city(dep, nd);
+
     if (arr_n) {
         *arr_n = na;
     }
     if (dep_n) {
         *dep_n = nd;
     }
-    Serial.printf("ADS-B board %s: %d arr / %d dep (from %d near)\n", code, na, nd, nc);
+    Serial.printf("ADS-B board %s: %d arr / %d dep (from %d airborne near)\n", code, na, nd, nc);
     return na > 0 || nd > 0;
 }
 
@@ -4149,35 +4601,63 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
 
     float lat = 0, lon = 0;
     board_resolve_ll(code, &lat, &lon);
-    if (fabsf(lat) + fabsf(lon) < 0.01f) {
-        set_err("Airport not in DB");
-        return false;
-    }
 
-    status_msg("Airport board...");
-    static Aircraft *s_board_ac = nullptr;
-    static constexpr int kBoardAcMax = 64;
-    if (!s_board_ac) {
-        s_board_ac = (Aircraft *)heap_caps_malloc(sizeof(Aircraft) * (size_t)kBoardAcMax,
-                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_board_ac) {
-            s_board_ac = (Aircraft *)heap_caps_malloc(sizeof(Aircraft) * (size_t)kBoardAcMax, MALLOC_CAP_8BIT);
+    // One page: https://www.flightaware.com/live/airport/KATL
+    // Arrivals column ← En Route (airborne inbound; Arrivals table is already landed).
+    // Departures column ← Departures (left gate; Scheduled are still on the ground).
+    status_msg("FlightAware board...");
+    char url[96];
+    snprintf(url, sizeof(url), "https://www.flightaware.com/live/airport/%s", code);
+    if (!https_get(url, nullptr, kUaBrowser, 10000, 90000, "text/html,application/xhtml+xml,*/*", true,
+                   fa_board_body_ok)) {
+        Serial.printf("FA board fetch fail %s: %s\n", code, g_last_err);
+        set_err(g_last_err[0] ? g_last_err : "FA board fetch failed");
+        return false;
+    }
+    size_t blen = 0;
+    const char *html = http_body_buf(&blen);
+    if (!html || blen < 800) {
+        set_err("FA board empty");
+        return false;
+    }
+    Serial.printf("FA board %s body %u KB\n", code, (unsigned)(blen / 1024));
+
+    // En Route = airborne inbound; Departures = left gate.
+    int na = fa_parse_airport_board_section(html, "enroute-board", arr, arr_max, false);
+    int nd = fa_parse_airport_board_section(html, "departures-board", dep, dep_max, false);
+    Serial.printf("FA board parse enroute=%d departures=%d (html has en=%d dep=%d sch=%d)\n", na, nd,
+                  strstr(html, "id=\"enroute-board\"") ? 1 : 0,
+                  strstr(html, "id=\"departures-board\"") ? 1 : 0,
+                  strstr(html, "id=\"scheduled-board\"") ? 1 : 0);
+    // Drop completed legs (progress bar at 100%).
+    auto drop_done = [](AirportBoardRow *rows, int n) -> int {
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            if (rows[i].progress_pct >= 100) {
+                continue;
+            }
+            if (w != i) {
+                rows[w] = rows[i];
+            }
+            w++;
         }
-    }
-    if (!s_board_ac) {
-        set_err("Board OOM");
+        return w;
+    };
+    na = drop_done(arr, na);
+    nd = drop_done(dep, nd);
+
+    if (na <= 0 && nd <= 0) {
+        set_err("FA board: no flights");
         return false;
     }
-    const int n_ac = net_fetch_aircraft(lat, lon, 40.0f, s_board_ac, (size_t)kBoardAcMax);
-    if (n_ac < 0) {
-        return false;
+    if (arr_n) {
+        *arr_n = na;
+    }
+    if (dep_n) {
+        *dep_n = nd;
     }
     if (label_out && label_len) {
-        snprintf(label_out, label_len, "%s (ADS-B)", code);
-    }
-    if (!board_fill_from_aircraft(code, lat, lon, s_board_ac, n_ac, arr, arr_max, arr_n, dep, dep_max, dep_n)) {
-        set_err("No traffic near airport");
-        return false;
+        snprintf(label_out, label_len, "%s (FA)", code);
     }
     if (out_lat) {
         *out_lat = lat;
@@ -4186,8 +4666,6 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
         *out_lon = lon;
     }
 
-    const int na = arr_n ? *arr_n : 0;
-    const int nd = dep_n ? *dep_n : 0;
     copy_trunc(s_cache_icao, sizeof(s_cache_icao), code);
     s_cache_an = (na < FR_MAX_BOARD_ROWS) ? na : FR_MAX_BOARD_ROWS;
     s_cache_dn = (nd < FR_MAX_BOARD_ROWS) ? nd : FR_MAX_BOARD_ROWS;
@@ -4205,6 +4683,10 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
     s_cache_lat = lat;
     s_cache_lon = lon;
     s_cache_ms = millis();
+    Serial.printf("FA board %s: %d arr / %d dep\n", code, na, nd);
+    // Large FA HTML thrash Hosted Wi-Fi DNS/TLS; settle before the next poll/track.
+    net_tls_reset();
+    delay(750);
     return true;
 }
 

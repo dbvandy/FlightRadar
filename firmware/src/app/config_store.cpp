@@ -46,6 +46,7 @@ void config_load(AppConfig *cfg) {
     prefs.getString("pass", cfg->wifi_pass, sizeof(cfg->wifi_pass));
     prefs.getString("q", cfg->location.query, sizeof(cfg->location.query));
     prefs.getString("label", cfg->location.label, sizeof(cfg->location.label));
+    prefs.getString("icao", cfg->location.icao, sizeof(cfg->location.icao));
     cfg->location.lat = prefs.getFloat("lat", 0);
     cfg->location.lon = prefs.getFloat("lon", 0);
     cfg->range_nm = prefs.getFloat("range", 50.0f);
@@ -80,6 +81,7 @@ void config_save(const AppConfig *cfg) {
     prefs.putString("pass", cfg->wifi_pass);
     prefs.putString("q", cfg->location.query);
     prefs.putString("label", cfg->location.label);
+    prefs.putString("icao", cfg->location.icao);
     prefs.putFloat("lat", cfg->location.lat);
     prefs.putFloat("lon", cfg->location.lon);
     prefs.putFloat("range", cfg->range_nm);
@@ -108,6 +110,7 @@ void config_save_location(const GeoFix *fix) {
     }
     prefs.putString("q", fix->query);
     prefs.putString("label", fix->label);
+    prefs.putString("icao", fix->icao);
     prefs.putFloat("lat", fix->lat);
     prefs.putFloat("lon", fix->lon);
     prefs.end();

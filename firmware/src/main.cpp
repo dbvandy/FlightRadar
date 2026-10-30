@@ -277,12 +277,11 @@ static void handle_save_location() {
     xSemaphoreTake(g_state.mutex, portMAX_DELAY);
     fix = g_state.cfg.location;
     xSemaphoreGive(g_state.mutex);
-    // Airport homes: ensure label is "CODE - City" (AWC) before persisting.
+    // Airport homes: persist/display ICAO only (no facility name or street address).
     const bool enriched = net_enrich_airport_home_label(&fix);
     if (enriched) {
         xSemaphoreTake(g_state.mutex, portMAX_DELAY);
-        strncpy(g_state.cfg.location.label, fix.label, sizeof(g_state.cfg.location.label) - 1);
-        g_state.cfg.location.label[sizeof(g_state.cfg.location.label) - 1] = 0;
+        g_state.cfg.location = fix;
         xSemaphoreGive(g_state.mutex);
     }
     lvgl_port_lock(-1);
@@ -766,30 +765,10 @@ static void handle_airport_board() {
     ui_set_board_status("Loading board…");
     float board_lat = 0, board_lon = 0;
 
-    // Instant path: classify aircraft already on the PPI (no extra HTTPS).
-    static Aircraft s_local_ac[FR_MAX_AIRCRAFT];
-    int local_n = 0;
-    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
-    local_n = g_state.aircraft_count;
-    if (local_n > FR_MAX_AIRCRAFT) {
-        local_n = FR_MAX_AIRCRAFT;
-    }
-    if (local_n > 0) {
-        memcpy(s_local_ac, g_state.aircraft, sizeof(Aircraft) * (size_t)local_n);
-    }
-    xSemaphoreGive(g_state.mutex);
-
-    bool ok = false;
-    if (local_n > 0) {
-        ok = net_build_airport_board_from_traffic(icao, s_local_ac, local_n, s_arr, FR_MAX_BOARD_ROWS, &an,
-                                                  s_dep, FR_MAX_BOARD_ROWS, &dn, label, sizeof(label),
-                                                  &board_lat, &board_lon);
-    }
-    if (!ok) {
-        // Fallback: dedicated ADS-B fetch around the airport.
-        ok = net_fetch_airport_board(icao, s_arr, FR_MAX_BOARD_ROWS, &an, s_dep, FR_MAX_BOARD_ROWS, &dn,
-                                     label, sizeof(label), &board_lat, &board_lon);
-    }
+    // FlightAware live/airport/{ICAO} — Ident/Type/From|To/Depart/Arrive in one page.
+    // Do not fall back to local ADS-B (wrong columns + misleading "No traffic near airport").
+    const bool ok = net_fetch_airport_board(icao, s_arr, FR_MAX_BOARD_ROWS, &an, s_dep, FR_MAX_BOARD_ROWS, &dn,
+                                            label, sizeof(label), &board_lat, &board_lon);
 
     if (ok) {
         xSemaphoreTake(g_state.mutex, portMAX_DELAY);
@@ -1167,17 +1146,24 @@ static void net_task(void *arg) {
         if (req & UI_REQ_FETCH_WEATHER) {
             handle_weather();
         }
-        if (req & UI_REQ_FETCH_FLIGHT_INFO) {
-            handle_flight_info();
-        }
+        // Track/follow before board refresh — a queued FA board download must not
+        // block a flight the user just tapped.
         if (req & UI_REQ_TRACK_FLIGHT) {
             handle_track_flight();
+        }
+        if (req & UI_REQ_FETCH_FLIGHT_INFO) {
+            handle_flight_info();
         }
         if (req & UI_REQ_SEARCH_AIRPORTS) {
             handle_search_airports();
         }
         if (req & UI_REQ_FETCH_AIRPORT_BOARD) {
-            handle_airport_board();
+            // Defer board refresh while a track is in flight this tick.
+            if (!(req & UI_REQ_TRACK_FLIGHT)) {
+                handle_airport_board();
+            } else {
+                __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_FETCH_AIRPORT_BOARD);
+            }
         }
         if (req & UI_REQ_REFRESH_PLATE_CITIES) {
             handle_refresh_plate_cities();
@@ -1322,13 +1308,14 @@ void setup() {
             char msg[96];
             snprintf(msg, sizeof(msg), "Joined %s", g_state.cfg.wifi_ssid);
             if (g_state.cfg.location.valid) {
-                // Existing airport homes may still be "KBNA (BNA)" — upgrade to "BNA - City".
+                // Existing airport homes may still be a long address — collapse to ICAO.
                 if (net_enrich_airport_home_label(&g_state.cfg.location)) {
                     config_save_location(&g_state.cfg.location);
                 }
                 // ui_show_radar marks radar_live and requests ADS-B + airports.
                 lvgl_port_lock(-1);
-                ui_notify_home_label(g_state.cfg.location.label);
+                ui_notify_home_label(g_state.cfg.location.icao[0] ? g_state.cfg.location.icao
+                                                                  : g_state.cfg.location.label);
                 ui_show_radar();
                 lvgl_port_unlock();
             } else {
