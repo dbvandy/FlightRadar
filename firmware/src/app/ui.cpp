@@ -213,6 +213,7 @@ static float s_follow_saved_range = 250.0f;
 static int s_follow_saved_max_alt = 45000;
 static bool s_follow_saved_view_ok = false;
 static bool s_follow_route_fitted = false;  // zoom/center fitted to dep+arr for this track
+static bool s_follow_skip_path_overview = false;  // heli / slow: keep close-in, skip dep–arr fit
 static bool s_follow_spd_view_done = false;  // applied once per track from groundspeed
 static float s_hist_alt_floor = -1.0f;  // rolling low alt while locking chart climb-start
 static GeoFix s_home_loc{};  // base/home from boot cfg or Change location (not pan center)
@@ -274,8 +275,8 @@ static uint32_t s_hist_fa_t_end_unix = 0;  // last FA sample used in seed
 static uint32_t s_hist_last_minute = 0;    // live append throttle (unix / 60)
 
 // Near zoom (always). While following, zoom-out continues in 250 nm steps to 1000.
-static const float kZoomNear[] = {4, 5, 15, 25, 40, 60, 100, 160, 250};
-static const int kZoomNearN = 9;
+static const float kZoomNear[] = {3, 5, 10, 15, 25, 40, 60, 100, 160, 250};
+static const int kZoomNearN = 10;
 static const float kZoomFarStep = 250.0f;
 static const float kZoomFarMax = FR_FOLLOW_MAX_NM;
 static const lv_coord_t kRadarPanClickThresh = 10;  // px: drag beyond this skips aircraft/airport pick
@@ -1437,11 +1438,24 @@ static void follow_waypoints_prune_outliers() {
     }
 }
 
-/** Keep dep/arr; drop intermediate pins closer than min_nm to the previous kept pin. */
-static void follow_waypoints_thin_min_nm(float min_nm) {
-    if (s_follow_wpt_n <= 2 || min_nm <= 0.0f) {
+/**
+ * Keep dep/arr; thin intermediates.
+ * Within 50 nm of dep or arr → ≥25 nm spacing; enroute (beyond both) → ≥50 nm.
+ */
+static void follow_waypoints_thin_adaptive() {
+    if (s_follow_wpt_n <= 2) {
         return;
     }
+    const FollowWpt &dep = s_follow_wpts[0];
+    const FollowWpt &arr = s_follow_wpts[s_follow_wpt_n - 1];
+    auto min_spacing = [&](float lat, float lon) -> float {
+        constexpr float kNearAptNm = 50.0f;
+        if ((dep.ok && wpt_dist_nm(dep.lat, dep.lon, lat, lon) <= kNearAptNm) ||
+            (arr.ok && wpt_dist_nm(arr.lat, arr.lon, lat, lon) <= kNearAptNm)) {
+            return 25.0f;
+        }
+        return 50.0f;
+    };
     int kept = 1;  // always keep index 0 (dep)
     for (int i = 1; i < s_follow_wpt_n - 1; i++) {
         const FollowWpt &prev = s_follow_wpts[kept - 1];
@@ -1449,7 +1463,7 @@ static void follow_waypoints_thin_min_nm(float min_nm) {
         if (!cur.ok) {
             continue;
         }
-        if (wpt_dist_nm(prev.lat, prev.lon, cur.lat, cur.lon) >= min_nm) {
+        if (wpt_dist_nm(prev.lat, prev.lon, cur.lat, cur.lon) >= min_spacing(cur.lat, cur.lon)) {
             if (kept != i) {
                 s_follow_wpts[kept] = cur;
             }
@@ -1485,10 +1499,10 @@ static void follow_waypoints_rebuild() {
             }
             push_wpt(rw.lat, rw.lon, rw.name[0] ? rw.name : "WPT");
         }
-        // Drop off-path rogues, then enforce ≥25 nm spacing (DAL3161 was a mess).
+        // Drop off-path rogues, then thin: 25 nm near dep/arr, 50 nm enroute.
         if (s_follow_wpt_n > 2) {
             follow_waypoints_prune_outliers();
-            follow_waypoints_thin_min_nm(25.0f);
+            follow_waypoints_thin_adaptive();
         }
         return;
     }
@@ -1513,7 +1527,7 @@ static void follow_apt_clear() {
 
 static bool aircraft_is_helicopter(const Aircraft *ac);
 
-/** Once per track: heli or <100 kt → 40 nm / FL100 / counties on; else keep default follow view. */
+/** Once per track: heli → 40 nm close-in (skip path overview); jet → keep dep–arr overview. */
 static void follow_maybe_apply_speed_view(const Aircraft *ac) {
     if (!s_follow || s_follow_spd_view_done || !ac) {
         return;
@@ -1523,15 +1537,15 @@ static void follow_maybe_apply_speed_view(const Aircraft *ac) {
     if (ac->on_ground) {
         gs = 0.0f;
     }
-    // Helis always use the close-in view; planes wait for a real GS sample.
-    if (!heli && isnan(gs)) {
+    // Track/board placeholders have no hex and gs==0 — wait for real ADS-B.
+    // Otherwise we falsely skip the 15s dep/arr city overview.
+    if (!heli && (!ac->hex[0] || isnan(gs))) {
         return;
     }
     s_follow_spd_view_done = true;
     if (!heli && gs >= 100.0f) {
         return;  // leave range / ceiling / overlays as already set
     }
-    set_range(40.0f);
     set_max_alt(10000);
     if (!s_follow_county_user_hid) {
         s_show_counties = true;
@@ -1543,15 +1557,22 @@ static void follow_maybe_apply_speed_view(const Aircraft *ac) {
         update_cty_toggle_label();
         map_cache_mark_dirty();
     }
-    // Keep close-in view; don't zoom out to full dep–arr span.
-    s_follow_route_fitted = true;
+    // Only helis skip the dep–arr overview; jets still zoom out to show both cities.
+    if (heli) {
+        set_range(40.0f);
+        s_follow_skip_path_overview = true;
+    }
     if (radar_plot) {
         lv_obj_invalidate(radar_plot);
     }
 }
 
-/** Approach auto-zoom: as aircraft nears arrival, step PPI in to 60 → 40 → 25 → 15 → 5 → 4 nm. */
+/** Approach auto-zoom: as aircraft nears arrival, step PPI in to 40 → 25 → 15 → 10 → 5 → 3 nm. */
 static void follow_maybe_approach_zoom(const Aircraft *ac) {
+    // Path overview owns the camera until the 15s Center timer fires.
+    if (s_follow_hold_center) {
+        return;
+    }
     if (!s_follow || !ac || !s_follow_arr.ok || s_follow_approach_zoom_off) {
         return;
     }
@@ -1559,18 +1580,18 @@ static void follow_maybe_approach_zoom(const Aircraft *ac) {
     ll_to_nm(s_follow_arr.lat, s_follow_arr.lon, ac->lat, ac->lon, &east, &north);
     const float nm = hypotf(east, north);
     float want = 0.0f;
-    if (nm <= 4.0f) {
-        want = 4.0f;
+    if (nm <= 3.0f) {
+        want = 3.0f;  // short final
     } else if (nm <= 5.0f) {
         want = 5.0f;
+    } else if (nm <= 10.0f) {
+        want = 10.0f;
     } else if (nm <= 15.0f) {
         want = 15.0f;
     } else if (nm <= 25.0f) {
         want = 25.0f;
     } else if (nm <= 40.0f) {
         want = 40.0f;
-    } else if (nm <= 60.0f) {
-        want = 60.0f;
     } else {
         return;
     }
@@ -1616,7 +1637,7 @@ static void follow_path_center_timer_arm() {
 
 /** Center + zoom so dep and arr airports (and aircraft if known) fit in the PPI. */
 static void follow_fit_dep_arr_view() {
-    if (!s_follow || !s_follow_dep.ok || !s_follow_arr.ok) {
+    if (!s_follow || !s_follow_dep.ok || !s_follow_arr.ok || s_follow_skip_path_overview) {
         return;
     }
     const float clat = (s_follow_dep.lat + s_follow_arr.lat) * 0.5f;
@@ -1639,7 +1660,7 @@ static void follow_fit_dep_arr_view() {
             need = d_ac;
         }
     }
-    need *= 1.12f;  // keep marks inside the rim
+    need *= 1.25f;  // keep dep/arr cities inside the rim
     if (need < 15.0f) {
         need = 15.0f;
     }
@@ -1672,7 +1693,15 @@ static void follow_fit_dep_arr_view() {
     // Hold center so traffic updates don't snap back onto the aircraft.
     s_follow_hold_center = true;
     sync_follow_to_state();
-    // Traffic only — airports/counties stay hidden while tracking.
+    // Cities on during overview so dep/arr metro labels are visible.
+    s_show_cities = true;
+    if (g_state) {
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        g_state->cfg.show_cities = true;
+        xSemaphoreGive(g_state->mutex);
+    }
+    update_city_toggle_label();
+    map_cache_mark_dirty();
     set_radar_center(clat, clon, label, UI_REQ_REFRESH_TRAFFIC);
     set_range(zoom);
     s_follow_route_fitted = true;
@@ -1764,7 +1793,8 @@ static void follow_apt_update_from_fi(const FlightInfo *fi) {
         s_follow_fi.route_ok = true;
     }
     follow_waypoints_rebuild();
-    if (s_follow && s_follow_dep.ok && s_follow_arr.ok && !s_follow_route_fitted) {
+    if (s_follow && s_follow_dep.ok && s_follow_arr.ok && !s_follow_route_fitted &&
+        !s_follow_skip_path_overview) {
         follow_fit_dep_arr_view();
     }
     if (radar_plot && (s_follow_dep.ok || s_follow_arr.ok || s_follow_wpt_n > 0)) {
@@ -1783,6 +1813,7 @@ static void stop_follow(bool restore_saved) {
     s_follow_hold_center = false;
     s_follow_approach_zoom_off = false;
     s_follow_route_fitted = false;
+    s_follow_skip_path_overview = false;
     s_follow_spd_view_done = false;
     s_traffic_sel_row = -1;
     s_follow_hex[0] = 0;
@@ -1836,6 +1867,7 @@ static void leave_follow_for_home() {
     s_follow_hold_center = false;
     s_follow_approach_zoom_off = false;
     s_follow_route_fitted = false;
+    s_follow_skip_path_overview = false;
     s_follow_spd_view_done = false;
     s_traffic_sel_row = -1;
     s_follow_hex[0] = 0;
@@ -1897,9 +1929,24 @@ static void leave_follow_for_home() {
 static void update_adsb_clicked(lv_event_t *e) {
     LV_UNUSED(e);
     if (radar_status) {
-        lv_label_set_text(radar_status, "Updating ADS-B…");
+        lv_label_set_text(radar_status, s_follow ? "Updating ADS-B + schedule…" : "Resetting network…");
     }
-    request(UI_REQ_REFRESH_TRAFFIC | UI_REQ_REFRESH_AIRPORTS);
+    // Break in-flight FA/FS HTTPS (Loading route…) so recover can run this loop.
+    net_abort_request();
+    // Drop hung FA / board / plate scrapes that lock TLS, then force a clean ADS-B poll.
+    if (g_state) {
+        __sync_fetch_and_and(
+            (uint32_t *)&g_state->requests,
+            ~(UI_REQ_FETCH_FLIGHT_INFO | UI_REQ_FETCH_AIRPORT_BOARD | UI_REQ_FETCH_ROUTE_FLIGHTS |
+              UI_REQ_FETCH_PLATE | UI_REQ_UPDATE_PLATES | UI_REQ_FETCH_PLATE_RADIOS |
+              UI_REQ_TRACK_FLIGHT | UI_REQ_REFRESH_SCHEDULE));
+    }
+    uint32_t req = UI_REQ_NET_RECOVER | UI_REQ_REFRESH_TRAFFIC | UI_REQ_REFRESH_AIRPORTS;
+    // While tracking, also refresh FlightStats Sch/Act/Est (merged into existing dep/arr).
+    if (s_follow && (s_follow_label[0] || s_follow_fi.flight[0])) {
+        req |= UI_REQ_REFRESH_SCHEDULE;
+    }
+    request(req);
 }
 
 static void capture_home_from_cfg() {
@@ -2001,8 +2048,17 @@ static void center_on_flight(lv_event_t *e) {
     } else {
         return;
     }
+    // Keep cities on after path overview (tracking default).
+    s_show_cities = true;
+    if (g_state) {
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        g_state->cfg.show_cities = true;
+        xSemaphoreGive(g_state->mutex);
+    }
+    update_city_toggle_label();
+    map_cache_mark_dirty();
     set_radar_center(lat, lon, label, UI_REQ_REFRESH_TRAFFIC | UI_REQ_REFRESH_AIRPORTS);
-    set_range(100.0f);
+    set_range(100.0f);  // Center button / post-overview always 100 nm
     if (radar_plot) {
         lv_obj_invalidate(radar_plot);
     }
@@ -2774,7 +2830,7 @@ static bool rwy_is_parallel(int hdg_a, int hdg_b) {
     return d <= 12;
 }
 
-/** Collect CTAF/ATC|CTR/GND/ATIS|AWOS lines that have frequencies. */
+/** Collect radio lines: towered → TWR/GND/ATIS; nontowered → CTAF + ATIS/AWOS. */
 static int plate_freq_lines(const AirportRadios *r, const char *lbls[4], const char *freqs[4]) {
     int n = 0;
     if (!r) {
@@ -2787,10 +2843,19 @@ static int plate_freq_lines(const AirportRadios *r, const char *lbls[4], const c
             n++;
         }
     };
-    push("CTAF", r->ctaf);
-    push((r->atc_is_center && r->atc[0]) ? "CTR" : "ATC", r->atc);
-    push("GND", r->gnd);
-    push((r->atis_is_awos && r->atis[0]) ? "AWOS" : "ATIS", r->atis);
+    const bool has_tower = r->atc[0] && !r->atc_is_center;
+    if (has_tower) {
+        push("TWR", r->atc);
+        push("GND", r->gnd);
+        push((r->atis_is_awos && r->atis[0]) ? "AWOS" : "ATIS", r->atis);
+    } else {
+        // No tower frequency — CTAF plus ATIS and/or AWOS (CTR if present).
+        push("CTAF", r->ctaf);
+        if (r->atc_is_center) {
+            push("CTR", r->atc);
+        }
+        push((r->atis_is_awos && r->atis[0]) ? "AWOS" : "ATIS", r->atis);
+    }
     return n;
 }
 
@@ -3030,6 +3095,14 @@ static void draw_runway_plate(lv_draw_ctx_t *ctx, lv_coord_t cx, lv_coord_t cy, 
 /** Mini airport diagram centered on (cx,cy) — used on the PPI at ≤15 nm. */
 static void draw_map_airport_plate(lv_draw_ctx_t *ctx, lv_coord_t cx, lv_coord_t cy, lv_coord_t size,
                                    const char *icao, const Runway *rwys, int rwy_n) {
+    if (size >= 24 && icao && icao[0]) {
+        const lv_coord_t half = size / 2;
+        lv_area_t box = {(lv_coord_t)(cx - half), (lv_coord_t)(cy - half), (lv_coord_t)(cx + half),
+                         (lv_coord_t)(cy + half)};
+        if (draw_faa_plate_bitmap(ctx, &box, icao)) {
+            return;
+        }
+    }
     draw_runway_plate(ctx, cx, cy, size, icao, rwys, rwy_n);
 }
 
@@ -3179,7 +3252,7 @@ static void format_radios_block(const AirportRadios *r, char *out, size_t out_le
     if (!r) {
         return;
     }
-    // Only list radios that exist (e.g. KINF has CTAF+CTR, no ATIS/GND).
+    // Towered: TWR/GND/ATIS. Nontowered: CTAF + ATIS/AWOS (and CTR if present).
     char *p = out;
     size_t left = out_len;
     auto append_line = [&](const char *lbl, const char *freq) {
@@ -3192,10 +3265,18 @@ static void format_radios_block(const AirportRadios *r, char *out, size_t out_le
             left -= (size_t)n;
         }
     };
-    append_line("CTAF", r->ctaf);
-    append_line((r->atc_is_center && r->atc[0]) ? "CTR" : "ATC", r->atc);
-    append_line("GND", r->gnd);
-    append_line((r->atis_is_awos && r->atis[0]) ? "AWOS" : "ATIS", r->atis);
+    const bool has_tower = r->atc[0] && !r->atc_is_center;
+    if (has_tower) {
+        append_line("TWR", r->atc);
+        append_line("GND", r->gnd);
+        append_line((r->atis_is_awos && r->atis[0]) ? "AWOS" : "ATIS", r->atis);
+    } else {
+        append_line("CTAF", r->ctaf);
+        if (r->atc_is_center) {
+            append_line("CTR", r->atc);
+        }
+        append_line((r->atis_is_awos && r->atis[0]) ? "AWOS" : "ATIS", r->atis);
+    }
 }
 
 static void layout_detail_body(bool with_side_panel) {
@@ -3355,6 +3436,8 @@ static void center_on_airport(lv_event_t *e) {
     request(UI_REQ_SAVE_LOCATION | UI_REQ_REFRESH_AIRPORTS | UI_REQ_REFRESH_TRAFFIC);
 }
 
+static void track_history_push(const char *raw);
+
 /**
  * Begin (or switch) follow on an aircraft.
  * toggle_if_same: true = Follow/Unfollow button (tap same plane ends track);
@@ -3396,20 +3479,22 @@ static void start_follow_aircraft(const Aircraft *ac, bool toggle_if_same, bool 
     s_follow_solo = true;
     s_follow_hold_center = false;
     s_follow_approach_zoom_off = false;
+    s_follow_route_fitted = false;
+    s_follow_skip_path_overview = false;
     s_follow_county_state = -2;
     s_follow_county_user_hid = false;
     s_wpt_view_mode = 0;  // show route names + line
-    // Airports/cities off; counties ON for the aircraft's state (unless user later hides).
+    // Airports off; cities + counties ON while tracking (user can still hide).
     // Helis / <100 kt tracks also force counties via follow_maybe_apply_speed_view.
     s_show_airports = false;
     s_show_counties = true;
-    s_show_cities = false;
+    s_show_cities = true;
     s_follow_spd_view_done = false;
     if (g_state) {
         xSemaphoreTake(g_state->mutex, portMAX_DELAY);
         g_state->cfg.show_airports = false;
         g_state->cfg.show_counties = true;
-        g_state->cfg.show_cities = false;
+        g_state->cfg.show_cities = true;
         xSemaphoreGive(g_state->mutex);
     }
     update_apt_toggle_label();
@@ -3434,6 +3519,10 @@ static void start_follow_aircraft(const Aircraft *ac, bool toggle_if_same, bool 
         strncpy(s_follow_label, s_follow_hex, sizeof(s_follow_label) - 1);
         s_follow_label[sizeof(s_follow_label) - 1] = 0;
     }
+    // Every tracked flight lands on Track Flight → Recent (radar/table/board/Track).
+    if (s_follow_label[0]) {
+        track_history_push(s_follow_label);
+    }
     s_follow_ac = *ac;
     s_follow_ac_ok = true;
     sync_follow_to_state();
@@ -3448,6 +3537,14 @@ static void start_follow_aircraft(const Aircraft *ac, bool toggle_if_same, bool 
         follow_apt_update_from_fi(&s_follow_fi);
     } else {
         memset(&s_follow_fi, 0, sizeof(s_follow_fi));
+        // Drop leftover Track/FA data so FETCH isn't skipped for a different flight
+        // and old waypoints don't stick on the new follow.
+        if (g_state) {
+            xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+            memset(&g_state->flight_info, 0, sizeof(g_state->flight_info));
+            g_state->flight_track_n = 0;
+            xSemaphoreGive(g_state->mutex);
+        }
     }
 
     trail_clear();
@@ -3777,18 +3874,21 @@ static void radar_draw(lv_event_t *e) {
     // Mode 0 = all, 1 = hide names, 2 = hide line + mid waypoints (dep/arr stay visible).
     // On final (≤15 nm): hide route lines and waypoint labels — plates own the view.
     if (s_follow && s_follow_wpt_n > 0 && s_range > 15.5f) {
-        auto project_wpt = [&](float lat, float lon, lv_coord_t *ox, lv_coord_t *oy) {
+        // Returns true when the fix is outside the PPI (projected onto the rim).
+        auto project_wpt = [&](float lat, float lon, lv_coord_t *ox, lv_coord_t *oy) -> bool {
             float east = 0, north = 0;
             ll_to_nm(lat, lon, s_olat, s_olon, &east, &north);
             float ex = (s_range > 0.1f) ? (east / s_range) : 0.0f;
             float ny = (s_range > 0.1f) ? (-north / s_range) : 0.0f;
             const float len = hypotf(ex, ny);
-            if (len > 1.02f && len > 1e-4f) {
+            const bool off_screen = (len > 1.02f);
+            if (off_screen && len > 1e-4f) {
                 ex /= len;
                 ny /= len;
             }
             *ox = (lv_coord_t)lroundf((float)cx + ex * (float)R);
             *oy = (lv_coord_t)lroundf((float)cy + ny * (float)R);
+            return off_screen;
         };
 
         // Route polyline through waypoints (hidden in mode 2).
@@ -3831,7 +3931,12 @@ static void radar_draw(lv_event_t *e) {
                 continue;
             }
             lv_coord_t x, y;
-            project_wpt(w.lat, w.lon, &x, &y);
+            const bool off_screen = project_wpt(w.lat, w.lon, &x, &y);
+            // Off-scale mid fixes clamp to the same rim point — skip marks/names so
+            // they don't pile up; dep/arr airports still show on the rim.
+            if (!is_end && off_screen) {
+                continue;
+            }
             const lv_color_t col = (i == 0) ? COL_APT_LG : ((i == s_follow_wpt_n - 1) ? COL_APT_MD : COL_WPT);
             lv_draw_rect_dsc_t mark;
             lv_draw_rect_dsc_init(&mark);
@@ -4382,14 +4487,15 @@ static void radar_clicked(lv_event_t *e) {
         s_detail_city[0] = 0;
         memset(&s_detail_radios, 0, sizeof(s_detail_radios));
         plates_city_from_name(a->name, s_detail_city, sizeof(s_detail_city));
-        net_lookup_airport_radios(a->icao, &s_detail_radios);
+        // Radios come with METAR/TAF (net task) — do not HTTPS on LVGL thread.
         char radios[96];
         format_radios_block(&s_detail_radios, radios, sizeof(radios));
         snprintf(title, sizeof(title), "%s  %s", a->icao, a->iata);
         snprintf(body, sizeof(body),
                  "%s\n%s %s\nElev %d ft\nRwy  %d ft\nPos  %.4f, %.4f\n"
                  "%s\n\nLoading METAR / TAF...",
-                 a->name, a->state, a->country, a->elev_ft, a->longest_rwy_ft, a->lat, a->lon, radios);
+                 a->name, a->state, a->country, a->elev_ft, a->longest_rwy_ft, a->lat, a->lon,
+                 radios[0] ? radios : "Radios…");
         show_detail(title, body, a->icao);
         request(UI_REQ_FETCH_WEATHER);
         return;
@@ -4397,7 +4503,7 @@ static void radar_clicked(lv_event_t *e) {
 }
 
 static void set_range_ex(float nm, bool request_refresh) {
-    // While tracking, allow approach zooms down to the nearest kZoomNear step (4 nm).
+    // While tracking, allow approach zooms down to the nearest kZoomNear step (3 nm).
     const float min_nm = s_follow ? kZoomNear[0] : 10.0f;
     if (nm < min_nm) {
         nm = min_nm;
@@ -4488,8 +4594,8 @@ static void on_pinch_zoom(int dir) {
     s_radar_drag_active = false;
     s_radar_did_pan = true;
     s_radar_drag_dist = (float)kRadarPanClickThresh + 1.0f;
-    // Invert vs port: pinch-in = zoom in, spread = zoom out.
-    radar_zoom_step(-dir);
+    // Port: +1 fingers apart (zoom in), -1 together (zoom out).
+    radar_zoom_step(dir);
 }
 
 static void set_max_alt_ex(int alt_ft, bool persist) {
@@ -4759,7 +4865,7 @@ static void hide_settings(lv_event_t *e) {
 }
 
 static void sync_sound_panel_controls() {
-    int bright = 100;
+    int bright = 50;
     int vol = 60;
     if (g_state) {
         xSemaphoreTake(g_state->mutex, portMAX_DELAY);
@@ -4855,6 +4961,9 @@ static void vol_slider_changed(lv_event_t *e) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d%%", v);
         lv_label_set_text(vol_pct_lbl, buf);
+    }
+    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED && v > 0) {
+        audio_click_play();  // live preview while dragging
     }
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
         audio_click_play();
@@ -5096,9 +5205,21 @@ static void plates_load_preview(const char *icao) {
     if (icao && icao[0]) {
         strncpy(s_plates_prev_icao, icao, sizeof(s_plates_prev_icao) - 1);
         s_plates_prev_icao[sizeof(s_plates_prev_icao) - 1] = 0;
+        // Local flash DB only — never HTTPS on the LVGL thread (that locked the UI).
         s_plates_prev_rwy_n =
             net_lookup_runways(s_plates_prev_icao, s_plates_prev_rwys, FR_MAX_RWYS_PER_APT);
-        net_lookup_airport_radios(s_plates_prev_icao, &s_plates_radios);
+        // Plates: load from SPIFFS into PSRAM here (event, not draw) — never auto-download.
+        (void)faa_plate_load_local(s_plates_prev_icao);
+        if (g_state) {
+            xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+            strncpy(g_state->pending_plate_radios_icao, s_plates_prev_icao,
+                    sizeof(g_state->pending_plate_radios_icao) - 1);
+            g_state->pending_plate_radios_icao[sizeof(g_state->pending_plate_radios_icao) - 1] = 0;
+            g_state->plate_radios_ok = false;
+            memset(&g_state->plate_radios, 0, sizeof(g_state->plate_radios));
+            xSemaphoreGive(g_state->mutex);
+            request(UI_REQ_FETCH_PLATE_RADIOS);
+        }
     }
     if (plates_preview) {
         lv_obj_invalidate(plates_preview);
@@ -5114,7 +5235,7 @@ static void plates_load_preview(const char *icao) {
             snprintf(t, sizeof(t), "%s  (added)", icao);
             lv_label_set_text(plates_title_lbl, t);
         } else {
-            lv_label_set_text(plates_title_lbl, "Airport Plates");
+            lv_label_set_text(plates_title_lbl, "Airport Information");
         }
     }
     plates_fill_info_table();
@@ -5316,6 +5437,7 @@ static void plates_normalize_code(const char *raw, char *out, size_t out_len) {
 
 static void plates_add_hit_clicked(lv_event_t *e);
 static void plates_add_icao(const char *icao_raw, const char *city_opt);
+static void plates_update_clicked(lv_event_t *e);
 static void update_detail_add_plate_btn();
 static void open_plates_for_icao(const char *icao);
 static void plates_request_city_refresh();
@@ -5627,6 +5749,18 @@ static void goto_plates(lv_event_t *e) {
     lv_obj_move_foreground(plates_panel);
     plates_hide_keyboard();
     plates_request_city_refresh();
+}
+
+static void plates_update_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    if (!g_state) {
+        return;
+    }
+    if (plates_status) {
+        lv_label_set_text(plates_status, "Downloading plates → onboard storage…");
+    }
+    ui_set_status("Updating plates…");
+    request(UI_REQ_UPDATE_PLATES);
 }
 
 static void plates_remove_clicked(lv_event_t *e) {
@@ -5964,9 +6098,357 @@ static void startup_dd_changed(lv_event_t *e) {
     apply_startup_dropdowns(true);
 }
 
+// ---- Screen calibrate (Startup Settings → Calibrate Screen) ----------------
+static lv_obj_t *calib_panel = nullptr;
+static lv_obj_t *calib_hint_lbl = nullptr;
+static lv_obj_t *calib_raw_lbl = nullptr;
+static lv_obj_t *calib_status_lbl = nullptr;
+static lv_obj_t *calib_press_slider = nullptr;
+static lv_obj_t *calib_press_pct_lbl = nullptr;
+static lv_obj_t *calib_targets[5] = {};
+static lv_timer_t *calib_timer = nullptr;
+static int s_calib_raw_x[5] = {};
+static int s_calib_raw_y[5] = {};
+static uint8_t s_calib_hit_mask = 0;
+static int s_calib_press_sens = 100;
+static constexpr int kTouchSensMin = 60;
+static constexpr int kTouchSensMax = 100;
+
+static int clamp_touch_sens_ui(int sens) {
+    if (sens < kTouchSensMin) {
+        return kTouchSensMin;
+    }
+    if (sens > kTouchSensMax) {
+        return kTouchSensMax;
+    }
+    return sens;
+}
+
+static int touch_sens_to_min(int sens) {
+    sens = clamp_touch_sens_ui(sens);
+    // 100 = lightest (threshold 0); 60 = firmer (~80 strength).
+    return ((kTouchSensMax - sens) * 200) / 100;
+}
+
+static void apply_touch_calib_runtime(float ox, float oy, float sx, float sy, int sens) {
+    lvgl_port_set_touch_map(ox, oy, sx, sy);
+    lvgl_port_set_touch_pressure_min(touch_sens_to_min(sens));
+}
+
+static void calib_update_raw_lbl() {
+    if (!calib_raw_lbl) {
+        return;
+    }
+    int rx = 0, ry = 0, rs = 0;
+    lvgl_port_get_last_touch_raw(&rx, &ry, &rs);
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Raw  X=%d  Y=%d  Pressure=%d", rx, ry, rs);
+    lv_label_set_text(calib_raw_lbl, buf);
+}
+
+static void calib_timer_cb(lv_timer_t *t) {
+    LV_UNUSED(t);
+    if (!calib_panel || lv_obj_has_flag(calib_panel, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    calib_update_raw_lbl();
+}
+
+static void calib_style_targets() {
+    for (int i = 0; i < 5; i++) {
+        if (!calib_targets[i]) {
+            continue;
+        }
+        const bool hit = (s_calib_hit_mask & (1u << i)) != 0;
+        lv_obj_set_style_bg_color(calib_targets[i], lv_color_hex(hit ? 0x2A6A2A : 0x1A2A1A), 0);
+        lv_obj_set_style_border_color(calib_targets[i], hit ? COL_GREEN : COL_DIM, 0);
+    }
+}
+
+static void calib_target_clicked(lv_event_t *e) {
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= 5) {
+        return;
+    }
+    int rx = 0, ry = 0, rs = 0;
+    lvgl_port_get_last_touch_raw(&rx, &ry, &rs);
+    s_calib_raw_x[idx] = rx;
+    s_calib_raw_y[idx] = ry;
+    s_calib_hit_mask |= (uint8_t)(1u << idx);
+    calib_style_targets();
+    audio_click_play();
+    if (calib_status_lbl) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "Point %d saved (%d,%d)  strength %d", idx + 1, rx, ry, rs);
+        lv_label_set_text(calib_status_lbl, msg);
+    }
+}
+
+static void calib_compute_map(float *ox, float *oy, float *sx, float *sy) {
+    // Targets: 0=TL 1=TR 2=BL 3=BR  (center=4 unused for map math).
+    constexpr float kM = 48.0f;
+    const float W = (float)H_size;
+    const float H = (float)V_size;
+    const float dx1 = (float)(s_calib_raw_x[1] - s_calib_raw_x[0]);
+    const float dx2 = (float)(s_calib_raw_x[3] - s_calib_raw_x[2]);
+    const float dy1 = (float)(s_calib_raw_y[2] - s_calib_raw_y[0]);
+    const float dy2 = (float)(s_calib_raw_y[3] - s_calib_raw_y[1]);
+    float adx = 0.5f * (dx1 + dx2);
+    float ady = 0.5f * (dy1 + dy2);
+    if (fabsf(adx) < 8.0f) {
+        adx = (adx < 0.0f) ? -8.0f : 8.0f;
+    }
+    if (fabsf(ady) < 8.0f) {
+        ady = (ady < 0.0f) ? -8.0f : 8.0f;
+    }
+    *sx = (W - 2.0f * kM) / adx;
+    *sy = (H - 2.0f * kM) / ady;
+    const float raw_left = 0.5f * (float)(s_calib_raw_x[0] + s_calib_raw_x[2]);
+    const float raw_top = 0.5f * (float)(s_calib_raw_y[0] + s_calib_raw_y[1]);
+    *ox = kM - (*sx) * raw_left;
+    *oy = kM - (*sy) * raw_top;
+}
+
+static void calib_press_changed(lv_event_t *e) {
+    LV_UNUSED(e);
+    if (!calib_press_slider) {
+        return;
+    }
+    s_calib_press_sens = clamp_touch_sens_ui((int)lv_slider_get_value(calib_press_slider));
+    if (calib_press_slider && (int)lv_slider_get_value(calib_press_slider) != s_calib_press_sens) {
+        lv_slider_set_value(calib_press_slider, s_calib_press_sens, LV_ANIM_OFF);
+    }
+    if (calib_press_pct_lbl) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Pressure sensitivity  %d%%  (min %d)", s_calib_press_sens,
+                 kTouchSensMin);
+        lv_label_set_text(calib_press_pct_lbl, buf);
+    }
+    // Live preview of threshold while adjusting.
+    lvgl_port_set_touch_pressure_min(touch_sens_to_min(s_calib_press_sens));
+}
+
+static void calib_apply_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    float ox = 0, oy = 0, sx = 1, sy = 1;
+    if ((s_calib_hit_mask & 0x0F) == 0x0F) {
+        calib_compute_map(&ox, &oy, &sx, &sy);
+    } else {
+        // Keep existing map; only pressure may change.
+        lvgl_port_get_touch_map(&ox, &oy, &sx, &sy);
+        if (calib_status_lbl) {
+            lv_label_set_text(calib_status_lbl, "Tap all 4 corners for location map (pressure saved)");
+        }
+    }
+    apply_touch_calib_runtime(ox, oy, sx, sy, s_calib_press_sens);
+    if (g_state) {
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        g_state->cfg.touch_ox = ox;
+        g_state->cfg.touch_oy = oy;
+        g_state->cfg.touch_sx = sx;
+        g_state->cfg.touch_sy = sy;
+        g_state->cfg.touch_pressure_sens = s_calib_press_sens;
+        xSemaphoreGive(g_state->mutex);
+    }
+    config_save_touch_calib(ox, oy, sx, sy, s_calib_press_sens);
+    audio_click_play();
+    if (calib_status_lbl && (s_calib_hit_mask & 0x0F) == 0x0F) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Applied  scale %.3f,%.3f  sens %d%%", sx, sy, s_calib_press_sens);
+        lv_label_set_text(calib_status_lbl, msg);
+    }
+}
+
+static void calib_reset_clicked(lv_event_t *e) {
+    LV_UNUSED(e);
+    s_calib_hit_mask = 0;
+    memset(s_calib_raw_x, 0, sizeof(s_calib_raw_x));
+    memset(s_calib_raw_y, 0, sizeof(s_calib_raw_y));
+    s_calib_press_sens = 100;
+    if (calib_press_slider) {
+        lv_slider_set_value(calib_press_slider, s_calib_press_sens, LV_ANIM_OFF);
+    }
+    if (calib_press_pct_lbl) {
+        lv_label_set_text(calib_press_pct_lbl, "Pressure sensitivity  100%  (min 60)");
+    }
+    apply_touch_calib_runtime(0.0f, 0.0f, 1.0f, 1.0f, s_calib_press_sens);
+    if (g_state) {
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        g_state->cfg.touch_ox = 0.0f;
+        g_state->cfg.touch_oy = 0.0f;
+        g_state->cfg.touch_sx = 1.0f;
+        g_state->cfg.touch_sy = 1.0f;
+        g_state->cfg.touch_pressure_sens = s_calib_press_sens;
+        xSemaphoreGive(g_state->mutex);
+    }
+    config_save_touch_calib(0.0f, 0.0f, 1.0f, 1.0f, s_calib_press_sens);
+    calib_style_targets();
+    audio_click_play();
+    if (calib_status_lbl) {
+        lv_label_set_text(calib_status_lbl, "Reset to identity map + default pressure");
+    }
+}
+
+static void hide_calib_panel(lv_event_t *e) {
+    LV_UNUSED(e);
+    if (calib_timer) {
+        lv_timer_pause(calib_timer);
+    }
+    if (calib_panel) {
+        lv_obj_add_flag(calib_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(calib_panel, LV_OBJ_FLAG_CLICKABLE);
+    }
+    // Restore identity map whenever leaving calibrate.
+    apply_touch_calib_runtime(0.0f, 0.0f, 1.0f, 1.0f, s_calib_press_sens);
+    // Restore Startup Settings underneath.
+    if (loc_panel) {
+        lv_obj_clear_flag(loc_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(loc_panel);
+    }
+}
+
+static void open_calib_panel(lv_event_t *e) {
+    LV_UNUSED(e);
+    if (loc_kb) {
+        lv_obj_add_flag(loc_kb, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (loc_panel) {
+        lv_obj_add_flag(loc_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+    s_calib_hit_mask = 0;
+    memset(s_calib_raw_x, 0, sizeof(s_calib_raw_x));
+    memset(s_calib_raw_y, 0, sizeof(s_calib_raw_y));
+    if (g_state) {
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        s_calib_press_sens = g_state->cfg.touch_pressure_sens;
+        xSemaphoreGive(g_state->mutex);
+    }
+    s_calib_press_sens = clamp_touch_sens_ui(s_calib_press_sens);
+    if (calib_press_slider) {
+        lv_slider_set_value(calib_press_slider, s_calib_press_sens, LV_ANIM_OFF);
+    }
+    if (calib_press_pct_lbl) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Pressure sensitivity  %d%%  (min %d)", s_calib_press_sens,
+                 kTouchSensMin);
+        lv_label_set_text(calib_press_pct_lbl, buf);
+    }
+    // Identity while mapping so targets line up with raw taps.
+    lvgl_port_set_touch_map(0.0f, 0.0f, 1.0f, 1.0f);
+    lvgl_port_set_touch_pressure_min(touch_sens_to_min(s_calib_press_sens));
+    calib_style_targets();
+    if (calib_status_lbl) {
+        lv_label_set_text(calib_status_lbl, "Tap the 4 corner crosshairs, then Apply");
+    }
+    if (calib_panel) {
+        lv_obj_add_flag(calib_panel, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(calib_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(calib_panel);
+    }
+    if (calib_timer) {
+        lv_timer_resume(calib_timer);
+    }
+    calib_update_raw_lbl();
+}
+
+static void build_calibrate() {
+    calib_panel = lv_obj_create(scr_radar);
+    lv_obj_set_size(calib_panel, H_size, V_size);
+    lv_obj_set_pos(calib_panel, 0, 0);
+    lv_obj_set_style_bg_color(calib_panel, lv_color_hex(0x0A100C), 0);
+    lv_obj_set_style_border_width(calib_panel, 0, 0);
+    lv_obj_set_style_radius(calib_panel, 0, 0);
+    lv_obj_set_style_pad_all(calib_panel, 0, 0);
+    lv_obj_clear_flag(calib_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(calib_panel, LV_OBJ_FLAG_HIDDEN);
+    // Stay non-clickable while hidden so it cannot eat radar touches if unhidden wrongly.
+    lv_obj_clear_flag(calib_panel, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *title = lv_label_create(calib_panel);
+    lv_label_set_text(title, "Calibrate Screen");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COL_GREEN, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+    calib_hint_lbl = lv_label_create(calib_panel);
+    lv_label_set_text(calib_hint_lbl,
+                      "Location mapping: tap each corner crosshair. Center is optional check.");
+    lv_obj_set_style_text_color(calib_hint_lbl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(calib_hint_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(calib_hint_lbl, LV_ALIGN_TOP_MID, 0, 40);
+
+    calib_raw_lbl = lv_label_create(calib_panel);
+    lv_label_set_text(calib_raw_lbl, "Raw  X=--  Y=--  Pressure=--");
+    lv_obj_set_style_text_color(calib_raw_lbl, COL_GREEN, 0);
+    lv_obj_set_style_text_font(calib_raw_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(calib_raw_lbl, LV_ALIGN_TOP_MID, 0, 62);
+
+    calib_press_pct_lbl = lv_label_create(calib_panel);
+    lv_label_set_text(calib_press_pct_lbl, "Pressure sensitivity  100%  (min 60)");
+    lv_obj_set_style_text_color(calib_press_pct_lbl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(calib_press_pct_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(calib_press_pct_lbl, LV_ALIGN_BOTTOM_MID, 0, -86);
+
+    calib_press_slider = lv_slider_create(calib_panel);
+    lv_obj_set_width(calib_press_slider, 420);
+    lv_slider_set_range(calib_press_slider, kTouchSensMin, kTouchSensMax);
+    lv_slider_set_value(calib_press_slider, 100, LV_ANIM_OFF);
+    lv_obj_align(calib_press_slider, LV_ALIGN_BOTTOM_MID, 0, -58);
+    lv_obj_add_event_cb(calib_press_slider, calib_press_changed, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    calib_status_lbl = lv_label_create(calib_panel);
+    lv_label_set_text(calib_status_lbl, "");
+    lv_obj_set_style_text_color(calib_status_lbl, COL_DIM, 0);
+    lv_obj_set_style_text_font(calib_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(calib_status_lbl, LV_ALIGN_BOTTOM_MID, 0, -120);
+
+    lv_obj_t *btn_reset = make_btn(calib_panel, "Reset", calib_reset_clicked, nullptr);
+    lv_obj_set_size(btn_reset, 120, 40);
+    lv_obj_align(btn_reset, LV_ALIGN_BOTTOM_LEFT, 24, -16);
+
+    lv_obj_t *btn_apply = make_btn(calib_panel, "Apply", calib_apply_clicked, nullptr);
+    lv_obj_set_size(btn_apply, 120, 40);
+    lv_obj_align(btn_apply, LV_ALIGN_BOTTOM_MID, 0, -16);
+
+    lv_obj_t *btn_close = make_btn(calib_panel, "Close", hide_calib_panel, nullptr);
+    lv_obj_set_size(btn_close, 120, 40);
+    lv_obj_align(btn_close, LV_ALIGN_BOTTOM_RIGHT, -24, -16);
+
+    // Corner + center crosshair targets (location mapping).
+    constexpr lv_coord_t kM = 48;
+    constexpr lv_coord_t kT = 44;
+    const lv_coord_t positions[5][2] = {
+        {kM, kM},
+        {(lv_coord_t)(H_size - kM - kT), kM},
+        {kM, (lv_coord_t)(V_size - kM - kT - 140)},
+        {(lv_coord_t)(H_size - kM - kT), (lv_coord_t)(V_size - kM - kT - 140)},
+        {(lv_coord_t)((H_size - kT) / 2), (lv_coord_t)((V_size - kT) / 2 - 40)},
+    };
+    const char *labels[5] = {"1", "2", "3", "4", "·"};
+    for (int i = 0; i < 5; i++) {
+        calib_targets[i] = lv_btn_create(calib_panel);
+        lv_obj_set_size(calib_targets[i], kT, kT);
+        lv_obj_set_pos(calib_targets[i], positions[i][0], positions[i][1]);
+        lv_obj_set_style_radius(calib_targets[i], 4, 0);
+        lv_obj_set_style_bg_color(calib_targets[i], lv_color_hex(0x1A2A1A), 0);
+        lv_obj_set_style_border_width(calib_targets[i], 2, 0);
+        lv_obj_set_style_border_color(calib_targets[i], COL_DIM, 0);
+        lv_obj_t *lab = lv_label_create(calib_targets[i]);
+        lv_label_set_text(lab, labels[i]);
+        lv_obj_set_style_text_color(lab, COL_GREEN, 0);
+        lv_obj_center(lab);
+        // PRESSED samples raw coords while the finger is still down.
+        lv_obj_add_event_cb(calib_targets[i], calib_target_clicked, LV_EVENT_PRESSED,
+                            (void *)(intptr_t)i);
+    }
+
+    calib_timer = lv_timer_create(calib_timer_cb, 100, nullptr);
+    lv_timer_pause(calib_timer);
+}
+
 static void build_location() {
     loc_panel = lv_obj_create(scr_radar);
-    lv_obj_set_size(loc_panel, 720, 340);
+    lv_obj_set_size(loc_panel, 720, 380);
     lv_obj_center(loc_panel);
     lv_obj_set_style_bg_color(loc_panel, lv_color_hex(0x101810), 0);
     lv_obj_set_style_border_color(loc_panel, COL_GREEN, 0);
@@ -6066,6 +6548,10 @@ static void build_location() {
     style_startup_checkbox(loc_city_cb);
     lv_obj_align(loc_city_cb, LV_ALIGN_TOP_LEFT, 480, 236);
     lv_obj_add_event_cb(loc_city_cb, startup_dd_changed, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    lv_obj_t *calib_btn = make_btn(loc_panel, "Calibrate Screen", open_calib_panel, nullptr);
+    lv_obj_set_size(calib_btn, 200, 40);
+    lv_obj_align(calib_btn, LV_ALIGN_TOP_LEFT, 480, 272);
 
     // Screen-level keyboard (same pattern as Wi-Fi) so it is not clipped by the panel.
     loc_kb = lv_keyboard_create(scr_radar);
@@ -6206,6 +6692,44 @@ static void track_start_query(const char *q, bool show_kb) {
     if (show_kb) {
         show_track_keyboard();
     }
+
+    // Same as airport board: open radar follow immediately, then enrich in background.
+    // (Board already called start_follow — skip if we're already on this flight.)
+    char icao_cs[16] = {0}, iata_al[4] = {0}, iata_num[8] = {0};
+    const bool parsed = net_parse_flight_number(g_state->pending_query, icao_cs, sizeof(icao_cs), iata_al,
+                                                sizeof(iata_al), iata_num, sizeof(iata_num));
+    const char *label = icao_cs[0] ? icao_cs : g_state->pending_query;
+    const bool already =
+        s_follow && label[0] && s_follow_label[0] && follow_flight_matches(s_follow_label, label);
+    if (parsed && !already) {
+        Aircraft ac{};
+        FlightInfo fi{};
+        strncpy(ac.flight, label, sizeof(ac.flight) - 1);
+        ac.valid = true;
+        ac.on_ground = false;
+        ac.alt_ft = 5000.0f;
+        // Pin to current PPI center until ADS-B / schedule resolve a real position.
+        ac.lat = s_olat;
+        ac.lon = s_olon;
+        strncpy(fi.flight, label, sizeof(fi.flight) - 1);
+        track_history_push(label);
+        hide_track(nullptr);
+        hide_airport_board(nullptr);
+        hide_route_search(nullptr);
+        s_detail_ac = ac;
+        s_detail_is_aircraft = true;
+        s_flight_info = fi;
+        xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+        g_state->tracked_ac = ac;
+        g_state->tracked_ok = true;
+        g_state->flight_info = fi;
+        g_state->flight_track_n = 0;
+        xSemaphoreGive(g_state->mutex);
+        start_follow_aircraft(&ac, false, false);  // enrich via TRACK_FLIGHT + FA; no dual FETCH
+        merge_follow_fi(fi);
+        refresh_follow_panel();
+    }
+
     request(UI_REQ_TRACK_FLIGHT);
 }
 
@@ -8597,8 +9121,9 @@ static void refresh_follow_sched_col() {
     format_follow_remaining(rem, sizeof(rem));
     const char *st_name = follow_state_display_name();
     // DEP/ARR lines use LVGL recolor (bright green) so they read as bold/emphasis.
-    // Flight time lives in the left info box.
-    char body[520];
+    // Flight time lives in the left info box. Always show Sch + Act + Est for both ends
+    // (DEP used to omit Est, so pre-departure estimates never appeared).
+    char body[560];
     if (fi->flight_date[0]) {
         snprintf(body, sizeof(body),
                  "%s\n"
@@ -8606,31 +9131,37 @@ static void refresh_follow_sched_col() {
                  "%s\n"
                  "Sch %s\n"
                  "Act %s\n"
+                 "Est %s\n"
                  "State: %s\n"
                  "\n"
                  "#27E36A ARR %s#\n"
                  "%s\n"
                  "Sch %s\n"
+                 "Act %s\n"
                  "Est %s\n"
                  "Rem %s",
                  fi->flight_date, dep_icao, dep_tg, fi->dep_time[0] ? fi->dep_time : "--",
-                 fi->dep_act[0] ? fi->dep_act : "--", st_name, arr_icao, arr_tg,
-                 fi->arr_time[0] ? fi->arr_time : "--", fi->arr_est[0] ? fi->arr_est : "--", rem);
+                 fi->dep_act[0] ? fi->dep_act : "--", fi->dep_est[0] ? fi->dep_est : "--", st_name, arr_icao,
+                 arr_tg, fi->arr_time[0] ? fi->arr_time : "--", fi->arr_act[0] ? fi->arr_act : "--",
+                 fi->arr_est[0] ? fi->arr_est : "--", rem);
     } else {
         snprintf(body, sizeof(body),
                  "#27E36A DEP %s#\n"
                  "%s\n"
                  "Sch %s\n"
                  "Act %s\n"
+                 "Est %s\n"
                  "State: %s\n"
                  "\n"
                  "#27E36A ARR %s#\n"
                  "%s\n"
                  "Sch %s\n"
+                 "Act %s\n"
                  "Est %s\n"
                  "Rem %s",
-                 dep_icao, dep_tg, fi->dep_time[0] ? fi->dep_time : "--", fi->dep_act[0] ? fi->dep_act : "--",
-                 st_name, arr_icao, arr_tg, fi->arr_time[0] ? fi->arr_time : "--",
+                 dep_icao, dep_tg, fi->dep_time[0] ? fi->dep_time : "--",
+                 fi->dep_act[0] ? fi->dep_act : "--", fi->dep_est[0] ? fi->dep_est : "--", st_name, arr_icao,
+                 arr_tg, fi->arr_time[0] ? fi->arr_time : "--", fi->arr_act[0] ? fi->arr_act : "--",
                  fi->arr_est[0] ? fi->arr_est : "--", rem);
     }
     lv_label_set_recolor(follow_sched_lbl, true);
@@ -8655,11 +9186,18 @@ static void format_follow_airport(char *out, size_t n, const char *icao, const c
 }
 
 // Merge incoming flight-info without wiping airports / schedule already on screen.
+// Non-empty incoming fields win; blanks leave whatever was already showing.
 static void merge_follow_fi(const FlightInfo &fi) {
     FlightInfo keep = s_follow_fi;
     s_follow_fi = fi;
+    auto keep_str = [](char *dst, size_t n, const char *neu, const char *oldv) {
+        if ((!neu || !neu[0]) && oldv && oldv[0]) {
+            strncpy(dst, oldv, n - 1);
+            dst[n - 1] = 0;
+        }
+    };
     // Board/ADS-B often seeds the airborne leg (departed + OD). A later FlightStats
-    // hit can be tomorrow's scheduled turn (!departed, reversed OD) — do not clobber.
+    // hit can be tomorrow's scheduled turn (!departed, reversed OD) — do not clobber OD.
     const bool keep_active = keep.departed && keep.origin[0] && keep.dest[0];
     const bool incoming_future = !fi.departed && fi.schedule_ok;
     if (keep_active && incoming_future) {
@@ -8667,27 +9205,27 @@ static void merge_follow_fi(const FlightInfo &fi) {
         strncpy(s_follow_fi.origin_name, keep.origin_name, sizeof(s_follow_fi.origin_name) - 1);
         strncpy(s_follow_fi.dest, keep.dest, sizeof(s_follow_fi.dest) - 1);
         strncpy(s_follow_fi.dest_name, keep.dest_name, sizeof(s_follow_fi.dest_name) - 1);
-        strncpy(s_follow_fi.dep_gate, keep.dep_gate, sizeof(s_follow_fi.dep_gate) - 1);
-        strncpy(s_follow_fi.dep_terminal, keep.dep_terminal, sizeof(s_follow_fi.dep_terminal) - 1);
-        strncpy(s_follow_fi.arr_gate, keep.arr_gate, sizeof(s_follow_fi.arr_gate) - 1);
-        strncpy(s_follow_fi.arr_terminal, keep.arr_terminal, sizeof(s_follow_fi.arr_terminal) - 1);
-        if (keep.dep_time[0]) {
-            strncpy(s_follow_fi.dep_time, keep.dep_time, sizeof(s_follow_fi.dep_time) - 1);
-        }
-        if (keep.dep_act[0]) {
-            strncpy(s_follow_fi.dep_act, keep.dep_act, sizeof(s_follow_fi.dep_act) - 1);
-        }
-        if (keep.arr_time[0]) {
-            strncpy(s_follow_fi.arr_time, keep.arr_time, sizeof(s_follow_fi.arr_time) - 1);
-        }
-        if (keep.arr_est[0]) {
-            strncpy(s_follow_fi.arr_est, keep.arr_est, sizeof(s_follow_fi.arr_est) - 1);
-        }
-        if (keep.dep_act_epoch) {
+        keep_str(s_follow_fi.dep_gate, sizeof(s_follow_fi.dep_gate), fi.dep_gate, keep.dep_gate);
+        keep_str(s_follow_fi.dep_terminal, sizeof(s_follow_fi.dep_terminal), fi.dep_terminal,
+                 keep.dep_terminal);
+        keep_str(s_follow_fi.arr_gate, sizeof(s_follow_fi.arr_gate), fi.arr_gate, keep.arr_gate);
+        keep_str(s_follow_fi.arr_terminal, sizeof(s_follow_fi.arr_terminal), fi.arr_terminal,
+                 keep.arr_terminal);
+        // Prefer fresh Sch/Act/Est when FS returns them; otherwise leave prior times.
+        keep_str(s_follow_fi.dep_time, sizeof(s_follow_fi.dep_time), fi.dep_time, keep.dep_time);
+        keep_str(s_follow_fi.dep_act, sizeof(s_follow_fi.dep_act), fi.dep_act, keep.dep_act);
+        keep_str(s_follow_fi.dep_est, sizeof(s_follow_fi.dep_est), fi.dep_est, keep.dep_est);
+        keep_str(s_follow_fi.arr_time, sizeof(s_follow_fi.arr_time), fi.arr_time, keep.arr_time);
+        keep_str(s_follow_fi.arr_act, sizeof(s_follow_fi.arr_act), fi.arr_act, keep.arr_act);
+        keep_str(s_follow_fi.arr_est, sizeof(s_follow_fi.arr_est), fi.arr_est, keep.arr_est);
+        if (!fi.dep_act_epoch && keep.dep_act_epoch) {
             s_follow_fi.dep_act_epoch = keep.dep_act_epoch;
         }
-        if (keep.arr_est_epoch) {
+        if (!fi.arr_est_epoch && keep.arr_est_epoch) {
             s_follow_fi.arr_est_epoch = keep.arr_est_epoch;
+        }
+        if (!fi.arr_act_epoch && keep.arr_act_epoch) {
+            s_follow_fi.arr_act_epoch = keep.arr_act_epoch;
         }
         s_follow_fi.departed = true;
         if (keep.status[0] && (!fi.status[0] || strcasecmp(fi.status, "Scheduled") == 0)) {
@@ -8697,47 +9235,24 @@ static void merge_follow_fi(const FlightInfo &fi) {
     if (!s_follow_fi.origin[0] && keep.origin[0]) {
         strncpy(s_follow_fi.origin, keep.origin, sizeof(s_follow_fi.origin) - 1);
         strncpy(s_follow_fi.origin_name, keep.origin_name, sizeof(s_follow_fi.origin_name) - 1);
-        if (!s_follow_fi.dep_gate[0]) {
-            strncpy(s_follow_fi.dep_gate, keep.dep_gate, sizeof(s_follow_fi.dep_gate) - 1);
-        }
-        if (!s_follow_fi.dep_terminal[0]) {
-            strncpy(s_follow_fi.dep_terminal, keep.dep_terminal, sizeof(s_follow_fi.dep_terminal) - 1);
-        }
-        if (!s_follow_fi.dep_time[0]) {
-            strncpy(s_follow_fi.dep_time, keep.dep_time, sizeof(s_follow_fi.dep_time) - 1);
-        }
-        if (!s_follow_fi.dep_act[0]) {
-            strncpy(s_follow_fi.dep_act, keep.dep_act, sizeof(s_follow_fi.dep_act) - 1);
-        }
-        if (!s_follow_fi.dep_est[0]) {
-            strncpy(s_follow_fi.dep_est, keep.dep_est, sizeof(s_follow_fi.dep_est) - 1);
-        }
-        if (!s_follow_fi.dep_act_epoch && keep.dep_act_epoch) {
-            s_follow_fi.dep_act_epoch = keep.dep_act_epoch;
-        }
     }
     if (!s_follow_fi.dest[0] && keep.dest[0]) {
         strncpy(s_follow_fi.dest, keep.dest, sizeof(s_follow_fi.dest) - 1);
         strncpy(s_follow_fi.dest_name, keep.dest_name, sizeof(s_follow_fi.dest_name) - 1);
-        if (!s_follow_fi.arr_gate[0]) {
-            strncpy(s_follow_fi.arr_gate, keep.arr_gate, sizeof(s_follow_fi.arr_gate) - 1);
-        }
-        if (!s_follow_fi.arr_terminal[0]) {
-            strncpy(s_follow_fi.arr_terminal, keep.arr_terminal, sizeof(s_follow_fi.arr_terminal) - 1);
-        }
-        if (!s_follow_fi.arr_time[0]) {
-            strncpy(s_follow_fi.arr_time, keep.arr_time, sizeof(s_follow_fi.arr_time) - 1);
-        }
-        if (!s_follow_fi.arr_act[0]) {
-            strncpy(s_follow_fi.arr_act, keep.arr_act, sizeof(s_follow_fi.arr_act) - 1);
-        }
-        if (!s_follow_fi.arr_est[0]) {
-            strncpy(s_follow_fi.arr_est, keep.arr_est, sizeof(s_follow_fi.arr_est) - 1);
-        }
-        if (!s_follow_fi.arr_act_epoch && keep.arr_act_epoch) {
-            s_follow_fi.arr_act_epoch = keep.arr_act_epoch;
-        }
     }
+    // Always retain prior schedule/gate strings when the refresh left them blank.
+    keep_str(s_follow_fi.dep_gate, sizeof(s_follow_fi.dep_gate), s_follow_fi.dep_gate, keep.dep_gate);
+    keep_str(s_follow_fi.dep_terminal, sizeof(s_follow_fi.dep_terminal), s_follow_fi.dep_terminal,
+             keep.dep_terminal);
+    keep_str(s_follow_fi.arr_gate, sizeof(s_follow_fi.arr_gate), s_follow_fi.arr_gate, keep.arr_gate);
+    keep_str(s_follow_fi.arr_terminal, sizeof(s_follow_fi.arr_terminal), s_follow_fi.arr_terminal,
+             keep.arr_terminal);
+    keep_str(s_follow_fi.dep_time, sizeof(s_follow_fi.dep_time), s_follow_fi.dep_time, keep.dep_time);
+    keep_str(s_follow_fi.dep_act, sizeof(s_follow_fi.dep_act), s_follow_fi.dep_act, keep.dep_act);
+    keep_str(s_follow_fi.dep_est, sizeof(s_follow_fi.dep_est), s_follow_fi.dep_est, keep.dep_est);
+    keep_str(s_follow_fi.arr_time, sizeof(s_follow_fi.arr_time), s_follow_fi.arr_time, keep.arr_time);
+    keep_str(s_follow_fi.arr_act, sizeof(s_follow_fi.arr_act), s_follow_fi.arr_act, keep.arr_act);
+    keep_str(s_follow_fi.arr_est, sizeof(s_follow_fi.arr_est), s_follow_fi.arr_est, keep.arr_est);
     if (!s_follow_fi.dep_act_epoch && keep.dep_act_epoch) {
         s_follow_fi.dep_act_epoch = keep.dep_act_epoch;
     }
@@ -9336,7 +9851,7 @@ static void build_radar() {
     lv_obj_set_size(scounty, 320, 44);
     lv_obj_align(scounty, LV_ALIGN_TOP_MID, 0, 208);
 
-    lv_obj_t *splates = make_btn(settings_panel, "Airport Plates", goto_plates, nullptr);
+    lv_obj_t *splates = make_btn(settings_panel, "Airport Information", goto_plates, nullptr);
     lv_obj_set_size(splates, 320, 44);
     lv_obj_align(splates, LV_ALIGN_TOP_MID, 0, 260);
 
@@ -9353,7 +9868,7 @@ static void build_radar() {
     lv_obj_add_flag(plates_panel, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *ptitle = lv_label_create(plates_panel);
-    lv_label_set_text(ptitle, "Airport Plates");
+    lv_label_set_text(ptitle, "Airport Information");
     lv_obj_set_style_text_font(ptitle, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(ptitle, COL_GREEN, 0);
     lv_obj_align(ptitle, LV_ALIGN_TOP_LEFT, 8, 4);
@@ -9379,12 +9894,13 @@ static void build_radar() {
     constexpr lv_coord_t kPlatesUpdX = kPlatesPrevX + kPlatesPrevW + 10; // 648
     constexpr lv_coord_t kPlatesUpdW = 270;
     constexpr lv_coord_t kPlatesUpdH = 40;
-    constexpr lv_coord_t kPlatesRemY = kPlatesPrevY;
+    constexpr lv_coord_t kPlatesUpdateY = kPlatesPrevY;
+    constexpr lv_coord_t kPlatesRemY = kPlatesUpdateY + kPlatesUpdH + 8;
     constexpr lv_coord_t kPlatesAddH = 36;
     constexpr lv_coord_t kPlatesAddTaY = kPlatesRemY + kPlatesUpdH + 8;
     constexpr lv_coord_t kPlatesAddBtnY = kPlatesAddTaY + kPlatesAddH + 8;
     constexpr lv_coord_t kPlatesAddHitsY = kPlatesAddBtnY + kPlatesAddH + 8;
-    constexpr lv_coord_t kPlatesAddHitsH = 100;
+    constexpr lv_coord_t kPlatesAddHitsH = 80;
     constexpr lv_coord_t kPlatesStatusY = kPlatesAddHitsY + kPlatesAddHitsH + 8;
 
     // Filter search above the left plates list.
@@ -9460,6 +9976,10 @@ static void build_radar() {
     lv_obj_set_width(plates_city_lbl, kPlatesPrevW);
     lv_label_set_long_mode(plates_city_lbl, LV_LABEL_LONG_CLIP);
     lv_obj_align(plates_city_lbl, LV_ALIGN_TOP_LEFT, kPlatesPrevX, kPlatesCityY);
+
+    lv_obj_t *pupd = make_btn(plates_panel, "Update Plates", plates_update_clicked, nullptr);
+    lv_obj_set_size(pupd, kPlatesUpdW, kPlatesUpdH);
+    lv_obj_align(pupd, LV_ALIGN_TOP_LEFT, kPlatesUpdX, kPlatesUpdateY);
 
     lv_obj_t *prem = make_btn(plates_panel, "Remove Plate", plates_remove_clicked, nullptr);
     lv_obj_set_size(prem, kPlatesUpdW, kPlatesUpdH);
@@ -9606,7 +10126,7 @@ static void build_radar() {
     lv_obj_align(blbl, LV_ALIGN_TOP_LEFT, 16, 56);
 
     bright_pct_lbl = lv_label_create(sound_panel);
-    lv_label_set_text(bright_pct_lbl, "100%");
+    lv_label_set_text(bright_pct_lbl, "50%");
     lv_obj_set_style_text_color(bright_pct_lbl, COL_GREEN, 0);
     lv_obj_set_style_text_font(bright_pct_lbl, &lv_font_montserrat_14, 0);
     lv_obj_align(bright_pct_lbl, LV_ALIGN_TOP_RIGHT, -16, 56);
@@ -9614,7 +10134,7 @@ static void build_radar() {
     bright_slider = lv_slider_create(sound_panel);
     lv_obj_set_width(bright_slider, 360);
     lv_slider_set_range(bright_slider, 0, 100);
-    lv_slider_set_value(bright_slider, 100, LV_ANIM_OFF);
+    lv_slider_set_value(bright_slider, 50, LV_ANIM_OFF);
     lv_obj_align(bright_slider, LV_ALIGN_TOP_MID, 0, 88);
     lv_obj_set_style_bg_color(bright_slider, lv_color_hex(0x2A3A2A), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bright_slider, COL_GREEN, LV_PART_INDICATOR);
@@ -9629,7 +10149,7 @@ static void build_radar() {
     lv_obj_align(vlbl, LV_ALIGN_TOP_LEFT, 16, 150);
 
     vol_pct_lbl = lv_label_create(sound_panel);
-    lv_label_set_text(vol_pct_lbl, "60%");
+    lv_label_set_text(vol_pct_lbl, "50%");
     lv_obj_set_style_text_color(vol_pct_lbl, COL_GREEN, 0);
     lv_obj_set_style_text_font(vol_pct_lbl, &lv_font_montserrat_14, 0);
     lv_obj_align(vol_pct_lbl, LV_ALIGN_TOP_RIGHT, -16, 150);
@@ -9637,7 +10157,7 @@ static void build_radar() {
     vol_slider = lv_slider_create(sound_panel);
     lv_obj_set_width(vol_slider, 360);
     lv_slider_set_range(vol_slider, 0, 100);
-    lv_slider_set_value(vol_slider, 60, LV_ANIM_OFF);
+    lv_slider_set_value(vol_slider, 50, LV_ANIM_OFF);
     lv_obj_align(vol_slider, LV_ALIGN_TOP_MID, 0, 182);
     lv_obj_set_style_bg_color(vol_slider, lv_color_hex(0x2A3A2A), LV_PART_MAIN);
     lv_obj_set_style_bg_color(vol_slider, COL_GREEN, LV_PART_INDICATOR);
@@ -9785,6 +10305,7 @@ static void build_radar() {
     lv_obj_align(detail_body, LV_ALIGN_TOP_LEFT, 8, 40);
 
     build_location();
+    build_calibrate();
     build_track_flight();
     build_airport_board();
     build_route_search();
@@ -9868,6 +10389,14 @@ void ui_init(SharedState *state) {
     if (g_state) {
         s_max_alt = g_state->cfg.max_alt_ft;
         s_range = g_state->cfg.range_nm;
+        // Force identity touch map on boot — never apply a saved remap that can
+        // send all taps off-screen (looks like a dead/locked panel).
+        g_state->cfg.touch_ox = 0.0f;
+        g_state->cfg.touch_oy = 0.0f;
+        g_state->cfg.touch_sx = 1.0f;
+        g_state->cfg.touch_sy = 1.0f;
+        g_state->cfg.touch_pressure_sens = clamp_touch_sens_ui(g_state->cfg.touch_pressure_sens);
+        apply_touch_calib_runtime(0.0f, 0.0f, 1.0f, 1.0f, g_state->cfg.touch_pressure_sens);
     }
     lv_disp_t *disp = lv_disp_get_default();
     lv_theme_t *th = lv_theme_default_init(disp, COL_GREEN, COL_DIM, true, &lv_font_montserrat_14);
@@ -10439,9 +10968,15 @@ void ui_notify_flight_info() {
         }
         return a_icao[0] && b_icao[0] && strcasecmp(a_icao, b_icao) == 0;
     };
-    if (s_follow && ((fi.hex[0] && strcasecmp(fi.hex, s_follow_hex) == 0) ||
-                     (fi.flight[0] && flight_matches(fi.flight, s_follow_label)) ||
-                     (fi.flight[0] && s_follow_ac_ok && flight_matches(fi.flight, s_follow_ac.flight)))) {
+    // Apply when hex/callsign matches, or when Update Schedule refreshed OD/times for
+    // the active follow (fi.flight may be ICAO while label is IATA, or vice versa).
+    const bool same_follow =
+        s_follow && ((fi.hex[0] && s_follow_hex[0] && strcasecmp(fi.hex, s_follow_hex) == 0) ||
+                     (fi.flight[0] && s_follow_label[0] && flight_matches(fi.flight, s_follow_label)) ||
+                     (fi.flight[0] && s_follow_ac_ok && flight_matches(fi.flight, s_follow_ac.flight)) ||
+                     ((fi.schedule_ok || fi.origin[0] || fi.dest[0]) && s_follow_label[0] &&
+                      (!fi.flight[0] || flight_matches(fi.flight, s_follow_label))));
+    if (same_follow) {
         merge_follow_fi(fi);
         if (fi.reg[0] && s_follow_ac_ok && !s_follow_ac.reg[0]) {
             strncpy(s_follow_ac.reg, fi.reg, sizeof(s_follow_ac.reg) - 1);
@@ -10594,6 +11129,88 @@ void ui_notify_airport_board(bool ok, const char *msg) {
     if (board_panel) {
         lv_obj_clear_flag(board_panel, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(board_panel);
+    }
+    lvgl_port_unlock();
+}
+
+void ui_notify_plate_bitmap(void) {
+    lvgl_port_lock(-1);
+    map_plates_mark_dirty();
+    if (plates_preview) {
+        lv_obj_invalidate(plates_preview);
+    }
+    if (detail_plate) {
+        lv_obj_invalidate(detail_plate);
+    }
+    if (radar_plot) {
+        lv_obj_invalidate(radar_plot);
+    }
+    lvgl_port_unlock();
+}
+
+void ui_notify_plate_radios(bool ok) {
+    if (!g_state) {
+        return;
+    }
+    char icao[8] = {0};
+    AirportRadios radios{};
+    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+    strncpy(icao, g_state->pending_plate_radios_icao, sizeof(icao) - 1);
+    if (ok) {
+        radios = g_state->plate_radios;
+    }
+    xSemaphoreGive(g_state->mutex);
+
+    lvgl_port_lock(-1);
+    if (icao[0] && strcasecmp(icao, s_plates_prev_icao) == 0) {
+        if (ok) {
+            s_plates_radios = radios;
+        }
+        plates_fill_info_table();
+    }
+    lvgl_port_unlock();
+}
+
+void ui_notify_plates_updated(bool ok, const char *msg) {
+    char pack[48][8];
+    int pack_n = 0;
+    xSemaphoreTake(g_state->mutex, portMAX_DELAY);
+    pack_n = g_state->plate_pack_n;
+    if (pack_n > 48) {
+        pack_n = 48;
+    }
+    if (pack_n > 0) {
+        memcpy(pack, g_state->plate_pack_icao, sizeof(char[8]) * (size_t)pack_n);
+    }
+    xSemaphoreGive(g_state->mutex);
+
+    lvgl_port_lock(-1);
+    if (ok && pack_n > 0) {
+        for (int i = 0; i < pack_n; i++) {
+            if (!pack[i][0] || plate_known(pack[i])) {
+                continue;
+            }
+            // New pack entry → add to user list so it shows in Plates + radar.
+            if (s_plate_extra_n < FR_PLATE_EXTRA_MAX) {
+                strncpy(s_plate_extra[s_plate_extra_n], pack[i], FR_PLATE_EXTRA_ID_LEN - 1);
+                s_plate_extra[s_plate_extra_n][FR_PLATE_EXTRA_ID_LEN - 1] = 0;
+                s_plate_extra_city[s_plate_extra_n][0] = 0;
+                s_plate_extra_n++;
+            }
+        }
+        config_save_plate_extras(s_plate_extra, s_plate_extra_city, s_plate_extra_n);
+        map_plates_mark_dirty();
+        plates_refresh_list();
+        plates_request_city_refresh();
+        if (s_plates_prev_icao[0]) {
+            plates_load_preview(s_plates_prev_icao);
+        }
+    }
+    if (plates_status) {
+        lv_label_set_text(plates_status, msg ? msg : (ok ? "Plates updated" : "Plate update failed"));
+    }
+    if (radar_plot) {
+        lv_obj_invalidate(radar_plot);
     }
     lvgl_port_unlock();
 }
@@ -10756,15 +11373,44 @@ void ui_notify_track_result(bool ok, const char *msg) {
     if (board_status && board_panel && !lv_obj_has_flag(board_panel, LV_OBJ_FLAG_HIDDEN)) {
         lv_label_set_text(board_status, msg ? msg : (ok ? "Tracking" : "Track failed"));
     }
-    // Already following from an airport-board tap — keep that; only upgrade position/info.
-    if ((!ok || !have_ac) && s_follow) {
+
+    // Already on radar (airport board OR Track page shell) — same upgrade path for both.
+    if (s_follow) {
+        if (ok && have_ac && ac.valid) {
+            s_follow_ac = ac;
+            s_follow_ac_ok = true;
+            if (ac.hex[0]) {
+                strncpy(s_follow_hex, ac.hex, sizeof(s_follow_hex) - 1);
+                s_follow_hex[sizeof(s_follow_hex) - 1] = 0;
+            }
+            if (ac.flight[0]) {
+                strncpy(s_follow_label, ac.flight, sizeof(s_follow_label) - 1);
+                s_follow_label[sizeof(s_follow_label) - 1] = 0;
+                trim_inplace(s_follow_label);
+            }
+            trail_push(ac.lat, ac.lon);
+            hist_push(ac.on_ground ? 0.0f : ac.alt_ft, ac.gs_kts);
+            follow_note_airborne_sample(&ac);
+            sync_follow_to_state();
+        }
         if (ok && fi.flight[0]) {
+            s_flight_info = fi;
             merge_follow_fi(fi);
-            refresh_follow_panel();
+            follow_try_seed_hist_from_state();
+        }
+        refresh_follow_panel();
+        if (ok) {
+            hide_track(nullptr);
+            hide_airport_board(nullptr);
+            hide_route_search(nullptr);
+        }
+        if (radar_plot) {
+            lv_obj_invalidate(radar_plot);
         }
         lvgl_port_unlock();
         return;
     }
+
     if (!ok || !have_ac) {
         lvgl_port_unlock();
         return;
@@ -10779,7 +11425,7 @@ void ui_notify_track_result(bool ok, const char *msg) {
     s_detail_ac = ac;
     s_detail_is_aircraft = true;
     s_flight_info = fi;
-    start_follow_aircraft(&ac, false, false);  // caller already fetched FS/FA via track
+    start_follow_aircraft(&ac, false, false);  // ADS-B/FS already loaded; FA may follow
     // start_follow may clear fi; restore tracked schedule (airports/gates/times).
     merge_follow_fi(fi);
     follow_try_seed_hist_from_state();
@@ -10837,25 +11483,8 @@ void ui_notify_weather() {
     } else if (!s_detail_city[0]) {
         plates_city_from_name(apt.name, s_detail_city, sizeof(s_detail_city));
     }
+    // Radios filled on the net task in handle_weather — never HTTPS under LVGL lock.
     s_detail_radios = wp->radios;
-    // Keep onboard values if AWC left slots empty.
-    AirportRadios local{};
-    if (net_lookup_airport_radios(wp->icao, &local)) {
-        if (!s_detail_radios.ctaf[0] && local.ctaf[0]) {
-            strncpy(s_detail_radios.ctaf, local.ctaf, sizeof(s_detail_radios.ctaf) - 1);
-        }
-        if (!s_detail_radios.atc[0] && local.atc[0]) {
-            strncpy(s_detail_radios.atc, local.atc, sizeof(s_detail_radios.atc) - 1);
-            s_detail_radios.atc_is_center = local.atc_is_center;
-        }
-        if (!s_detail_radios.gnd[0] && local.gnd[0]) {
-            strncpy(s_detail_radios.gnd, local.gnd, sizeof(s_detail_radios.gnd) - 1);
-        }
-        if (!s_detail_radios.atis[0] && local.atis[0]) {
-            strncpy(s_detail_radios.atis, local.atis, sizeof(s_detail_radios.atis) - 1);
-            s_detail_radios.atis_is_awos = local.atis_is_awos;
-        }
-    }
     char radios[96];
     format_radios_block(&s_detail_radios, radios, sizeof(radios));
 

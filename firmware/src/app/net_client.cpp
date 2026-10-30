@@ -255,6 +255,32 @@ void net_tls_reset() {
     tls_close();
 }
 
+static volatile bool s_net_abort = false;
+
+void net_abort_request() {
+    s_net_abort = true;
+}
+
+void net_abort_clear() {
+    s_net_abort = false;
+}
+
+bool net_abort_requested() {
+    return s_net_abort;
+}
+
+void net_stack_recover() {
+    // Abort sticky FA/TLS session + drop the oversized page buffer so the next
+    // ADS-B poll gets a clean handshake and contiguous DMA.
+    s_net_abort = true;  // trip any in-flight read still winding down
+    tls_close();
+    s_tls_last_was_fa = false;
+    http_buf_shrink_default();
+    delay(80);  // was 450 — Update ADS-B felt sluggish
+    yield();
+    s_net_abort = false;  // allow the next ADS-B / schedule fetch
+}
+
 static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_t connect_ms, uint32_t io_ms) {
     if (g_tls && g_tls->connected() && g_tls_port == port && strcmp(g_tls_host, host) == 0) {
         return g_tls;
@@ -401,6 +427,9 @@ static int http_read_exact(Client &client, char *dst, int n, uint32_t idle_ms, u
     int got = 0;
     const uint32_t full_to_s = (idle_ms + 999) / 1000;
     while (got < n) {
+        if (s_net_abort) {
+            break;
+        }
         const unsigned long now = millis();
         if ((long)(now - *idle_start) >= (long)idle_ms || (long)(now - abs_deadline) >= 0) {
             break;
@@ -459,6 +488,10 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
     // Headers are tiny but ESP-Hosted + first TLS write can be slow after join.
     const uint32_t hdr_ms = io_ms > 20000 ? 20000 : (io_ms < 12000 ? 12000 : io_ms);
     while (millis() - start < hdr_ms) {
+        if (s_net_abort) {
+            set_err("HTTP aborted");
+            return false;
+        }
         const int avail = client.available();
         int n = 0;
         if (avail > 0) {
@@ -593,6 +626,10 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
         };
 
         for (;;) {
+            if (s_net_abort) {
+                set_err("HTTP aborted");
+                return false;
+            }
             if ((long)(millis() - abs_deadline) >= 0) {
                 // Prefer a clean peer-close; only keep a partial if we already have usable HTML.
                 if (http_partial_usable(g_http_buf, len)) {
@@ -712,6 +749,10 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
         g_http_buf[len] = 0;
         // Absolute deadline — do not reset on each byte (that hung FA downloads).
         while ((long)(millis() - abs_deadline) < 0) {
+            if (s_net_abort) {
+                set_err("HTTP aborted");
+                return false;
+            }
             if (content_len >= 0 && (int)len >= content_len) {
                 len = (size_t)content_len;
                 g_http_buf[len] = 0;
@@ -776,6 +817,10 @@ static const char *http_body_buf(size_t *len_out) {
     return g_http_buf;
 }
 
+const uint8_t *net_http_body(size_t *len_out) {
+    return (const uint8_t *)http_body_buf(len_out);
+}
+
 /** Resolve absolute/relative Location into out_url using the current request URL pieces. */
 static bool resolve_redirect_url(bool cur_tls, const char *cur_host, uint16_t cur_port,
                                  const char *cur_path, const char *loc, char *out_url,
@@ -831,6 +876,12 @@ bool https_get(const char *url, String *body, const char *user_agent, uint32_t c
     g_http_early_ok = early_ok;
 
     for (int hop = 0; hop < 6; hop++) {
+        if (s_net_abort) {
+            set_err("HTTP aborted");
+            g_http_early_ok = nullptr;
+            tls_close();
+            return false;
+        }
         bool tls = false;
         uint16_t port = 80;
         char host[80];
@@ -2877,8 +2928,11 @@ static bool fs_pick_current_url(JsonObjectConst tracker, char *url_out, size_t u
     return true;
 }
 
-bool net_fetch_flight_schedule(const char *flight_num, FlightInfo *fi) {
+bool net_fetch_flight_schedule(const char *flight_num, FlightInfo *fi, bool allow_dated_refetch) {
     if (!fi || !flight_num || !flight_num[0]) {
+        return false;
+    }
+    if (s_net_abort) {
         return false;
     }
     char icao_cs[16] = {0}, iata_al[4] = {0}, iata_num[8] = {0};
@@ -2893,8 +2947,12 @@ bool net_fetch_flight_schedule(const char *flight_num, FlightInfo *fi) {
     status_msg("FlightStats lookup...");
     char url[192];
     snprintf(url, sizeof(url), "https://www.flightstats.com/v2/flight-tracker/%s/%s", iata_al, iata_num);
-    // force_close: don't leave a sticky session that stalls the next host (FA).
-    if (!https_get(url, nullptr, kUaBrowser, 8000, 20000, nullptr, true)) {
+    // HTML accept (not application/json) — FS embeds tracker JSON in the page.
+    // Short timeouts: Update ADS-B must not sit on "Updating schedule…" for 40s+.
+    constexpr uint32_t kFsConnectMs = 6000;
+    constexpr uint32_t kFsIoMs = 12000;
+    if (!https_get(url, nullptr, kUaBrowser, kFsConnectMs, kFsIoMs, "text/html,application/xhtml+xml,*/*",
+                   true)) {
         return false;
     }
     size_t blen = 0;
@@ -2915,10 +2973,12 @@ bool net_fetch_flight_schedule(const char *flight_num, FlightInfo *fi) {
     }
 
     char better[192] = {0};
-    if (fs_pick_current_url(doc.as<JsonObjectConst>(), better, sizeof(better))) {
+    if (allow_dated_refetch && !s_net_abort &&
+        fs_pick_current_url(doc.as<JsonObjectConst>(), better, sizeof(better))) {
         Serial.printf("FlightStats: refetch current %s\n", better);
         status_msg("FlightStats current...");
-        if (https_get(better, nullptr, kUaBrowser, 8000, 20000, nullptr, true)) {
+        if (https_get(better, nullptr, kUaBrowser, kFsConnectMs, kFsIoMs, "text/html,application/xhtml+xml,*/*",
+                      true)) {
             blen = 0;
             if (http_body_buf(&blen) && blen > 500) {
                 tracker_json = extract_flightstats_tracker(g_http_buf);
@@ -3598,11 +3658,27 @@ static float wpt_dist_proxy_nm(float lat1, float lon1, float lat2, float lon2) {
     return sqrtf(dlat * dlat + dlon * dlon);
 }
 
+/** ≥25 nm within 50 nm of dep/arr; ≥50 nm enroute. */
+static float fa_wpt_min_spacing_nm(float lat, float lon, float dep_lat, float dep_lon, bool have_dep,
+                                   float arr_lat, float arr_lon, bool have_arr) {
+    constexpr float kNearAptNm = 50.0f;
+    if ((have_dep && wpt_dist_proxy_nm(dep_lat, dep_lon, lat, lon) <= kNearAptNm) ||
+        (have_arr && wpt_dist_proxy_nm(arr_lat, arr_lon, lat, lon) <= kNearAptNm)) {
+        return 25.0f;
+    }
+    return 50.0f;
+}
+
+static float s_fa_dep_lat = 0, s_fa_dep_lon = 0, s_fa_arr_lat = 0, s_fa_arr_lon = 0;
+static bool s_fa_have_dep = false, s_fa_have_arr = false;
+
 static void fa_push_route_wpt(FlightInfo *fi, const char *name, float lat, float lon, bool force = false) {
     if (!fi || fi->route_wpt_n >= FR_MAX_ROUTE_WPTS) {
         return;
     }
-    constexpr float kMinNm = 25.0f;  // keep pins readable / on-path
+    const float kMinNm =
+        fa_wpt_min_spacing_nm(lat, lon, s_fa_dep_lat, s_fa_dep_lon, s_fa_have_dep, s_fa_arr_lat,
+                              s_fa_arr_lon, s_fa_have_arr);
     // Skip points too close to an existing pin (unless force — dep/arr endpoints).
     if (!force) {
         for (int i = 0; i < fi->route_wpt_n; i++) {
@@ -3668,6 +3744,31 @@ static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *w
     fi->route_wpt_n = 0;
     memset(fi->route_wpts, 0, sizeof(fi->route_wpts));
 
+    s_fa_have_dep = false;
+    s_fa_have_arr = false;
+    if (fi->origin[0]) {
+        if (net_lookup_airport(fi->origin, &s_fa_dep_lat, &s_fa_dep_lon, nullptr) ||
+            net_lookup_airport_iata(fi->origin, nullptr, 0, &s_fa_dep_lat, &s_fa_dep_lon)) {
+            s_fa_have_dep = true;
+        }
+    }
+    if (!s_fa_have_dep && wn > 0) {
+        s_fa_dep_lat = wlats[0];
+        s_fa_dep_lon = wlons[0];
+        s_fa_have_dep = true;
+    }
+    if (fi->dest[0]) {
+        if (net_lookup_airport(fi->dest, &s_fa_arr_lat, &s_fa_arr_lon, nullptr) ||
+            net_lookup_airport_iata(fi->dest, nullptr, 0, &s_fa_arr_lat, &s_fa_arr_lon)) {
+            s_fa_have_arr = true;
+        }
+    }
+    if (!s_fa_have_arr && wn > 0) {
+        s_fa_arr_lat = wlats[wn - 1];
+        s_fa_arr_lon = wlons[wn - 1];
+        s_fa_have_arr = true;
+    }
+
     auto push_origin = [&]() {
         if (fi->origin[0]) {
             float lat = 0, lon = 0;
@@ -3710,8 +3811,10 @@ static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *w
             // Stay on the FA polyline — snapping to FAA fix coords pulled pins off-path.
             const float flat = wlats[i], flon = wlons[i];
             const float since = have_prev ? wpt_dist_proxy_nm(prev_lat, prev_lon, flat, flon) : 999.0f;
-            // Always ≥25 nm from last pin (new fix names used to spam every few miles).
-            if (!have_prev || since >= 25.0f) {
+            const float need =
+                fa_wpt_min_spacing_nm(flat, flon, s_fa_dep_lat, s_fa_dep_lon, s_fa_have_dep,
+                                      s_fa_arr_lat, s_fa_arr_lon, s_fa_have_arr);
+            if (!have_prev || since >= need) {
                 fa_push_route_wpt(fi, lbl, flat, flon);
                 copy_trunc(prev_lbl, sizeof(prev_lbl), lbl);
                 prev_lat = flat;
@@ -3942,30 +4045,76 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
         return false;
     }
 
+    // Prefer ICAO (FFT1749); keep IATA alt (F91749) — FA pages often key off either.
+    char alt_cs[16] = {0};
+    {
+        char icao_cs[16] = {0}, iata_al[4] = {0}, iata_num[8] = {0};
+        if (net_parse_flight_number(cs, icao_cs, sizeof(icao_cs), iata_al, sizeof(iata_al), iata_num,
+                                    sizeof(iata_num))) {
+            if (icao_cs[0] && strcasecmp(icao_cs, cs) != 0) {
+                // Queried as IATA — try ICAO first (better ADS-B / FA identity).
+                copy_trunc(alt_cs, sizeof(alt_cs), cs);
+                copy_trunc(cs, sizeof(cs), icao_cs);
+            } else if (iata_al[0] && iata_num[0]) {
+                snprintf(alt_cs, sizeof(alt_cs), "%s%s", iata_al, iata_num);
+                if (strcasecmp(alt_cs, cs) == 0) {
+                    alt_cs[0] = 0;
+                }
+            }
+        }
+    }
+
     status_msg("FlightAware route...");
-    char enc[32];
-    url_encode(cs, enc, sizeof(enc));
-    char url[160];
-    snprintf(url, sizeof(url), "https://www.flightaware.com/live/flight/%s", enc);
     // Grow to 768 KB only for this fetch (route/waypoints sit ~450 KB into the page).
     // Shrink afterward so ADS-B / hexdb TLS keep contiguous int-dma.
     if (!ensure_http_buf_sized(kHttpBufCapFa)) {
         Serial.printf("FlightAware buf fail: %s\n", g_last_err);
         return false;
     }
-    if (!https_get(url, nullptr, kUaBrowser, 10000, 90000, "text/html,application/xhtml+xml,*/*", true)) {
-        Serial.printf("FlightAware fetch fail: %s\n", g_last_err);
-        http_buf_shrink_default();
-        return false;
+    auto fa_get = [&](const char *ident) -> bool {
+        char e[32];
+        url_encode(ident, e, sizeof(e));
+        char u[160];
+        snprintf(u, sizeof(u), "https://www.flightaware.com/live/flight/%s", e);
+        Serial.printf("FlightAware try %s\n", ident);
+        // Cap FA page wait — 90s used to freeze ADS-B / Update behind "Loading route…".
+        if (!https_get(u, nullptr, kUaBrowser, 8000, 35000, "text/html,application/xhtml+xml,*/*", true)) {
+            Serial.printf("FlightAware fetch fail (%s): %s\n", ident, g_last_err);
+            return false;
+        }
+        return true;
+    };
+    if (!fa_get(cs)) {
+        if (alt_cs[0]) {
+            net_tls_reset();
+            delay(400);
+            if (!fa_get(alt_cs)) {
+                http_buf_shrink_default();
+                return false;
+            }
+            copy_trunc(cs, sizeof(cs), alt_cs);
+        } else {
+            http_buf_shrink_default();
+            return false;
+        }
     }
     size_t blen = 0;
     const char *html = http_body_buf(&blen);
+    if ((!html || blen < 800) && alt_cs[0]) {
+        Serial.println("FlightAware: empty body — retry alt id");
+        net_tls_reset();
+        delay(400);
+        if (fa_get(alt_cs)) {
+            html = http_body_buf(&blen);
+            copy_trunc(cs, sizeof(cs), alt_cs);
+        }
+    }
     if (!html || blen < 800) {
         Serial.println("FlightAware: empty body");
         http_buf_shrink_default();
         return false;
     }
-    Serial.printf("FlightAware body %u KB\n", (unsigned)(blen / 1024));
+    Serial.printf("FlightAware body %u KB (%s)\n", (unsigned)(blen / 1024), cs);
 
     // Historical altitude / speed for the follow chart (same page as route).
     if (track_out && track_max > 0) {
@@ -3980,7 +4129,7 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
     char act_origin[8] = {0};
     char act_dest[8] = {0};
     char hist_path[160] = {0};
-    const bool have_act =
+    bool have_act =
         fa_pick_current_activity(html, act_origin, sizeof(act_origin), act_dest, sizeof(act_dest),
                                  hist_path, sizeof(hist_path));
     if (have_act) {
@@ -4063,6 +4212,63 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
                 }
                 Serial.printf("FlightAware history route_len=%u waypoints=%d\n", (unsigned)strlen(route),
                               wn);
+            }
+        }
+    }
+
+    // If ICAO page had no usable plan, retry IATA form (FFT1749 → F91749).
+    if (!route[0] && wn <= 0 && !(track_n && *track_n > 0) && alt_cs[0] && strcasecmp(alt_cs, cs) != 0) {
+        Serial.printf("FlightAware: no plan on %s — retry %s\n", cs, alt_cs);
+        net_tls_reset();
+        delay(400);
+        if (fa_get(alt_cs)) {
+            html = http_body_buf(&blen);
+            if (html && blen >= 800) {
+                copy_trunc(cs, sizeof(cs), alt_cs);
+                if (track_out && track_max > 0) {
+                    const int tn = fa_parse_track_array(html, track_out, track_max);
+                    if (track_n) {
+                        *track_n = tn;
+                    }
+                }
+                have_act = fa_pick_current_activity(html, act_origin, sizeof(act_origin), act_dest,
+                                                    sizeof(act_dest), hist_path, sizeof(hist_path));
+                if (have_act) {
+                    copy_trunc(fi->origin, sizeof(fi->origin), act_origin);
+                    copy_trunc(fi->dest, sizeof(fi->dest), act_dest);
+                    fi->departed = true;
+                    fi->schedule_ok = true;
+                    fi->route_ok = true;
+                }
+                route[0] = 0;
+                fa_extract_route_string(html, route, sizeof(route));
+                wn = fa_parse_waypoints_array(html, wlats, wlons, kFaPolyMax);
+                if (hist_path[0] == '/') {
+                    char hist_url[192];
+                    snprintf(hist_url, sizeof(hist_url), "https://www.flightaware.com%s", hist_path);
+                    if (https_get(hist_url, nullptr, kUaBrowser, 10000, 90000,
+                                  "text/html,application/xhtml+xml,*/*", true)) {
+                        size_t hlen = 0;
+                        const char *hhtml = http_body_buf(&hlen);
+                        if (hhtml && hlen > 800) {
+                            char hist_route[384] = {0};
+                            fa_extract_route_string(hhtml, hist_route, sizeof(hist_route));
+                            if (hist_route[0]) {
+                                copy_trunc(route, sizeof(route), hist_route);
+                            }
+                            const int hwn = fa_parse_waypoints_array(hhtml, wlats, wlons, kFaPolyMax);
+                            if (hwn > 0) {
+                                wn = hwn;
+                            }
+                            if (track_out && track_max > 0 && (!track_n || *track_n < 8)) {
+                                const int tn = fa_parse_track_array(hhtml, track_out, track_max);
+                                if (track_n) {
+                                    *track_n = tn;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -5080,9 +5286,9 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
     // One page: https://www.flightaware.com/live/airport/KATL
     // Arrivals column ← En Route (airborne inbound; Arrivals table is already landed).
     // Departures column ← Departures (left gate; Scheduled are still on the ground).
-    // Settle TLS after FA flight-plan (768 KB) thrash; ensure body buffer is alive.
+    // Settle TLS after FA flight-plan thrash; ensure body buffer is alive.
     net_tls_reset();
-    delay(400);
+    delay(80);
     if (!ensure_http_buf()) {
         set_err(g_last_err[0] ? g_last_err : "No HTTP buffer");
         return false;
@@ -5090,11 +5296,20 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
     status_msg("FlightAware board...");
     char url[96];
     snprintf(url, sizeof(url), "https://www.flightaware.com/live/airport/%s", code);
-    if (!https_get(url, nullptr, kUaBrowser, 10000, 90000, "text/html,application/xhtml+xml,*/*", true,
-                   fa_board_body_ok)) {
-        Serial.printf("FA board fetch fail %s: %s\n", code, g_last_err);
-        set_err(g_last_err[0] ? g_last_err : "FA board fetch failed");
-        return false;
+    auto fa_board_get = [&]() -> bool {
+        return https_get(url, nullptr, kUaBrowser, 8000, 35000, "text/html,application/xhtml+xml,*/*",
+                         true, fa_board_body_ok);
+    };
+    if (!fa_board_get()) {
+        Serial.printf("FA board fetch fail %s: %s — retry\n", code, g_last_err);
+        net_abort_clear();
+        net_tls_reset();
+        delay(120);
+        if (!fa_board_get()) {
+            Serial.printf("FA board fetch fail %s: %s\n", code, g_last_err);
+            set_err(g_last_err[0] ? g_last_err : "FA board fetch failed");
+            return false;
+        }
     }
     size_t blen = 0;
     const char *html = http_body_buf(&blen);
@@ -5468,6 +5683,84 @@ bool net_fetch_route_flights(const char *dep_icao, const char *arr_icao, Airport
         }
     }
 
+    if (out_n) {
+        *out_n = n;
+    }
+    return n > 0;
+}
+
+bool net_fetch_plate_manifest(char icaos[][8], int max_n, int *out_n) {
+    if (out_n) {
+        *out_n = 0;
+    }
+    if (!icaos || max_n <= 0) {
+        return false;
+    }
+    char url[220];
+    snprintf(url, sizeof(url), "%s/manifest.json", FR_SD_DATA_BASE_URL);
+    if (!https_get(url, nullptr, nullptr, 8000, 15000, "application/json", true)) {
+        return false;
+    }
+    size_t blen = 0;
+    const char *body = (const char *)net_http_body(&blen);
+    if (!body || blen < 8) {
+        return false;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, body, blen)) {
+        set_err("Plate manifest JSON");
+        return false;
+    }
+    JsonArray files = doc["files"].as<JsonArray>();
+    if (files.isNull()) {
+        set_err("Plate manifest files");
+        return false;
+    }
+    int n = 0;
+    for (JsonObject f : files) {
+        if (n >= max_n) {
+            break;
+        }
+        const char *path = f["path"] | "";
+        if (!path || !path[0]) {
+            continue;
+        }
+        // Expect "plates/KATL.frpl"
+        if (!strstr(path, ".frpl")) {
+            continue;
+        }
+        const char *slash = strrchr(path, '/');
+        const char *name = slash ? slash + 1 : path;
+        size_t len = strlen(name);
+        if (len < 6 || strcasecmp(name + len - 5, ".frpl") != 0) {
+            continue;
+        }
+        char icao[8] = {0};
+        size_t ilen = len - 5;
+        if (ilen >= sizeof(icao)) {
+            ilen = sizeof(icao) - 1;
+        }
+        for (size_t i = 0; i < ilen; i++) {
+            icao[i] = (char)toupper((unsigned char)name[i]);
+        }
+        icao[ilen] = 0;
+        if (icao[0] < 'A' || icao[0] > 'Z') {
+            continue;
+        }
+        bool dup = false;
+        for (int j = 0; j < n; j++) {
+            if (strcasecmp(icaos[j], icao) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        strncpy(icaos[n], icao, 7);
+        icaos[n][7] = 0;
+        n++;
+    }
     if (out_n) {
         *out_n = n;
     }

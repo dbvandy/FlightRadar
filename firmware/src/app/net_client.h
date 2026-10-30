@@ -10,12 +10,20 @@ void net_init_buffers();
 void net_arm_tls_dma_after_wifi();
 /** Drop any sticky TLS session (call before a heavy FA fetch / after abort). */
 void net_tls_reset();
+/** Hard reset hung HTTPS/TLS/FA buffer so ADS-B can run again (Update ADS-B). */
+void net_stack_recover();
+/** Ask in-flight HTTPS (FA/FS) to bail so Update ADS-B / recover can run. */
+void net_abort_request();
+void net_abort_clear();
+bool net_abort_requested();
 
 // body may be nullptr to keep the payload only in the internal fixed buffer.
 // early_ok: optional stop-as-soon-as-usable predicate (airport board markers, etc.).
 bool https_get(const char *url, String *body, const char *user_agent = nullptr,
                uint32_t connect_ms = 8000, uint32_t io_ms = 10000, const char *accept = nullptr,
                bool force_close = false, bool (*early_ok)(const char *buf, size_t len) = nullptr);
+/** Body of the last https_get into the shared buffer (binary-safe via length). */
+const uint8_t *net_http_body(size_t *len_out);
 const char *net_last_error();
 void net_set_status_callback(void (*cb)(const char *msg));
 
@@ -51,8 +59,9 @@ bool net_fetch_weather(const char *icao, Weather *out);
 /** Split "UA100" / "UAL100" into ICAO callsign + IATA airline/number. */
 bool net_parse_flight_number(const char *query, char *icao_cs, size_t icao_cs_len, char *iata_al,
                              size_t iata_al_len, char *iata_num, size_t iata_num_len);
-/** Schedule / gate / times for a flight (FlightStats). Fills fi on success. */
-bool net_fetch_flight_schedule(const char *flight_key, FlightInfo *fi);
+/** Schedule / gate / times for a flight (FlightStats). Fills fi on success.
+ *  allow_dated_refetch: follow otherDays URL (slower). Pass false for Update ADS-B. */
+bool net_fetch_flight_schedule(const char *flight_key, FlightInfo *fi, bool allow_dated_refetch = true);
 /** Filed route waypoints + alt/groundspeed history (FlightAware). */
 bool net_fetch_flight_plan(const char *flight_key, FlightInfo *fi, FlightTrackPt *track, int track_max,
                            int *track_n);
@@ -75,3 +84,6 @@ bool net_fetch_route_flights(const char *dep_icao, const char *arr_icao, Airport
                              int *rows_n, char *label, size_t label_len);
 
 void url_encode(const char *in, char *out, size_t out_len);
+
+/** Parse GitHub fr_data/manifest.json → ICAO list from plates/*.frpl entries. */
+bool net_fetch_plate_manifest(char icaos[][8], int max_n, int *out_n);

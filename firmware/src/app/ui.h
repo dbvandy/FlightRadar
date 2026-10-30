@@ -25,6 +25,14 @@ enum UiRequest : uint32_t {
     UI_REQ_REFRESH_PLATE_CITIES = 1u << 21,
     UI_REQ_ROUTE_SEARCH = 1u << 22,
     UI_REQ_FETCH_ROUTE_FLIGHTS = 1u << 23,
+    UI_REQ_FETCH_PLATE = 1u << 24,
+    UI_REQ_UPDATE_PLATES = 1u << 25,
+    /** Reset hung TLS/HTTP then refresh ADS-B (Update ADS-B button). */
+    UI_REQ_NET_RECOVER = 1u << 26,
+    /** Refresh FlightStats Sch/Act/Est while following (merge, don't wipe). */
+    UI_REQ_REFRESH_SCHEDULE = 1u << 27,
+    /** Fetch AWC radios for Airport Information (must not run on LVGL thread). */
+    UI_REQ_FETCH_PLATE_RADIOS = 1u << 28,
 };
 
 struct SharedState {
@@ -53,6 +61,13 @@ struct SharedState {
     char plate_city_icao[24][8];
     char plate_city_name[24][28];
     int plate_city_n;
+    // GitHub plate pack (Update Plates → manifest).
+    char plate_pack_icao[48][8];
+    int plate_pack_n;
+    // Airport Information radios (AWC) — fetched on net task.
+    char pending_plate_radios_icao[8];
+    AirportRadios plate_radios;
+    bool plate_radios_ok;
     // Airport arrivals / departures board.
     char board_icao[8];
     char board_label[48];
@@ -127,6 +142,12 @@ void ui_notify_airport_board(bool ok, const char *msg);
 /** Update Airport Board status label (safe from net task; takes LVGL lock). */
 void ui_set_board_status(const char *msg);
 void ui_notify_plate_cities(bool ok);
+/** Bitmap plate finished loading into PSRAM — refresh preview / map / detail. */
+void ui_notify_plate_bitmap(void);
+/** Manifest refresh finished (ok) — merge ICAOs into list and refresh UI. */
+void ui_notify_plates_updated(bool ok, const char *msg);
+/** AWC radios ready for Airport Information preview (icao in pending_plate_radios_icao). */
+void ui_notify_plate_radios(bool ok);
 void ui_notify_route_search(bool ok, const char *msg);
 void ui_notify_route_flights(bool ok, const char *msg);
 void ui_notify_track_result(bool ok, const char *msg);

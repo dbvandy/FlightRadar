@@ -5,8 +5,8 @@
 #include <string.h>
 #include <strings.h>
 
-// Built-in plate list. Bitmaps load from GitHub FRPL pack into PSRAM
-// (see FR_SD_DATA_BASE_URL …/plates/*.frpl); procedural runway draw is fallback.
+// Built-in plate list. Bitmaps: Update Plates downloads FRPL → SPIFFS + PSRAM;
+// browsing only reads local storage (no auto network). Procedural runway = fallback.
 struct AirportPlateInfo {
     const char *icao;
     const char *iata;
@@ -46,13 +46,17 @@ static inline const AirportPlateInfo *airport_plate_at(int idx) {
     return (idx >= 0 && idx < AIRPORT_PLATE_COUNT) ? &kAirportPlates[idx] : nullptr;
 }
 
-// FAA bitmap plates: queue → net task downloads FRPL into PSRAM LRU cache.
-const lv_img_dsc_t *faa_plate_lookup(const char *icao);
+// FAA bitmap plates: SPIFFS (durable) + PSRAM LRU. Network only via Update Plates.
+const lv_img_dsc_t *faa_plate_lookup(const char *icao);  // PSRAM peek only (draw-safe)
+/** SPIFFS → PSRAM for one ICAO. Never call from LVGL draw callbacks. */
+bool faa_plate_load_local(const char *icao);
 const lv_img_dsc_t *faa_plate_peek(const char *icao);
-void faa_plate_request(const char *icao);
+void faa_plate_request(const char *icao);  // queue only; serviced during Update Plates
+/** Drop one ICAO from PSRAM cache + miss list (does not erase SPIFFS). */
+void faa_plate_forget(const char *icao);
 bool faa_plates_service(void);
 bool faa_plates_pending(void);
-/** Force re-download of the given ICAOs into the PSRAM cache (Update Plates). */
+/** Wipe SPIFFS + PSRAM, then download ICAOs (Update Plates button). */
 void faa_plates_queue_refresh(const char icaos[][8], int n);
 bool faa_plates_bulk_active(void);
 bool faa_plates_bulk_finished(void);

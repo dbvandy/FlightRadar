@@ -28,14 +28,30 @@ static int clamp_pct(int v) {
     return v;
 }
 
+/** Pressure sensitivity floor is 60% (below that touch felt dead). */
+static int clamp_touch_sens(int v) {
+    if (v < 60) {
+        return 60;
+    }
+    if (v > 100) {
+        return 100;
+    }
+    return v;
+}
+
 void config_load(AppConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->range_nm = 50.0f;
     cfg->max_alt_ft = 45000;
     cfg->show_airports = true;
     cfg->county_mask = kCountyMaskAll50;
-    cfg->brightness = 100;
-    cfg->volume = 60;
+    cfg->brightness = 50;
+    cfg->volume = 50;
+    cfg->touch_ox = 0.0f;
+    cfg->touch_oy = 0.0f;
+    cfg->touch_sx = 1.0f;
+    cfg->touch_sy = 1.0f;
+    cfg->touch_pressure_sens = 100;  // 100% = most sensitive (min allowed 60)
     if (!prefs.begin("fradar", true)) {
         cfg->startup_range_nm = cfg->range_nm;
         cfg->startup_max_alt_ft = cfg->max_alt_ft;
@@ -55,8 +71,23 @@ void config_load(AppConfig *cfg) {
     cfg->show_counties = prefs.getBool("showcty", false);
     cfg->show_cities = prefs.getBool("showcity", false);
     cfg->county_mask = prefs.getULong64("ctymask", kCountyMaskAll50) & kCountyMaskAll50;
-    cfg->brightness = clamp_pct(prefs.getInt("bright", 100));
-    cfg->volume = clamp_pct(prefs.getInt("vol", 60));
+    // New key so units that already saved bright=100 pick up the 50% default.
+    cfg->brightness = clamp_pct(prefs.getInt("bright2", 50));
+    // New key so prior loud saves (60/80) don't stick after the quieter scale.
+    cfg->volume = clamp_pct(prefs.getInt("vol2", 50));
+    // New keys: clear any bad map from the first calib flash that locked touch.
+    cfg->touch_ox = prefs.getFloat("tch2_ox", 0.0f);
+    cfg->touch_oy = prefs.getFloat("tch2_oy", 0.0f);
+    cfg->touch_sx = prefs.getFloat("tch2_sx", 1.0f);
+    cfg->touch_sy = prefs.getFloat("tch2_sy", 1.0f);
+    if (fabsf(cfg->touch_sx) < 1e-4f) {
+        cfg->touch_sx = 1.0f;
+    }
+    if (fabsf(cfg->touch_sy) < 1e-4f) {
+        cfg->touch_sy = 1.0f;
+    }
+    // New key: prior saves (20/60/70) must not override the 100% default.
+    cfg->touch_pressure_sens = clamp_touch_sens(prefs.getInt("tch_psen3", 100));
     cfg->location.valid = (fabsf(cfg->location.lat) > 0.01f || fabsf(cfg->location.lon) > 0.01f);
     if (cfg->range_nm < 10.0f) {
         cfg->range_nm = 10.0f;
@@ -90,8 +121,13 @@ void config_save(const AppConfig *cfg) {
     prefs.putBool("showcty", cfg->show_counties);
     prefs.putBool("showcity", cfg->show_cities);
     prefs.putULong64("ctymask", cfg->county_mask);
-    prefs.putInt("bright", clamp_pct(cfg->brightness));
-    prefs.putInt("vol", clamp_pct(cfg->volume));
+    prefs.putInt("bright2", clamp_pct(cfg->brightness));
+    prefs.putInt("vol2", clamp_pct(cfg->volume));
+    prefs.putFloat("tch2_ox", cfg->touch_ox);
+    prefs.putFloat("tch2_oy", cfg->touch_oy);
+    prefs.putFloat("tch2_sx", cfg->touch_sx);
+    prefs.putFloat("tch2_sy", cfg->touch_sy);
+    prefs.putInt("tch_psen3", clamp_touch_sens(cfg->touch_pressure_sens));
     prefs.end();
 }
 
@@ -168,7 +204,7 @@ void config_save_brightness(int brightness) {
     if (!prefs.begin("fradar", false)) {
         return;
     }
-    prefs.putInt("bright", clamp_pct(brightness));
+    prefs.putInt("bright2", clamp_pct(brightness));
     prefs.end();
 }
 
@@ -176,7 +212,19 @@ void config_save_volume(int volume) {
     if (!prefs.begin("fradar", false)) {
         return;
     }
-    prefs.putInt("vol", clamp_pct(volume));
+    prefs.putInt("vol2", clamp_pct(volume));
+    prefs.end();
+}
+
+void config_save_touch_calib(float ox, float oy, float sx, float sy, int pressure_sens) {
+    if (!prefs.begin("fradar", false)) {
+        return;
+    }
+    prefs.putFloat("tch2_ox", ox);
+    prefs.putFloat("tch2_oy", oy);
+    prefs.putFloat("tch2_sx", sx);
+    prefs.putFloat("tch2_sy", sy);
+    prefs.putInt("tch_psen3", clamp_touch_sens(pressure_sens));
     prefs.end();
 }
 

@@ -179,6 +179,24 @@ bool lvgl_port_pinch_active(void);
  */
 void lvgl_port_set_pinch_zoom_cb(void (*cb)(int dir));
 
+/**
+ * @brief Touch location mapping: mapped = offset + scale * raw.
+ * Defaults: ox=oy=0, sx=sy=1 (identity).
+ */
+void lvgl_port_set_touch_map(float ox, float oy, float sx, float sy);
+void lvgl_port_get_touch_map(float *ox, float *oy, float *sx, float *sy);
+
+/**
+ * @brief Minimum GT911 strength to accept a touch (0 = most sensitive).
+ */
+void lvgl_port_set_touch_pressure_min(int strength_min);
+int lvgl_port_get_touch_pressure_min(void);
+
+/**
+ * @brief Last raw touch sample (before map / pressure filter). strength may be 0 if unsupported.
+ */
+void lvgl_port_get_last_touch_raw(int *x, int *y, int *strength);
+
 #ifdef __cplusplus
 }
 #endif
