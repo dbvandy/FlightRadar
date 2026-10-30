@@ -1,0 +1,21 @@
+Screen Grab + Timelapse + SD — REMOVED from tree after v1.1.1
+==============================================================
+
+Code for SD card, screen grab, SMTP email, and timelapse was deleted
+(not merely feature-flagged) to stabilize Wi‑Fi / ADS‑B.
+
+To restore, check out an older tag and cherry-pick or copy:
+
+  git show v1.1.1:firmware/src/app/ui.cpp
+  git show v1.1.0:...   (full SD pack + AVI/email era)
+
+Key pieces that lived in those tags:
+  - Screen Shot button → begin_screenshot_email() → SMTP
+  - Timelapse → timelapse_avi.cpp + SD JPEG frames → AVI email
+  - SD Card Setup → Update Data (net_install_fr_data) + file browser
+  - airports/runways/waypoints loaded from /sdcard/fr_data/*.bin
+
+After the strip, airport + runway DBs are flash-embedded again
+(airport_db.cpp / runway_db.cpp). Waypoints stay empty (FA route still works).
+
+Do NOT re-enable heap_caps_malloc_extmem_enable(64) or pre-WiFi DMA reserve.
