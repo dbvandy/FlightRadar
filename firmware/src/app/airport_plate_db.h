@@ -5,7 +5,8 @@
 #include <string.h>
 #include <strings.h>
 
-// Plates list for procedural Class B overlays (runway geometry). SD bitmaps removed.
+// Built-in plate list. Bitmaps load from GitHub FRPL pack into PSRAM
+// (see FR_SD_DATA_BASE_URL …/plates/*.frpl); procedural runway draw is fallback.
 struct AirportPlateInfo {
     const char *icao;
     const char *iata;
@@ -16,10 +17,15 @@ static const AirportPlateInfo kAirportPlates[] = {
     {"KATL", "ATL", "Hartsfield-Jackson Atlanta Intl"},
     {"KBNA", "BNA", "Nashville Intl"},
     {"KCLT", "CLT", "Charlotte Douglas Intl"},
+    {"KDFW", "DFW", "Dallas/Fort Worth Intl"},
+    {"KDTW", "DTW", "Detroit Metro Wayne County"},
     {"KGNV", "GNV", "Gainesville Regional"},
+    {"KHOU", "HOU", "William P Hobby"},
     {"KINF", "INF", "Inverness"},
     {"KJAX", "JAX", "Jacksonville Intl"},
     {"KMCO", "MCO", "Orlando Intl"},
+    {"KOCF", "OCF", "Ocala Intl"},
+    {"KTPA", "TPA", "Tampa Intl"},
     {"KX60", "X60", "Williston Regional"},
 };
 #define AIRPORT_PLATE_COUNT ((int)(sizeof(kAirportPlates) / sizeof(kAirportPlates[0])))
@@ -40,10 +46,15 @@ static inline const AirportPlateInfo *airport_plate_at(int idx) {
     return (idx >= 0 && idx < AIRPORT_PLATE_COUNT) ? &kAirportPlates[idx] : nullptr;
 }
 
-// Legacy FAA bitmap API (stubs — always empty without SD).
+// FAA bitmap plates: queue → net task downloads FRPL into PSRAM LRU cache.
 const lv_img_dsc_t *faa_plate_lookup(const char *icao);
 const lv_img_dsc_t *faa_plate_peek(const char *icao);
 void faa_plate_request(const char *icao);
 bool faa_plates_service(void);
+bool faa_plates_pending(void);
+/** Force re-download of the given ICAOs into the PSRAM cache (Update Plates). */
+void faa_plates_queue_refresh(const char icaos[][8], int n);
+bool faa_plates_bulk_active(void);
+bool faa_plates_bulk_finished(void);
 void faa_plates_invalidate(void);
 bool faa_plates_sd_ready(void);

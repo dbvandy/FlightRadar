@@ -25,7 +25,21 @@ PLATES_DIR = Path(__file__).resolve().parent / "faa_plates"
 OUT = ROOT / "firmware" / "sd_pack" / "fr_data"
 
 # Match plates currently embedded in faa_plate_db.h
-PLATE_ICAOS = ["KATL", "KBNA", "KGNV", "KINF", "KJAX", "KMCO", "KX60"]
+PLATE_ICAOS = [
+    "KATL",
+    "KBNA",
+    "KCLT",
+    "KDFW",
+    "KDTW",
+    "KGNV",
+    "KHOU",
+    "KINF",
+    "KJAX",
+    "KMCO",
+    "KOCF",
+    "KTPA",
+    "KX60",
+]
 PLATE_SIZE = 280
 # LV_IMG_CF_TRUE_COLOR
 LV_IMG_CF_TRUE_COLOR = 4
