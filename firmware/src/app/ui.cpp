@@ -1397,9 +1397,9 @@ static float wpt_cross_track_nm(float alat, float alon, float blat, float blon, 
  * (bad duplicate-name lookups, bogus lat/lon tokens). Endpoints are kept.
  */
 static void follow_waypoints_prune_outliers() {
-    constexpr float kXtNm = 45.0f;       // cross-track vs neighbor chord
-    constexpr float kDetourNm = 70.0f;   // extra path length vs skipping the point
-    constexpr float kXtHardNm = 100.0f;  // extreme deviation alone is enough
+    constexpr float kXtNm = 25.0f;      // cross-track vs neighbor chord
+    constexpr float kDetourNm = 40.0f;  // extra path length vs skipping the point
+    constexpr float kXtHardNm = 50.0f;  // extreme deviation alone is enough
 
     bool changed = true;
     while (changed && s_follow_wpt_n > 2) {
@@ -1420,7 +1420,7 @@ static void follow_waypoints_prune_outliers() {
                                 wpt_dist_nm(cur.lat, cur.lon, next.lat, next.lon);
             const float detour = d_via - d_skip;
             const bool bad = (xt >= kXtHardNm) || (xt >= kXtNm && detour >= kDetourNm) ||
-                             (d_skip > 1.0f && d_via > 3.0f * d_skip && xt >= 25.0f);
+                             (d_skip > 1.0f && d_via > 2.5f * d_skip && xt >= 15.0f);
             if (bad && xt >= worst_score) {
                 worst_score = xt;
                 worst = i;
@@ -1435,6 +1435,31 @@ static void follow_waypoints_prune_outliers() {
         s_follow_wpt_n--;
         changed = true;
     }
+}
+
+/** Keep dep/arr; drop intermediate pins closer than min_nm to the previous kept pin. */
+static void follow_waypoints_thin_min_nm(float min_nm) {
+    if (s_follow_wpt_n <= 2 || min_nm <= 0.0f) {
+        return;
+    }
+    int kept = 1;  // always keep index 0 (dep)
+    for (int i = 1; i < s_follow_wpt_n - 1; i++) {
+        const FollowWpt &prev = s_follow_wpts[kept - 1];
+        const FollowWpt &cur = s_follow_wpts[i];
+        if (!cur.ok) {
+            continue;
+        }
+        if (wpt_dist_nm(prev.lat, prev.lon, cur.lat, cur.lon) >= min_nm) {
+            if (kept != i) {
+                s_follow_wpts[kept] = cur;
+            }
+            kept++;
+        }
+    }
+    // Always keep last (arr).
+    s_follow_wpts[kept] = s_follow_wpts[s_follow_wpt_n - 1];
+    kept++;
+    s_follow_wpt_n = kept;
 }
 
 static void follow_waypoints_rebuild() {
@@ -1460,10 +1485,10 @@ static void follow_waypoints_rebuild() {
             }
             push_wpt(rw.lat, rw.lon, rw.name[0] ? rw.name : "WPT");
         }
-        // Only prune when we have a short named-fix list; dense polyline paths
-        // are already on-route and pruning can wipe legitimate doglegs.
-        if (s_follow_wpt_n > 0 && s_follow_wpt_n <= 16) {
+        // Drop off-path rogues, then enforce ≥25 nm spacing (DAL3161 was a mess).
+        if (s_follow_wpt_n > 2) {
             follow_waypoints_prune_outliers();
+            follow_waypoints_thin_min_nm(25.0f);
         }
         return;
     }

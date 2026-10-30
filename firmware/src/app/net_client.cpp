@@ -3586,28 +3586,40 @@ static bool fa_pick_current_activity(const char *html, char *origin, size_t orig
     return true;
 }
 
-static void fa_push_route_wpt(FlightInfo *fi, const char *name, float lat, float lon) {
+/** Approx great-circle distance in nm (flat-earth); local helper for snap threshold. */
+static float wpt_dist_proxy_nm(float lat1, float lon1, float lat2, float lon2) {
+    const float mid = (lat1 + lat2) * 0.5f;
+    float cos_lat = cosf(mid * FR_DEG2RAD);
+    if (cos_lat < 0.15f) {
+        cos_lat = 0.15f;
+    }
+    const float dlat = (lat2 - lat1) * 60.0f;
+    const float dlon = (lon2 - lon1) * 60.0f * cos_lat;
+    return sqrtf(dlat * dlat + dlon * dlon);
+}
+
+static void fa_push_route_wpt(FlightInfo *fi, const char *name, float lat, float lon, bool force = false) {
     if (!fi || fi->route_wpt_n >= FR_MAX_ROUTE_WPTS) {
         return;
     }
-    // Skip nearly-identical positions; allow the same fix name only if far apart
-    // (nearest-FAA labeling often repeats a name across consecutive polyline samples).
-    for (int i = 0; i < fi->route_wpt_n; i++) {
-        float dlat = fi->route_wpts[i].lat - lat;
-        float dlon = fi->route_wpts[i].lon - lon;
-        if (dlat * dlat + dlon * dlon < 1e-4f) {  // ~0.6 nm
-            if (name && name[0] && !fi->route_wpts[i].name[0]) {
-                copy_trunc(fi->route_wpts[i].name, sizeof(fi->route_wpts[i].name), name);
-                for (char *q = fi->route_wpts[i].name; *q; q++) {
-                    *q = (char)toupper((unsigned char)*q);
+    constexpr float kMinNm = 25.0f;  // keep pins readable / on-path
+    // Skip points too close to an existing pin (unless force — dep/arr endpoints).
+    if (!force) {
+        for (int i = 0; i < fi->route_wpt_n; i++) {
+            const float d =
+                wpt_dist_proxy_nm(fi->route_wpts[i].lat, fi->route_wpts[i].lon, lat, lon);
+            if (d < kMinNm) {
+                if (name && name[0] && !fi->route_wpts[i].name[0]) {
+                    copy_trunc(fi->route_wpts[i].name, sizeof(fi->route_wpts[i].name), name);
+                    for (char *q = fi->route_wpts[i].name; *q; q++) {
+                        *q = (char)toupper((unsigned char)*q);
+                    }
                 }
+                return;
             }
-            return;
-        }
-        if (name && name[0] && fi->route_wpts[i].name[0] &&
-            strcasecmp(fi->route_wpts[i].name, name) == 0) {
-            // Same label already on path — keep the earlier pin unless this is distant.
-            if (dlat * dlat + dlon * dlon < 0.25f) {  // < ~30 nm
+            if (name && name[0] && fi->route_wpts[i].name[0] &&
+                strcasecmp(fi->route_wpts[i].name, name) == 0 && d < (kMinNm * 1.2f)) {
+                // Same label already on path nearby — keep the earlier pin.
                 return;
             }
         }
@@ -3626,18 +3638,6 @@ static void fa_push_route_wpt(FlightInfo *fi, const char *name, float lat, float
     w.ok = true;
 }
 
-/** Approx great-circle distance in nm (flat-earth); local helper for snap threshold. */
-static float wpt_dist_proxy_nm(float lat1, float lon1, float lat2, float lon2) {
-    const float mid = (lat1 + lat2) * 0.5f;
-    float cos_lat = cosf(mid * FR_DEG2RAD);
-    if (cos_lat < 0.15f) {
-        cos_lat = 0.15f;
-    }
-    const float dlat = (lat2 - lat1) * 60.0f;
-    const float dlon = (lon2 - lon1) * 60.0f * cos_lat;
-    return sqrtf(dlat * dlat + dlon * dlon);
-}
-
 /** Label a polyline vertex from the FAA fix DB (preferred) or a nearby airport. */
 static void fa_label_path_point(float lat, float lon, char *lbl, size_t lbl_len) {
     if (!lbl || lbl_len < 4) {
@@ -3645,7 +3645,8 @@ static void fa_label_path_point(float lat, float lon, char *lbl, size_t lbl_len)
     }
     lbl[0] = 0;
     // Prefer enroute fixes over airports so the path isn't all "Kxxx".
-    if (net_nearest_waypoint(lat, lon, 35.0f, lbl, lbl_len) && lbl[0]) {
+    // Keep the search tight — a 35 nm nearest fix often labeled the wrong radial.
+    if (net_nearest_waypoint(lat, lon, 15.0f, lbl, lbl_len) && lbl[0]) {
         return;
     }
     if (fa_nearest_airport_name(lbl, lbl_len, lat, lon, 12.0f) && lbl[0]) {
@@ -3672,12 +3673,12 @@ static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *w
             float lat = 0, lon = 0;
             if (net_lookup_airport(fi->origin, &lat, &lon, nullptr) ||
                 net_lookup_airport_iata(fi->origin, nullptr, 0, &lat, &lon)) {
-                fa_push_route_wpt(fi, fi->origin, lat, lon);
+                fa_push_route_wpt(fi, fi->origin, lat, lon, true);
             } else if (wn > 0) {
-                fa_push_route_wpt(fi, fi->origin, wlats[0], wlons[0]);
+                fa_push_route_wpt(fi, fi->origin, wlats[0], wlons[0], true);
             }
         } else if (wn > 0) {
-            fa_push_route_wpt(fi, "DEP", wlats[0], wlons[0]);
+            fa_push_route_wpt(fi, "DEP", wlats[0], wlons[0], true);
         }
     };
     auto push_dest = [&]() {
@@ -3685,12 +3686,12 @@ static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *w
             float lat = 0, lon = 0;
             if (net_lookup_airport(fi->dest, &lat, &lon, nullptr) ||
                 net_lookup_airport_iata(fi->dest, nullptr, 0, &lat, &lon)) {
-                fa_push_route_wpt(fi, fi->dest, lat, lon);
+                fa_push_route_wpt(fi, fi->dest, lat, lon, true);
             } else if (wn > 0) {
-                fa_push_route_wpt(fi, fi->dest, wlats[wn - 1], wlons[wn - 1]);
+                fa_push_route_wpt(fi, fi->dest, wlats[wn - 1], wlons[wn - 1], true);
             }
         } else if (wn > 0) {
-            fa_push_route_wpt(fi, "ARR", wlats[wn - 1], wlons[wn - 1]);
+            fa_push_route_wpt(fi, "ARR", wlats[wn - 1], wlons[wn - 1], true);
         }
     };
 
@@ -3706,18 +3707,11 @@ static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *w
         for (int i = 1; i < wn - 1 && fi->route_wpt_n < FR_MAX_ROUTE_WPTS - 1; i++) {
             char lbl[14];
             fa_label_path_point(wlats[i], wlons[i], lbl, sizeof(lbl));
-            float flat = wlats[i], flon = wlons[i];
-            float dlat = 0, dlon = 0;
-            if (lbl[0] && strcmp(lbl, "WPT") != 0 && net_lookup_waypoint(lbl, &dlat, &dlon)) {
-                if (wpt_dist_proxy_nm(wlats[i], wlons[i], dlat, dlon) < 20.0f) {
-                    flat = dlat;
-                    flon = dlon;
-                }
-            }
-            const bool same_fix = have_prev && lbl[0] && prev_lbl[0] && strcasecmp(lbl, prev_lbl) == 0;
+            // Stay on the FA polyline — snapping to FAA fix coords pulled pins off-path.
+            const float flat = wlats[i], flon = wlons[i];
             const float since = have_prev ? wpt_dist_proxy_nm(prev_lat, prev_lon, flat, flon) : 999.0f;
-            // New fix name, or same fix but we've moved ≥25 nm along track.
-            if (!have_prev || !same_fix || since >= 25.0f) {
+            // Always ≥25 nm from last pin (new fix names used to spam every few miles).
+            if (!have_prev || since >= 25.0f) {
                 fa_push_route_wpt(fi, lbl, flat, flon);
                 copy_trunc(prev_lbl, sizeof(prev_lbl), lbl);
                 prev_lat = flat;
@@ -3800,11 +3794,38 @@ static int fa_build_route_wpts(FlightInfo *fi, const char *route, const float *w
                 }
             }
             if (best_i >= 0 && best_d < (0.35f * 0.35f)) {  // ~20 nm @ mid-lat-ish
+                // Rename only — snapping lat/lon to the FAA fix often yanked pins off-path
+                // (duplicate/wrong-fix hits). Keep the polyline vertex.
                 copy_trunc(fi->route_wpts[best_i].name, sizeof(fi->route_wpts[best_i].name), use_name);
-                fi->route_wpts[best_i].lat = lat;
-                fi->route_wpts[best_i].lon = lon;
             } else if (fi->route_wpt_n < FR_MAX_ROUTE_WPTS) {
-                fa_push_route_wpt(fi, use_name, lat, lon);
+                // Only inject if the filed fix sits near the existing path (not a rogue SID/STAR).
+                float xt_min = 1e30f;
+                for (int i = 0; i + 1 < fi->route_wpt_n; i++) {
+                    const float xt = [&]() {
+                        const float alat = fi->route_wpts[i].lat, alon = fi->route_wpts[i].lon;
+                        const float blat = fi->route_wpts[i + 1].lat, blon = fi->route_wpts[i + 1].lon;
+                        const float mid = (alat + blat) * 0.5f;
+                        float cos_lat = cosf(mid * FR_DEG2RAD);
+                        if (cos_lat < 0.15f) {
+                            cos_lat = 0.15f;
+                        }
+                        const float abx = (blon - alon) * 60.0f * cos_lat;
+                        const float aby = (blat - alat) * 60.0f;
+                        const float acx = (lon - alon) * 60.0f * cos_lat;
+                        const float acy = (lat - alat) * 60.0f;
+                        const float ab2 = abx * abx + aby * aby;
+                        if (ab2 < 1e-4f) {
+                            return wpt_dist_proxy_nm(alat, alon, lat, lon);
+                        }
+                        return fabsf(acx * aby - acy * abx) / sqrtf(ab2);
+                    }();
+                    if (xt < xt_min) {
+                        xt_min = xt;
+                    }
+                }
+                if (xt_min <= 30.0f) {
+                    fa_push_route_wpt(fi, use_name, lat, lon);
+                }
             }
         }
     }
