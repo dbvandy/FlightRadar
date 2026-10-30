@@ -509,19 +509,44 @@ static bool aircraft_below_ceiling(const Aircraft *ac, int max_alt_ft) {
     return ac->alt_ft <= (float)max_alt_ft;
 }
 
+/** ICAO/IATA callsign match (DAL3161 ↔ DL3161). */
+static bool follow_flight_matches(const char *a, const char *b) {
+    if (!a || !b || !a[0] || !b[0]) {
+        return false;
+    }
+    if (strcasecmp(a, b) == 0) {
+        return true;
+    }
+    char a_icao[16] = {0}, b_icao[16] = {0}, al[4], num[8];
+    if (!net_parse_flight_number(a, a_icao, sizeof(a_icao), al, sizeof(al), num, sizeof(num))) {
+        return false;
+    }
+    if (!net_parse_flight_number(b, b_icao, sizeof(b_icao), al, sizeof(al), num, sizeof(num))) {
+        return false;
+    }
+    return a_icao[0] && b_icao[0] && strcasecmp(a_icao, b_icao) == 0;
+}
+
+static bool follow_is_tracked_ac(const Aircraft *ac) {
+    if (!ac || !s_follow) {
+        return false;
+    }
+    if (s_follow_hex[0] && ac->hex[0] && strcasecmp(ac->hex, s_follow_hex) == 0) {
+        return true;
+    }
+    if (s_follow_label[0] && ac->flight[0] && follow_flight_matches(ac->flight, s_follow_label)) {
+        return true;
+    }
+    return false;
+}
+
 static bool aircraft_shown(const Aircraft *ac) {
     if (!ac || !ac->valid) {
         return false;
     }
     // While tracking: only the followed aircraft (hide everyone else on the PPI).
     if (s_follow) {
-        if (s_follow_hex[0] && ac->hex[0] && strcasecmp(ac->hex, s_follow_hex) == 0) {
-            return true;
-        }
-        if (s_follow_label[0] && ac->flight[0] && strcasecmp(ac->flight, s_follow_label) == 0) {
-            return true;
-        }
-        return false;
+        return follow_is_tracked_ac(ac);
     }
     return aircraft_below_ceiling(ac, s_max_alt);
 }
@@ -1969,7 +1994,7 @@ static void update_follow_from_traffic() {
             break;
         }
         if (!hit && s_follow_label[0] && s_ac[i].flight[0] &&
-            strcasecmp(s_ac[i].flight, s_follow_label) == 0) {
+            follow_flight_matches(s_ac[i].flight, s_follow_label)) {
             hit = &s_ac[i];
             // keep scanning in case a hex match appears later in the list
         }
@@ -3310,7 +3335,7 @@ static void center_on_airport(lv_event_t *e) {
  * toggle_if_same: true = Follow/Unfollow button (tap same plane ends track);
  *                 false = radar/table/Track (tap same plane is ignored — keeps tracking).
  */
-static void start_follow_aircraft(const Aircraft *ac, bool toggle_if_same) {
+static void start_follow_aircraft(const Aircraft *ac, bool toggle_if_same, bool fetch_info = true) {
     if (!g_state || !ac || (!ac->hex[0] && !ac->flight[0]) || !ac->valid) {
         return;
     }
@@ -3420,7 +3445,8 @@ static void start_follow_aircraft(const Aircraft *ac, bool toggle_if_same) {
     }
     map_cache_ensure(kRadarPlot, kRadarPlot, s_olat, s_olon, s_range);
 
-    if (ac->flight[0] || ac->reg[0] || ac->hex[0]) {
+    // Skip when Track/board already loaded schedule+FA (duplicate fetch blocks ADS-B/graph).
+    if (fetch_info && (ac->flight[0] || ac->reg[0] || ac->hex[0])) {
         xSemaphoreTake(g_state->mutex, portMAX_DELAY);
         strncpy(g_state->pending_flight, ac->flight, sizeof(g_state->pending_flight) - 1);
         g_state->pending_flight[sizeof(g_state->pending_flight) - 1] = 0;
@@ -3520,13 +3546,18 @@ static void radar_draw(lv_event_t *e) {
         bool have = false;
         for (int i = 0; i < s_trail_count; i++) {
             const TrailPt &pt = s_trail[(oldest + i) % kTrailMax];
-            lv_coord_t x, y;
-            if (!map_point_ll(pt.lat, pt.lon, s_olat, s_olon, s_range, w, h, &x, &y)) {
-                have = false;
-                continue;
+            // Clamp to rim (same as waypoints) so route-fit zoom doesn't erase the trail.
+            float east = 0, north = 0;
+            ll_to_nm(pt.lat, pt.lon, s_olat, s_olon, &east, &north);
+            float ex = (s_range > 0.1f) ? (east / s_range) : 0.0f;
+            float ny = (s_range > 0.1f) ? (-north / s_range) : 0.0f;
+            const float len = hypotf(ex, ny);
+            if (len > 1.02f && len > 1e-4f) {
+                ex /= len;
+                ny /= len;
             }
-            x += coords.x1;
-            y += coords.y1;
+            const lv_coord_t x = (lv_coord_t)lroundf((float)cx + ex * (float)R);
+            const lv_coord_t y = (lv_coord_t)lroundf((float)cy + ny * (float)R);
             if (have) {
                 lv_point_t a = {px, py};
                 lv_point_t b = {x, y};
@@ -3940,17 +3971,34 @@ static void radar_draw(lv_event_t *e) {
             lab.flag = LV_TEXT_FLAG_NONE;
         }
     }
-    for (int i = 0; i < s_ac_n; i++) {
-        const Aircraft *ac = &s_ac[i];
-        if (!aircraft_shown(ac)) {
-            continue;
+    // Project a follow target onto the PPI (clamp to rim so route-fit zoom can't hide it).
+    auto project_follow_ac = [&](float lat, float lon, lv_coord_t *ox, lv_coord_t *oy) {
+        float east = 0, north = 0;
+        ll_to_nm(lat, lon, s_olat, s_olon, &east, &north);
+        float ex = (s_range > 0.1f) ? (east / s_range) : 0.0f;
+        float ny = (s_range > 0.1f) ? (-north / s_range) : 0.0f;
+        const float len = hypotf(ex, ny);
+        if (len > 1.02f && len > 1e-4f) {
+            ex /= len;
+            ny /= len;
+        }
+        *ox = (lv_coord_t)lroundf((float)cx + ex * (float)R);
+        *oy = (lv_coord_t)lroundf((float)cy + ny * (float)R);
+    };
+
+    auto draw_one_ac = [&](const Aircraft *ac, bool clamp_rim) {
+        if (!ac || !ac->valid) {
+            return;
         }
         lv_coord_t x, y;
-        if (!map_point_ll(ac->lat, ac->lon, s_olat, s_olon, s_range, w, h, &x, &y)) {
-            continue;
+        if (clamp_rim) {
+            project_follow_ac(ac->lat, ac->lon, &x, &y);
+        } else if (!map_point_ll(ac->lat, ac->lon, s_olat, s_olon, s_range, w, h, &x, &y)) {
+            return;
+        } else {
+            x += coords.x1;
+            y += coords.y1;
         }
-        x += coords.x1;
-        y += coords.y1;
         if (aircraft_is_helicopter(ac)) {
             draw_helicopter_icon(ctx, x, y, ac->track_deg, COL_AC);
         } else {
@@ -3960,6 +4008,24 @@ static void radar_draw(lv_event_t *e) {
         lv_area_t ta = {(lv_coord_t)(x + 10), (lv_coord_t)(y - 6), (lv_coord_t)(x + 90), (lv_coord_t)(y + 12)};
         lab.color = COL_AC;
         lv_draw_label(ctx, &lab, &ta, id, nullptr);
+    };
+
+    // Always paint the followed aircraft from its last fix — traffic s_ac[] is often
+    // empty while Track is still downloading FS/FA, and solo ADS-B can lag after TLS thrash.
+    bool drew_follow = false;
+    if (s_follow && s_follow_ac_ok && s_follow_ac.valid) {
+        draw_one_ac(&s_follow_ac, true);
+        drew_follow = true;
+    }
+    for (int i = 0; i < s_ac_n; i++) {
+        const Aircraft *ac = &s_ac[i];
+        if (!aircraft_shown(ac)) {
+            continue;
+        }
+        if (drew_follow && follow_is_tracked_ac(ac)) {
+            continue;  // already drawn from s_follow_ac
+        }
+        draw_one_ac(ac, false);
     }
 }
 
@@ -6815,7 +6881,7 @@ static void board_table_clicked(lv_event_t *e) {
         g_state->flight_info = fi;
         xSemaphoreGive(g_state->mutex);
     }
-    start_follow_aircraft(&ac, false);
+    start_follow_aircraft(&ac, false, false);  // track_start_query enriches; don't dual-fetch FA
     merge_follow_fi(fi);
     refresh_follow_panel();
 
@@ -10688,7 +10754,7 @@ void ui_notify_track_result(bool ok, const char *msg) {
     s_detail_ac = ac;
     s_detail_is_aircraft = true;
     s_flight_info = fi;
-    start_follow_aircraft(&ac, false);
+    start_follow_aircraft(&ac, false, false);  // caller already fetched FS/FA via track
     // start_follow may clear fi; restore tracked schedule (airports/gates/times).
     merge_follow_fi(fi);
     follow_try_seed_hist_from_state();

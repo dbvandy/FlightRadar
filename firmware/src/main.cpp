@@ -1139,7 +1139,11 @@ static void handle_track_flight() {
     }
 
     net_end_psram_safe();
-    ui_set_status(fi.schedule_ok ? "Schedule ready" : (track_n > 0 || fi.route_wpt_n > 0 ? "Route loaded" : "Tracking"));
+    // Drop any FETCH_FLIGHT_INFO queued by start_follow — we already loaded FS+FA.
+    // Otherwise the net task re-scrapes for a minute and ADS-B/graph freeze on "Schedule ready".
+    __sync_fetch_and_and((uint32_t *)&g_state.requests, ~UI_REQ_FETCH_FLIGHT_INFO);
+    __sync_fetch_and_or((uint32_t *)&g_state.requests, UI_REQ_REFRESH_TRAFFIC);
+    ui_set_status(fi.schedule_ok ? "Tracking" : (track_n > 0 || fi.route_wpt_n > 0 ? "Route loaded" : "Tracking"));
 }
 
 static void net_task(void *arg) {
@@ -1202,7 +1206,15 @@ static void net_task(void *arg) {
             handle_track_flight();
         }
         if (req & UI_REQ_FETCH_FLIGHT_INFO) {
-            handle_flight_info();
+            // Track/board already filled schedule — don't block live ADS-B on a second FA scrape.
+            bool skip = false;
+            xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+            skip = g_state.follow_active && g_state.flight_info.schedule_ok &&
+                   (g_state.flight_info.route_wpt_n > 0 || g_state.flight_track_n > 0);
+            xSemaphoreGive(g_state.mutex);
+            if (!skip) {
+                handle_flight_info();
+            }
         }
         if (req & UI_REQ_SEARCH_AIRPORTS) {
             handle_search_airports();
