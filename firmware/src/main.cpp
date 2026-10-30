@@ -940,8 +940,20 @@ static void handle_track_flight() {
     FlightInfo fi{};
     cpy(fi.flight, sizeof(fi.flight), icao_cs[0] ? icao_cs : query);
 
+    char sched_key[16];
+    if (iata_al[0] && iata_num[0]) {
+        snprintf(sched_key, sizeof(sched_key), "%s%s", iata_al, iata_num);
+    } else {
+        cpy(sched_key, sizeof(sched_key), icao_cs);
+    }
+
     net_begin_psram_safe();
-    // Live ADS-B position by ICAO callsign (and IATA form as fallback).
+    // After FA board / plan thrash, settle TLS before the first track HTTPS.
+    net_tls_reset();
+    delay(350);
+
+    // Live ADS-B position FIRST — publish immediately so Track isn't stuck behind
+    // FlightStats / FlightAware (common hang after airport board).
     int n = -1;
     if (icao_cs[0]) {
         n = net_fetch_aircraft_by_callsign(icao_cs, &ac);
@@ -954,16 +966,60 @@ static void handle_track_flight() {
             cpy(icao_cs, sizeof(icao_cs), iata_cs);
         }
     }
-    // Schedule / gate / times from FlightStats (most current sortie).
-    char sched_key[16];
-    if (iata_al[0] && iata_num[0]) {
-        snprintf(sched_key, sizeof(sched_key), "%s%s", iata_al, iata_num);
-    } else {
-        cpy(sched_key, sizeof(sched_key), icao_cs);
+
+    bool published = false;
+    auto publish_track = [&](const char *msg) {
+        if (!ac.flight[0] && icao_cs[0]) {
+            cpy(ac.flight, sizeof(ac.flight), icao_cs);
+        }
+        if (!fi.flight[0]) {
+            cpy(fi.flight, sizeof(fi.flight), ac.flight[0] ? ac.flight : icao_cs);
+        }
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        g_state.tracked_ac = ac;
+        g_state.tracked_ok = true;
+        g_state.flight_info = fi;
+        if (!published) {
+            g_state.flight_track_n = 0;
+        }
+        xSemaphoreGive(g_state.mutex);
+        ui_notify_track_result(true, msg);
+        ui_notify_flight_info();
+        published = true;
+    };
+
+    if (n > 0) {
+        // Airborne / ADS-B hit — open follow now; route + schedule fill in after.
+        publish_track("Tracking");
     }
+
+    auto push_fi = [&]() {
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        g_state.flight_info = fi;
+        if (ac.hex[0]) {
+            g_state.tracked_ac = ac;
+        }
+        xSemaphoreGive(g_state.mutex);
+        ui_notify_flight_info();
+    };
+
+    // FlightStats next — gates/times used to be near-instant; do not wait on FA.
     ui_set_status("Flight stats...");
+    net_tls_reset();
+    delay(300);
     net_fetch_flight_schedule(sched_key, &fi);
-    // Only fill missing endpoints — net_fetch_route clears its buffers and must not wipe FlightStats.
+    if (fi.origin[0] || fi.dest[0]) {
+        fi.route_ok = fi.origin[0] && fi.dest[0];
+        if (!fi.origin_name[0] || !fi.dest_name[0]) {
+            net_fetch_airport_names(fi.origin, fi.dest, fi.origin_name, sizeof(fi.origin_name), fi.dest_name,
+                                    sizeof(fi.dest_name));
+        }
+    }
+    if (published) {
+        push_fi();  // clear "FlightStats pending..." before FA
+    }
+
+    // HexDB OD only if FS left gaps.
     if ((!fi.origin[0] || !fi.dest[0]) && icao_cs[0]) {
         char o[8] = {0}, d[8] = {0};
         if (net_fetch_route(icao_cs, o, sizeof(o), d, sizeof(d))) {
@@ -973,19 +1029,20 @@ static void handle_track_flight() {
             if (!fi.dest[0] && d[0]) {
                 cpy(fi.dest, sizeof(fi.dest), d);
             }
-            if (fi.origin[0] && fi.dest[0]) {
-                fi.route_ok = true;
-            }
         }
     }
-    if (fi.origin[0] || fi.dest[0]) {
-        fi.route_ok = fi.origin[0] && fi.dest[0];
+    if (fi.origin[0] && fi.dest[0]) {
+        fi.route_ok = true;
         if (!fi.origin_name[0] || !fi.dest_name[0]) {
             net_fetch_airport_names(fi.origin, fi.dest, fi.origin_name, sizeof(fi.origin_name), fi.dest_name,
                                     sizeof(fi.dest_name));
         }
+        if (published) {
+            push_fi();
+        }
     }
-    if (n > 0 && ac.hex[0]) {
+
+    if (n > 0 && ac.hex[0] && !fi.meta_ok) {
         char meta_reg[12] = {0};
         fi.meta_ok = net_fetch_aircraft_meta(ac.hex, fi.manufacturer, sizeof(fi.manufacturer), fi.type_name,
                                              sizeof(fi.type_name), fi.owner, sizeof(fi.owner), meta_reg,
@@ -1019,7 +1076,6 @@ static void handle_track_flight() {
             ground.gs_kts = 0;
             ground.vrate_fpm = 0;
             ground.valid = true;
-            // No ICAO24 yet — follow by callsign until airborne ADS-B appears.
             if (n <= 0) {
                 ground.hex[0] = 0;
             }
@@ -1043,53 +1099,47 @@ static void handle_track_flight() {
         return;
     }
 
-    if (!ac.flight[0] && icao_cs[0]) {
-        cpy(ac.flight, sizeof(ac.flight), icao_cs);
-    }
-    cpy(fi.flight, sizeof(fi.flight), ac.flight[0] ? ac.flight : icao_cs);
-
-    // Publish track ASAP so the UI is not stuck during the large FA HTML download.
-    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
-    g_state.tracked_ac = ac;
-    g_state.tracked_ok = true;
-    g_state.flight_info = fi;
-    g_state.flight_track_n = 0;
-    xSemaphoreGive(g_state.mutex);
-    if (fi.schedule_ok && !fi.departed) {
-        char msg[64];
-        if (fi.status[0]) {
-            snprintf(msg, sizeof(msg), "%s @ %s", fi.status, fi.origin[0] ? fi.origin : "origin");
+    if (!published) {
+        if (fi.schedule_ok && !fi.departed) {
+            char msg[64];
+            if (fi.status[0]) {
+                snprintf(msg, sizeof(msg), "%s @ %s", fi.status, fi.origin[0] ? fi.origin : "origin");
+            } else {
+                snprintf(msg, sizeof(msg), "At %s (not departed)", fi.origin[0] ? fi.origin : "origin");
+            }
+            publish_track(msg);
         } else {
-            snprintf(msg, sizeof(msg), "At %s (not departed)", fi.origin[0] ? fi.origin : "origin");
+            publish_track("Tracking");
         }
-        ui_notify_track_result(true, msg);
     } else {
-        ui_notify_track_result(true, "Tracking");
+        push_fi();
     }
-    ui_notify_flight_info();
 
-    // Filed IFR waypoints + historical alt/gs track (FlightAware) — after UI is live.
+    // FlightAware route + alt/gs history last (can thrash TLS / take a while).
     static FlightTrackPt s_fa_track2[FR_MAX_TRACK_PTS];
     int track_n = 0;
     if (icao_cs[0] || (iata_al[0] && iata_num[0])) {
         ui_set_status("Loading route…");
+        net_tls_reset();
+        delay(400);
         const char *plan_key = icao_cs[0] ? icao_cs : sched_key;
         net_fetch_flight_plan(plan_key, &fi, s_fa_track2, FR_MAX_TRACK_PTS, &track_n);
-    }
-    net_end_psram_safe();
-
-    xSemaphoreTake(g_state.mutex, portMAX_DELAY);
-    g_state.flight_info = fi;
-    if (track_n > 0) {
-        const int ncopy = (track_n > FR_MAX_TRACK_PTS) ? FR_MAX_TRACK_PTS : track_n;
-        memcpy(g_state.flight_track, s_fa_track2, sizeof(FlightTrackPt) * (size_t)ncopy);
-        g_state.flight_track_n = ncopy;
-    }
-    xSemaphoreGive(g_state.mutex);
-    if (track_n > 0 || fi.route_wpt_n > 0) {
+        xSemaphoreTake(g_state.mutex, portMAX_DELAY);
+        g_state.flight_info = fi;
+        if (track_n > 0) {
+            const int ncopy = (track_n > FR_MAX_TRACK_PTS) ? FR_MAX_TRACK_PTS : track_n;
+            memcpy(g_state.flight_track, s_fa_track2, sizeof(FlightTrackPt) * (size_t)ncopy);
+            g_state.flight_track_n = ncopy;
+        }
+        xSemaphoreGive(g_state.mutex);
         ui_notify_flight_info();
-        ui_set_status("Route loaded");
+        if (track_n > 0 || fi.route_wpt_n > 0) {
+            ui_set_status("Route loaded");
+        }
     }
+
+    net_end_psram_safe();
+    ui_set_status(fi.schedule_ok ? "Schedule ready" : (track_n > 0 || fi.route_wpt_n > 0 ? "Route loaded" : "Tracking"));
 }
 
 static void net_task(void *arg) {

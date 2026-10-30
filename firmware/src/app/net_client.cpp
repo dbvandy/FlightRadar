@@ -2893,7 +2893,8 @@ bool net_fetch_flight_schedule(const char *flight_num, FlightInfo *fi) {
     status_msg("FlightStats lookup...");
     char url[192];
     snprintf(url, sizeof(url), "https://www.flightstats.com/v2/flight-tracker/%s/%s", iata_al, iata_num);
-    if (!https_get(url, nullptr, kUaBrowser, 8000, 20000)) {
+    // force_close: don't leave a sticky session that stalls the next host (FA).
+    if (!https_get(url, nullptr, kUaBrowser, 8000, 20000, nullptr, true)) {
         return false;
     }
     size_t blen = 0;
@@ -2917,7 +2918,7 @@ bool net_fetch_flight_schedule(const char *flight_num, FlightInfo *fi) {
     if (fs_pick_current_url(doc.as<JsonObjectConst>(), better, sizeof(better))) {
         Serial.printf("FlightStats: refetch current %s\n", better);
         status_msg("FlightStats current...");
-        if (https_get(better, nullptr, kUaBrowser, 8000, 20000)) {
+        if (https_get(better, nullptr, kUaBrowser, 8000, 20000, nullptr, true)) {
             blen = 0;
             if (http_body_buf(&blen) && blen > 500) {
                 tracker_json = extract_flightstats_tracker(g_http_buf);
@@ -2929,6 +2930,8 @@ bool net_fetch_flight_schedule(const char *flight_num, FlightInfo *fi) {
                     }
                 }
             }
+        } else {
+            Serial.println("FlightStats: current refetch failed; using default page");
         }
     }
 

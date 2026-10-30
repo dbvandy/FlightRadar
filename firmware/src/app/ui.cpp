@@ -10331,9 +10331,26 @@ void ui_notify_flight_info() {
     xSemaphoreGive(g_state->mutex);
 
     lvgl_port_lock(-1);
+    // Match ICAO or IATA forms (DAL3161 vs DL3161) so schedule/route updates apply.
+    auto flight_matches = [](const char *a, const char *b) -> bool {
+        if (!a || !b || !a[0] || !b[0]) {
+            return false;
+        }
+        if (strcasecmp(a, b) == 0) {
+            return true;
+        }
+        char a_icao[16] = {0}, b_icao[16] = {0}, al[4], num[8];
+        if (!net_parse_flight_number(a, a_icao, sizeof(a_icao), al, sizeof(al), num, sizeof(num))) {
+            return false;
+        }
+        if (!net_parse_flight_number(b, b_icao, sizeof(b_icao), al, sizeof(al), num, sizeof(num))) {
+            return false;
+        }
+        return a_icao[0] && b_icao[0] && strcasecmp(a_icao, b_icao) == 0;
+    };
     if (s_follow && ((fi.hex[0] && strcasecmp(fi.hex, s_follow_hex) == 0) ||
-                     (fi.flight[0] && strcasecmp(fi.flight, s_follow_label) == 0) ||
-                     (fi.flight[0] && s_follow_ac_ok && strcasecmp(fi.flight, s_follow_ac.flight) == 0))) {
+                     (fi.flight[0] && flight_matches(fi.flight, s_follow_label)) ||
+                     (fi.flight[0] && s_follow_ac_ok && flight_matches(fi.flight, s_follow_ac.flight)))) {
         merge_follow_fi(fi);
         if (fi.reg[0] && s_follow_ac_ok && !s_follow_ac.reg[0]) {
             strncpy(s_follow_ac.reg, fi.reg, sizeof(s_follow_ac.reg) - 1);
