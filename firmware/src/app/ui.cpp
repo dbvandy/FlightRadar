@@ -7309,7 +7309,7 @@ static void board_load_icao(const char *icao) {
     g_state->pending_board_icao[sizeof(g_state->pending_board_icao) - 1] = 0;
     xSemaphoreGive(g_state->mutex);
     if (board_status) {
-        lv_label_set_text(board_status, "Loading live board...");
+        lv_label_set_text(board_status, "Loading FlightAware board...");
     }
     if (board_title_lbl) {
         char t[64];

@@ -91,7 +91,7 @@ bool net_build_airport_board_from_traffic(const char *icao, const Aircraft *ac, 
                                           AirportBoardRow *dep, int dep_max, int *dep_n, char *label,
                                           size_t label_len, float *out_lat = nullptr,
                                           float *out_lon = nullptr);
-/** Arrivals/departures from live ADS-B within 40 nm. No FlightAware page. */
+/** Arrivals/departures scraped from flightaware.com/live/airport/{ICAO}. */
 bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max, int *arr_n,
                              AirportBoardRow *dep, int dep_max, int *dep_n, char *label, size_t label_len,
                              float *out_lat = nullptr, float *out_lon = nullptr);

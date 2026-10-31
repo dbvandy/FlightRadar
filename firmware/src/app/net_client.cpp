@@ -4915,11 +4915,11 @@ static void board_fmt_local_hm(char *out, size_t out_len, float apt_lat, float a
     if (now < 1700000000) {
         return;
     }
-    if (hours_ahead < 0.0f) {
-        hours_ahead = 0.0f;
+    if (hours_ahead < -20.0f) {
+        hours_ahead = -20.0f;
     }
-    if (hours_ahead > 48.0f) {
-        hours_ahead = 48.0f;
+    if (hours_ahead > 20.0f) {
+        hours_ahead = 20.0f;
     }
     time_t when = now + (time_t)lroundf(hours_ahead * 3600.0f);
     when += (time_t)net_tz_offset_for_ll(apt_lat, apt_lon, when);
@@ -4928,40 +4928,200 @@ static void board_fmt_local_hm(char *out, size_t out_len, float apt_lat, float a
     snprintf(out, out_len, "%02d:%02d", t.tm_hour, t.tm_min);
 }
 
-static bool board_nearest_apt(float lat, float lon, const char *skip, float max_nm, char *icao,
-                               size_t icao_len) {
-    if (!icao || icao_len == 0 || !kAptDb || K_APT_DB_COUNT == 0 || max_nm <= 0.0f) {
+struct BoardLeg {
+    char orig[8];
+    char dest[8];
+    char orig_city[36];
+    char dest_city[36];
+    float olat;
+    float olon;
+    float dlat;
+    float dlon;
+    bool have_o;
+    bool have_d;
+};
+
+static float board_nm_between(float lat1, float lon1, float lat2, float lon2) {
+    float east = 0, north = 0;
+    ll_to_nm(lat1, lon1, lat2, lon2, &east, &north);
+    return sqrtf(east * east + north * north);
+}
+
+static void board_leg_coords(const char *icao, float lat, float lon, float *out_lat, float *out_lon, bool *have) {
+    if (lat != 0.0f || lon != 0.0f) {
+        *out_lat = lat;
+        *out_lon = lon;
+        *have = true;
+        return;
+    }
+    float alat = 0, alon = 0;
+    if (icao && icao[0] && net_lookup_airport(icao, &alat, &alon, nullptr, nullptr)) {
+        *out_lat = alat;
+        *out_lon = alon;
+        *have = true;
+        return;
+    }
+    *have = false;
+}
+
+/** Origin, destination, and city from adsb.lol. A missing callsign is not a dead host. */
+static bool board_fetch_leg(const char *callsign, BoardLeg *leg) {
+    if (!leg) {
         return false;
     }
-    icao[0] = 0;
-    const float coslat = cosf(lat * 0.0174532925f);
-    const float c = (coslat < 0.2f) ? 0.2f : coslat;
-    float best2 = max_nm * max_nm;
-    const char *best = nullptr;
-    const int pad = (int)lroundf(max_nm / 0.6f) + 3;
-    const int lat0 = (int)lroundf(lat * 100.0f);
-    const int lon0 = (int)lroundf(lon * 100.0f);
-    for (size_t i = 0; i < K_APT_DB_COUNT; i++) {
-        const AptRec &a = kAptDb[i];
-        if (abs((int)a.lat_c - lat0) > pad || abs((int)a.lon_c - lon0) > pad) {
-            continue;
-        }
-        if (skip && skip[0] && strcasecmp(a.icao, skip) == 0) {
-            continue;
-        }
-        const float dlat = (a.lat_c / 100.0f - lat) * 60.0f;
-        const float dlon = (a.lon_c / 100.0f - lon) * 60.0f * c;
-        const float d2 = dlat * dlat + dlon * dlon;
-        if (d2 < best2) {
-            best2 = d2;
-            best = a.icao;
-        }
-    }
-    if (!best || !best[0]) {
+    memset(leg, 0, sizeof(*leg));
+    if (!callsign || !callsign[0]) {
         return false;
     }
-    copy_trunc(icao, icao_len, best);
+    char cs[16];
+    copy_trunc(cs, sizeof(cs), callsign);
+    for (char *p = cs; *p; p++) {
+        if (*p == ' ') {
+            *p = 0;
+            break;
+        }
+        *p = (char)toupper((unsigned char)*p);
+    }
+    if (!cs[0]) {
+        return false;
+    }
+    char enc[24];
+    url_encode(cs, enc, sizeof(enc));
+    char url[96];
+    snprintf(url, sizeof(url), "https://api.adsb.lol/api/0/route/%s", enc);
+    const bool got = https_get(url, nullptr, kUa, 6000, 8000, "application/json", false);
+    if (!got) {
+        if (strncmp(g_last_err, "HTTP status 4", 13) == 0) {
+            NetHostGate *g = host_gate("api.adsb.lol");
+            if (g) {
+                if (g->fails > 0) {
+                    g->fails--;
+                }
+                g->cool_until = 0;
+            }
+            if (s_net_fail_streak > 0) {
+                s_net_fail_streak--;
+            }
+        }
+        char origin[8] = {0}, dest[8] = {0};
+        if (!net_fetch_route(cs, origin, sizeof(origin), dest, sizeof(dest))) {
+            return false;
+        }
+        copy_trunc(leg->orig, sizeof(leg->orig), origin);
+        copy_trunc(leg->dest, sizeof(leg->dest), dest);
+    } else {
+        size_t blen = 0;
+        const char *body = http_body_buf(&blen);
+        if (!body || blen < 8) {
+            return false;
+        }
+        JsonDocument doc;
+        if (deserializeJson(doc, body, blen)) {
+            return false;
+        }
+        char codes[24];
+        copy_trunc(codes, sizeof(codes), doc["airport_codes"] | "");
+        char *dash = strchr(codes, '-');
+        if (dash && dash != codes && dash[1]) {
+            *dash = 0;
+            copy_trunc(leg->orig, sizeof(leg->orig), codes);
+            copy_trunc(leg->dest, sizeof(leg->dest), dash + 1);
+        }
+        JsonArray ap = doc["_airports"].as<JsonArray>();
+        if (!ap.isNull() && ap.size() >= 2) {
+            JsonObjectConst a0 = ap[0];
+            JsonObjectConst a1 = ap[1];
+            const char *o = a0["icao"] | "";
+            const char *d = a1["icao"] | "";
+            if (o[0]) {
+                copy_trunc(leg->orig, sizeof(leg->orig), o);
+            }
+            if (d[0]) {
+                copy_trunc(leg->dest, sizeof(leg->dest), d);
+            }
+            copy_trunc(leg->orig_city, sizeof(leg->orig_city), a0["location"] | "");
+            copy_trunc(leg->dest_city, sizeof(leg->dest_city), a1["location"] | "");
+            board_leg_coords(leg->orig, a0["lat"] | 0.0f, a0["lon"] | 0.0f, &leg->olat, &leg->olon, &leg->have_o);
+            board_leg_coords(leg->dest, a1["lat"] | 0.0f, a1["lon"] | 0.0f, &leg->dlat, &leg->dlon, &leg->have_d);
+        }
+    }
+    if (!leg->orig[0] || !leg->dest[0]) {
+        return false;
+    }
+    for (char *p = leg->orig; *p; p++) {
+        *p = (char)toupper((unsigned char)*p);
+    }
+    for (char *p = leg->dest; *p; p++) {
+        *p = (char)toupper((unsigned char)*p);
+    }
+    if (!leg->have_o) {
+        board_leg_coords(leg->orig, 0, 0, &leg->olat, &leg->olon, &leg->have_o);
+    }
+    if (!leg->have_d) {
+        board_leg_coords(leg->dest, 0, 0, &leg->dlat, &leg->dlon, &leg->have_d);
+    }
     return true;
+}
+
+static void board_apply_leg(AirportBoardRow *row, bool inbound, const char *board, float apt_lat, float apt_lon,
+                            const Aircraft &ac, float dst_nm) {
+    if (!row || !row->flight[0]) {
+        return;
+    }
+    BoardLeg leg;
+    if (!board_fetch_leg(row->flight, &leg)) {
+        row->other_apt[0] = 0;
+        row->other_name[0] = 0;
+        return;
+    }
+    const char *code = inbound ? leg.orig : leg.dest;
+    const char *city = inbound ? leg.orig_city : leg.dest_city;
+    if (apt_codes_match(code, board)) {
+        code = inbound ? leg.dest : leg.orig;
+        city = inbound ? leg.dest_city : leg.orig_city;
+    }
+    if (code && code[0] && !apt_codes_match(code, board)) {
+        copy_trunc(row->other_apt, sizeof(row->other_apt), code);
+        if (city && city[0]) {
+            copy_trunc(row->other_name, sizeof(row->other_name), city);
+        }
+    }
+    if (ac.gs_kts < 80.0f) {
+        return;
+    }
+    const float gs = ac.gs_kts;
+    float flown = dst_nm;
+    if (leg.have_o) {
+        flown = board_nm_between(leg.olat, leg.olon, ac.lat, ac.lon);
+    }
+    float remain = inbound ? dst_nm : 0.0f;
+    if (!inbound && leg.have_d) {
+        remain = board_nm_between(ac.lat, ac.lon, leg.dlat, leg.dlon);
+    }
+    const time_t now = time(nullptr);
+    if (flown > 1.0f && flown < 8000.0f) {
+        const float hours = -(flown / gs);
+        const float tlat = leg.have_o ? leg.olat : apt_lat;
+        const float tlon = leg.have_o ? leg.olon : apt_lon;
+        board_fmt_local_hm(row->dep_est, sizeof(row->dep_est), tlat, tlon, hours);
+        if (now > 1700000000) {
+            row->dep_epoch = (uint32_t)(now + (time_t)lroundf(hours * 3600.0f));
+        }
+    }
+    if (remain > 0.3f && remain < 8000.0f) {
+        const float hours = remain / gs;
+        float tlat = apt_lat;
+        float tlon = apt_lon;
+        if (!inbound && leg.have_d) {
+            tlat = leg.dlat;
+            tlon = leg.dlon;
+        }
+        board_fmt_local_hm(row->arr_est, sizeof(row->arr_est), tlat, tlon, hours);
+        if (now > 1700000000) {
+            row->arr_epoch = (uint32_t)(now + (time_t)lroundf(hours * 3600.0f));
+        }
+    }
+    Serial.printf("board %s %s-%s dep=%s arr=%s\n", row->flight, leg.orig, leg.dest, row->dep_est, row->arr_est);
 }
 
 static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_lon, const Aircraft *acs,
@@ -4997,23 +5157,6 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
             }
         }
         copy_trunc(row->type, sizeof(row->type), ac.type);
-        const float ray = inbound ? ac.track_deg + 180.0f : ac.track_deg;
-        const float rad = ray * 0.0174532925f;
-        const float ahead = dst_nm < 15.0f ? 50.0f : dst_nm;
-        const float east_nm = sinf(rad) * ahead;
-        const float north_nm = cosf(rad) * ahead;
-        const float plat = ac.lat + north_nm / 60.0f;
-        const float clat = cosf(ac.lat * 0.0174532925f);
-        const float plon = ac.lon + east_nm / (60.0f * ((clat < 0.2f) ? 0.2f : clat));
-        char other[8] = {0};
-        if (board_nearest_apt(plat, plon, code, 40.0f, other, sizeof(other))) {
-            copy_trunc(row->other_apt, sizeof(row->other_apt), other);
-        } else {
-            snprintf(row->other_name, sizeof(row->other_name), "%d nm", (int)lroundf(dst_nm));
-        }
-        if (inbound && ac.gs_kts > 40.0f) {
-            board_fmt_local_hm(row->arr_est, sizeof(row->arr_est), apt_lat, apt_lon, dst_nm / ac.gs_kts);
-        }
         int pct = inbound ? (int)lroundf(100.0f - dst_nm * 2.5f) : (int)lroundf(dst_nm * 2.5f);
         if (pct < 0) {
             pct = 0;
@@ -5069,21 +5212,44 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
     }
 
     int na = 0, nd = 0;
+    int arr_idx[FR_MAX_BOARD_ROWS];
+    int dep_idx[FR_MAX_BOARD_ROWS];
+    float arr_dst[FR_MAX_BOARD_ROWS];
+    float dep_dst[FR_MAX_BOARD_ROWS];
     for (int k = 0; k < nc; k++) {
         const Aircraft &ac = acs[cands[k].idx];
         if (cands[k].inbound) {
             if (na < arr_max && na < FR_MAX_BOARD_ROWS) {
                 fill_row(&arr[na], ac, cands[k].dst, true);
                 if (arr[na].valid) {
+                    arr_idx[na] = cands[k].idx;
+                    arr_dst[na] = cands[k].dst;
                     na++;
                 }
             }
         } else if (nd < dep_max && nd < FR_MAX_BOARD_ROWS) {
             fill_row(&dep[nd], ac, cands[k].dst, false);
             if (dep[nd].valid) {
+                dep_idx[nd] = cands[k].idx;
+                dep_dst[nd] = cands[k].dst;
                 nd++;
             }
         }
+    }
+
+    const int nroute = na + nd;
+    int step = 0;
+    for (int i = 0; i < na && !s_net_abort; i++) {
+        char st[40];
+        snprintf(st, sizeof(st), "Route %d/%d", ++step, nroute);
+        status_msg(st);
+        board_apply_leg(&arr[i], true, code, apt_lat, apt_lon, acs[arr_idx[i]], arr_dst[i]);
+    }
+    for (int i = 0; i < nd && !s_net_abort; i++) {
+        char st[40];
+        snprintf(st, sizeof(st), "Route %d/%d", ++step, nroute);
+        status_msg(st);
+        board_apply_leg(&dep[i], false, code, apt_lat, apt_lon, acs[dep_idx[i]], dep_dst[i]);
     }
 
     if (arr_n) {
@@ -5141,6 +5307,267 @@ bool net_build_airport_board_from_traffic(const char *icao, const Aircraft *ac, 
         return false;
     }
     return true;
+}
+
+static bool fa_live_board_ready(const char *buf, size_t len) {
+    // Stop once Departures and En Route are both on the wire and the next
+    // table has started, so the enroute rows are complete.
+    if (!buf || len < 8000) {
+        return false;
+    }
+    if (!strstr(buf, "id=\"departures-board\"") || !strstr(buf, "id=\"enroute-board\"")) {
+        return false;
+    }
+    return strstr(buf, "id=\"scheduled-board\"") != nullptr;
+}
+
+static void fa_copy_plain(const char *in, const char *end, char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return;
+    }
+    size_t o = 0;
+    bool tag = false;
+    for (const char *p = in ? in : ""; p < end && *p && o + 1 < out_len; p++) {
+        if (*p == '<') {
+            tag = true;
+            continue;
+        }
+        if (*p == '>') {
+            tag = false;
+            continue;
+        }
+        if (tag) {
+            continue;
+        }
+        if (strncmp(p, "&nbsp;", 6) == 0) {
+            out[o++] = ' ';
+            p += 5;
+            continue;
+        }
+        if (strncmp(p, "&amp;", 5) == 0) {
+            out[o++] = '&';
+            p += 4;
+            continue;
+        }
+        out[o++] = *p;
+    }
+    out[o] = 0;
+    trim_inplace(out);
+}
+
+static void fa_place_name(const char *title, char *name, size_t name_len) {
+    if (!name || name_len == 0) {
+        return;
+    }
+    name[0] = 0;
+    if (!title || !title[0]) {
+        return;
+    }
+    const char *lp = strchr(title, '(');
+    const char *rp = lp ? strchr(lp, ')') : nullptr;
+    if (lp && rp && rp > lp + 1) {
+        size_t n = (size_t)(rp - (lp + 1));
+        if (n >= name_len) {
+            n = name_len - 1;
+        }
+        memcpy(name, lp + 1, n);
+        name[n] = 0;
+        trim_inplace(name);
+        return;
+    }
+    char buf[80];
+    copy_trunc(buf, sizeof(buf), title);
+    char *dash = strstr(buf, " - ");
+    if (dash) {
+        *dash = 0;
+    }
+    trim_inplace(buf);
+    copy_trunc(name, name_len, buf);
+}
+
+static void fa_cell_clock(const char *cell, const char *cell_end, char *out, size_t out_len, bool *estimated) {
+    if (estimated) {
+        *estimated = false;
+    }
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = 0;
+    if (!cell || !cell_end || cell >= cell_end) {
+        return;
+    }
+    const char *italic = strstr(cell, "<i>");
+    if (estimated && italic && italic < cell_end) {
+        *estimated = true;
+    }
+    char plain[48];
+    fa_copy_plain(cell, cell_end, plain, sizeof(plain));
+    char *sp = strchr(plain, ' ');
+    if (sp) {
+        *sp = 0;
+    }
+    if (strchr(plain, ':')) {
+        copy_trunc(out, out_len, plain);
+    }
+}
+
+/** One FlightAware airportBoard table. Columns are Ident, Type, From/To, Depart, progress, Arrive. */
+static int fa_parse_live_board(const char *html, const char *board_id, AirportBoardRow *out, int out_max) {
+    if (!html || !board_id || !out || out_max <= 0) {
+        return 0;
+    }
+    char needle[40];
+    snprintf(needle, sizeof(needle), "id=\"%s\"", board_id);
+    const char *sec = strstr(html, needle);
+    if (!sec) {
+        return 0;
+    }
+    sec += strlen(needle);
+    const char *sec_end = nullptr;
+    static const char *kNext[] = {"id=\"arrivals-board\"", "id=\"departures-board\"", "id=\"enroute-board\"",
+                                  "id=\"scheduled-board\"", nullptr};
+    for (int i = 0; kNext[i]; i++) {
+        if (strstr(kNext[i], board_id)) {
+            continue;
+        }
+        const char *nx = strstr(sec, kNext[i]);
+        if (nx && (!sec_end || nx < sec_end)) {
+            sec_end = nx;
+        }
+    }
+    if (!sec_end) {
+        sec_end = sec + strlen(sec);
+    }
+
+    int n = 0;
+    const char *p = sec;
+    while (n < out_max && p < sec_end) {
+        const char *tr = strstr(p, "id=\"Row_");
+        if (!tr || tr >= sec_end) {
+            break;
+        }
+        const char *tr_end = strstr(tr, "</tr>");
+        if (!tr_end || tr_end >= sec_end) {
+            break;
+        }
+        const size_t tlen = (size_t)(tr_end - tr);
+        static char rowbuf[1600];
+        if (tlen >= sizeof(rowbuf)) {
+            p = tr_end + 5;
+            continue;
+        }
+        memcpy(rowbuf, tr, tlen);
+        rowbuf[tlen] = 0;
+
+        AirportBoardRow row{};
+        const char *fl = strstr(rowbuf, "/live/flight/");
+        if (fl) {
+            fl += strlen("/live/flight/");
+            size_t fi = 0;
+            while (fl[fi] && fl[fi] != '/' && fl[fi] != '"' && fi + 1 < sizeof(row.flight)) {
+                row.flight[fi] = (char)toupper((unsigned char)fl[fi]);
+                fi++;
+            }
+            row.flight[fi] = 0;
+        }
+        const char *tp = strstr(rowbuf, "/live/aircrafttype/");
+        if (tp) {
+            tp += strlen("/live/aircrafttype/");
+            size_t ti = 0;
+            while (tp[ti] && tp[ti] != '"' && tp[ti] != '<' && ti + 1 < sizeof(row.type)) {
+                row.type[ti] = (char)toupper((unsigned char)tp[ti]);
+                ti++;
+            }
+            row.type[ti] = 0;
+        }
+        const char *hint = strstr(rowbuf, "class=\"hint\"");
+        if (hint) {
+            const char *title = strstr(hint, "title=\"");
+            if (title && title < rowbuf + tlen) {
+                title += 7;
+                char raw[96];
+                size_t ri = 0;
+                while (title[ri] && title[ri] != '"' && ri + 1 < sizeof(raw)) {
+                    raw[ri] = title[ri];
+                    ri++;
+                }
+                raw[ri] = 0;
+                fa_place_name(raw, row.other_name, sizeof(row.other_name));
+            }
+        }
+        const char *ap = nullptr;
+        for (const char *q = rowbuf; (q = strstr(q, "/live/airport/")) != nullptr; q += 14) {
+            ap = q;
+        }
+        if (ap) {
+            ap += strlen("/live/airport/");
+            size_t ai = 0;
+            while (ap[ai] && ap[ai] != '"' && ai + 1 < sizeof(row.other_apt)) {
+                row.other_apt[ai] = (char)toupper((unsigned char)ap[ai]);
+                ai++;
+            }
+            row.other_apt[ai] = 0;
+        }
+        if (!row.other_name[0] && row.other_apt[0]) {
+            copy_trunc(row.other_name, sizeof(row.other_name), row.other_apt);
+        }
+
+        int td_i = 0;
+        const char *td = rowbuf;
+        while ((td = strstr(td, "<td")) != nullptr) {
+            const char *tdc = strchr(td, '>');
+            if (!tdc) {
+                break;
+            }
+            tdc++;
+            const char *tde = strstr(tdc, "</td>");
+            if (!tde) {
+                break;
+            }
+            if (td_i == 3 || td_i == 5) {
+                char clock[16];
+                bool est = false;
+                fa_cell_clock(tdc, tde, clock, sizeof(clock), &est);
+                if (clock[0]) {
+                    if (td_i == 3) {
+                        copy_trunc(est ? row.dep_est : row.dep_time, est ? sizeof(row.dep_est) : sizeof(row.dep_time),
+                                   clock);
+                    } else {
+                        copy_trunc(est ? row.arr_est : row.arr_time, est ? sizeof(row.arr_est) : sizeof(row.arr_time),
+                                   clock);
+                    }
+                }
+            }
+            td_i++;
+            td = tde + 5;
+        }
+
+        row.progress_pct = 0;
+        const char *pf = strstr(rowbuf, "track-panel-progress-fill");
+        if (pf) {
+            const char *w = strstr(pf, "width:");
+            if (w) {
+                int pct = atoi(w + 6);
+                if (pct < 0) {
+                    pct = 0;
+                }
+                if (pct > 100) {
+                    pct = 100;
+                }
+                row.progress_pct = pct;
+            }
+        }
+
+        if (row.flight[0]) {
+            row.valid = true;
+            out[n++] = row;
+        }
+        p = tr_end + 5;
+        if ((n & 3) == 0) {
+            vTaskDelay(1);
+        }
+    }
+    return n;
 }
 
 bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max, int *arr_n,
@@ -5211,28 +5638,59 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
 
     float lat = 0, lon = 0;
     board_resolve_ll(code, &lat, &lon);
-    if (fabsf(lat) + fabsf(lon) < 0.01f) {
-        set_err("Airport not in DB");
-        return false;
-    }
 
-    status_msg("Live traffic...");
-    static Aircraft s_board_ac[FR_MAX_AIRCRAFT];
-    memset(s_board_ac, 0, sizeof(s_board_ac));
-    const int n_ac = net_fetch_aircraft(lat, lon, 40.0f, s_board_ac, FR_MAX_AIRCRAFT);
-    if (n_ac < 0) {
-        set_err(g_last_err[0] ? g_last_err : "Traffic fetch failed");
+    status_msg("FlightAware board...");
+    net_tls_reset();
+    {
+        NetHostGate *g = host_gate("www.flightaware.com");
+        if (g) {
+            g->ip = IPAddress();
+            g->ip_ms = 0;
+            g->cool_until = 0;
+            g->fails = 0;
+        }
+    }
+    char url[96];
+    snprintf(url, sizeof(url), "https://www.flightaware.com/live/airport/%s", code);
+    https_get(url, nullptr, kUaBrowser, 12000, 25000, "text/html,application/xhtml+xml,*/*", true,
+              fa_live_board_ready);
+    size_t blen = 0;
+    const char *html = http_body_buf(&blen);
+    auto board_html_usable = [](const char *b, size_t n) -> bool {
+        return b && n > 4000 && strstr(b, "id=\"departures-board\"") != nullptr &&
+               strstr(b, "id=\"enroute-board\"") != nullptr;
+    };
+    if (!board_html_usable(html, blen) && !s_net_abort && strcmp(g_last_err, "FlightAware blocked") != 0) {
+        Serial.printf("FA board fetch fail %s: %s — one retry\n", code, g_last_err);
+        net_tls_reset();
+        delay(200);
+        https_get(url, nullptr, kUaBrowser, 12000, 25000, "text/html,application/xhtml+xml,*/*", true,
+                  fa_live_board_ready);
+        html = http_body_buf(&blen);
+    }
+    if (!board_html_usable(html, blen)) {
+        Serial.printf("FA board fetch fail %s: %s\n", code, g_last_err);
+        set_err(g_last_err[0] ? g_last_err : "FA board fetch failed");
         return false;
     }
-    if (!board_fill_from_aircraft(code, lat, lon, s_board_ac, n_ac, arr, arr_max, arr_n, dep, dep_max,
-                                  dep_n)) {
-        set_err("No traffic near airport");
+    Serial.printf("FA board %s body %u KB\n", code, (unsigned)(blen / 1024));
+
+    // En Route = arrivals (FROM). Departures = flights that left (TO).
+    const int na = fa_parse_live_board(html, "enroute-board", arr, arr_max);
+    const int nd = fa_parse_live_board(html, "departures-board", dep, dep_max);
+    Serial.printf("FA board %s enroute=%d departures=%d\n", code, na, nd);
+    if (na <= 0 && nd <= 0) {
+        set_err("FA board: no flights");
         return false;
     }
-    const int na = arr_n ? *arr_n : 0;
-    const int nd = dep_n ? *dep_n : 0;
+    if (arr_n) {
+        *arr_n = na;
+    }
+    if (dep_n) {
+        *dep_n = nd;
+    }
     if (label_out && label_len) {
-        snprintf(label_out, label_len, "%s (live)", code);
+        snprintf(label_out, label_len, "%s", code);
     }
     if (out_lat) {
         *out_lat = lat;
@@ -5258,7 +5716,7 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
     s_cache_lat = lat;
     s_cache_lon = lon;
     s_cache_ms = millis();
-    Serial.printf("Live board %s: %d arr / %d dep\n", code, na, nd);
+    Serial.printf("FA board %s: %d arr / %d dep\n", code, na, nd);
     return true;
 }
 
