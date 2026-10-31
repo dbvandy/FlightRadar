@@ -146,9 +146,16 @@ void ui_notify_plate_cities(bool ok);
 void ui_notify_plate_bitmap(void);
 /** Manifest refresh finished (ok) — merge ICAOs into list and refresh UI. */
 void ui_notify_plates_updated(bool ok, const char *msg);
+/** Live Update Plates progress: "Downloading KOCF from internet 42% (3/13)". */
+void ui_notify_plate_download(const char *icao, int pct, int index, int total);
+/** Append one line to the plates download log box (~10 lines, scrolls). */
+void ui_plates_log_line(const char *icao, const char *msg);
+void ui_plates_log_clear(void);
 /** AWC radios ready for Airport Information preview (icao in pending_plate_radios_icao). */
 void ui_notify_plate_radios(bool ok);
 void ui_notify_route_search(bool ok, const char *msg);
 void ui_notify_route_flights(bool ok, const char *msg);
 void ui_notify_track_result(bool ok, const char *msg);
 void ui_set_status(const char *msg);
+/** Copy src→dst replacing UTF-8 / non-Montserrat chars with '-' (ellipsis → "..."). */
+void ui_font_sanitize(char *dst, size_t dst_len, const char *src);

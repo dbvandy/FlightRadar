@@ -416,8 +416,8 @@
     #define LV_FONT_SUBPX_BGR 0  /*0: RGB; 1:BGR order*/
 #endif
 
-/*Enable drawing placeholders when glyph dsc is not found*/
-#define LV_USE_FONT_PLACEHOLDER 1
+/*Disable box placeholders — ui_font_sanitize() substitutes '-' for missing glyphs.*/
+#define LV_USE_FONT_PLACEHOLDER 0
 
 /*=================
  *  TEXT SETTINGS

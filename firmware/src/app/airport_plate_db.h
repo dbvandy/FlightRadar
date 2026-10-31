@@ -56,9 +56,15 @@ void faa_plate_request(const char *icao);  // queue only; serviced during Update
 void faa_plate_forget(const char *icao);
 bool faa_plates_service(void);
 bool faa_plates_pending(void);
-/** Wipe SPIFFS + PSRAM, then download ICAOs (Update Plates button). */
+/** Clear PSRAM + queue ICAOs for download (Update Plates). Keeps old SPIFFS until each overwrite. */
 void faa_plates_queue_refresh(const char icaos[][8], int n);
+/** Queue every built-in pack plate (plates/ICAO.frpl) — no manifest fetch. */
+void faa_plates_queue_pack_dir(void);
+/** Stop bulk download: empty queue, clear bulk flag (caller should net_abort_request). */
+void faa_plates_cancel(void);
 bool faa_plates_bulk_active(void);
 bool faa_plates_bulk_finished(void);
+/** After bulk finish: how many saved vs failed. */
+void faa_plates_bulk_stats(int *ok_n, int *fail_n, int *total_n);
 void faa_plates_invalidate(void);
 bool faa_plates_sd_ready(void);

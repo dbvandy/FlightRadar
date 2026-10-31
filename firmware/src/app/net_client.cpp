@@ -24,6 +24,7 @@ static const char *kUaBrowser =
     "Chrome/120.0.0.0 Safari/537.36";
 static char g_last_err[96] = "";
 static void (*g_status_cb)(const char *msg) = nullptr;
+static void (*g_http_progress_cb)(size_t got, size_t total) = nullptr;
 static int g_adsb_pref = 0;  // sticky working ADS-B source index
 
 const char *net_last_error() {
@@ -32,6 +33,16 @@ const char *net_last_error() {
 
 void net_set_status_callback(void (*cb)(const char *msg)) {
     g_status_cb = cb;
+}
+
+void net_set_http_progress_callback(void (*cb)(size_t got, size_t total)) {
+    g_http_progress_cb = cb;
+}
+
+static void http_progress(size_t got, size_t total) {
+    if (g_http_progress_cb) {
+        g_http_progress_cb(got, total);
+    }
 }
 
 static void set_err(const char *msg) {
@@ -256,6 +267,178 @@ void net_tls_reset() {
 }
 
 static volatile bool s_net_abort = false;
+static bool (*s_wifi_rejoin_cb)(uint32_t timeout_ms) = nullptr;
+static uint32_t s_net_fail_streak = 0;
+static uint32_t s_net_last_ok_ms = 0;
+
+// Per-host cool-down + sticky DNS — stop hammering dead names for 20s (DNS -54).
+struct NetHostGate {
+    char host[64];
+    IPAddress ip;
+    uint32_t ip_ms;
+    uint32_t cool_until;
+    uint8_t fails;
+};
+static NetHostGate s_host_gates[8]{};
+
+void net_set_wifi_rejoin_callback(bool (*cb)(uint32_t timeout_ms)) {
+    s_wifi_rejoin_cb = cb;
+}
+
+bool net_ensure_wifi(uint32_t timeout_ms) {
+    if (WiFi.status() == WL_CONNECTED) {
+        return true;
+    }
+    // Do not call WiFi.mode()/config here — ESP-Hosted RPC wedges when the C6 is busy.
+    if (!s_wifi_rejoin_cb) {
+        set_err("Wi-Fi down");
+        return false;
+    }
+    status_msg("Rejoining Wi-Fi…");
+    Serial.println("[net] Wi-Fi down — rejoin");
+    return s_wifi_rejoin_cb(timeout_ms);
+}
+
+static NetHostGate *host_gate(const char *host) {
+    if (!host || !host[0]) {
+        return nullptr;
+    }
+    for (int i = 0; i < 8; i++) {
+        if (s_host_gates[i].host[0] && strcasecmp(s_host_gates[i].host, host) == 0) {
+            return &s_host_gates[i];
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        if (!s_host_gates[i].host[0]) {
+            strncpy(s_host_gates[i].host, host, sizeof(s_host_gates[i].host) - 1);
+            return &s_host_gates[i];
+        }
+    }
+    // Recycle oldest cool entry.
+    NetHostGate *v = &s_host_gates[0];
+    for (int i = 1; i < 8; i++) {
+        if (s_host_gates[i].cool_until < v->cool_until) {
+            v = &s_host_gates[i];
+        }
+    }
+    memset(v, 0, sizeof(*v));
+    strncpy(v->host, host, sizeof(v->host) - 1);
+    return v;
+}
+
+static void host_gate_ok(const char *host, IPAddress ip) {
+    NetHostGate *g = host_gate(host);
+    if (!g) {
+        return;
+    }
+    if (ip) {
+        g->ip = ip;
+        g->ip_ms = millis();
+    }
+    g->fails = 0;
+    g->cool_until = 0;
+}
+
+static bool host_is_github(const char *host) {
+    return host && (strcasecmp(host, "raw.githubusercontent.com") == 0 ||
+                    strcasecmp(host, "github.com") == 0 ||
+                    strcasecmp(host, "cdn.jsdelivr.net") == 0);
+}
+
+static void host_gate_fail(const char *host) {
+    NetHostGate *g = host_gate(host);
+    if (!g) {
+        return;
+    }
+    if (g->fails < 250) {
+        g->fails++;
+    }
+    // GitHub plate pack: never cool — one TLS blip would skip the whole Update Plates run.
+    if (host_is_github(host)) {
+        g->cool_until = 0;
+        return;
+    }
+    // Cool 15s after first fail, 45s after repeated fails.
+    g->cool_until = millis() + (g->fails >= 3 ? 45000u : 15000u);
+}
+
+void net_host_gates_clear(void) {
+    for (int i = 0; i < 8; i++) {
+        s_host_gates[i].cool_until = 0;
+        s_host_gates[i].fails = 0;
+    }
+}
+
+static bool host_gate_allowed(const char *host) {
+    NetHostGate *g = host_gate(host);
+    if (!g || !g->cool_until) {
+        return true;
+    }
+    if ((int32_t)(millis() - g->cool_until) >= 0) {
+        g->cool_until = 0;
+        return true;
+    }
+    set_err("Host cooling down");
+    Serial.printf("[net] skip %s (cooling %u ms)\n", host, (unsigned)(g->cool_until - millis()));
+    return false;
+}
+
+/** Pre-resolve DNS quickly; fails fast instead of sitting in TLS connect. */
+static bool net_dns_preflight(const char *host, IPAddress *out_ip) {
+    if (out_ip) {
+        *out_ip = IPAddress();
+    }
+    if (!host_gate_allowed(host)) {
+        return false;
+    }
+    NetHostGate *g = host_gate(host);
+    if (g && g->ip_ms && g->ip && (millis() - g->ip_ms) < 180000u) {
+        if (out_ip) {
+            *out_ip = g->ip;
+        }
+        return true;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        set_err("DNS: Wi-Fi down");
+        return false;
+    }
+    IPAddress ip;
+    // hostByName on Hosted can block a long time on -54 — still better than TLS timeout.
+    const bool ok = WiFi.hostByName(host, ip);
+    if (!ok || !ip) {
+        host_gate_fail(host);
+        set_err("DNS failed");
+        Serial.printf("[net] DNS fail %s\n", host);
+        return false;
+    }
+    host_gate_ok(host, ip);
+    if (out_ip) {
+        *out_ip = ip;
+    }
+    Serial.printf("[net] DNS %s → %s\n", host, ip.toString().c_str());
+    return true;
+}
+
+static void net_note_success(const char *host) {
+    s_net_fail_streak = 0;
+    s_net_last_ok_ms = millis();
+    if (host && host[0]) {
+        NetHostGate *g = host_gate(host);
+        if (g) {
+            g->fails = 0;
+            g->cool_until = 0;
+        }
+    }
+}
+
+static void net_note_failure(const char *host) {
+    if (s_net_fail_streak < 1000) {
+        s_net_fail_streak++;
+    }
+    if (host && host[0]) {
+        host_gate_fail(host);
+    }
+}
 
 void net_abort_request() {
     s_net_abort = true;
@@ -269,16 +452,39 @@ bool net_abort_requested() {
     return s_net_abort;
 }
 
-void net_stack_recover() {
-    // Abort sticky FA/TLS session + drop the oversized page buffer so the next
-    // ADS-B poll gets a clean handshake and contiguous DMA.
-    s_net_abort = true;  // trip any in-flight read still winding down
+void net_stack_recover(bool force_rejoin) {
+    // Trip in-flight reads, drop TLS, shrink FA buffer — do NOT touch WiFi.config /
+    // WiFi.mode here except via the rejoin callback. Serial showed Req_GetWifiMode
+    // / STA enable failures when config/mode ran mid-flight.
+    s_net_abort = true;
     tls_close();
     s_tls_last_was_fa = false;
     http_buf_shrink_default();
-    delay(80);  // was 450 — Update ADS-B felt sluggish
+    delay(30);
     yield();
-    s_net_abort = false;  // allow the next ADS-B / schedule fetch
+
+    const bool wifi_up = (WiFi.status() == WL_CONNECTED);
+    // Hosted DNS -54 leaves WL_CONNECTED true — force_rejoin is required for board.
+    const bool need_rejoin = force_rejoin || !wifi_up || s_net_fail_streak >= 2;
+    if (need_rejoin && s_wifi_rejoin_cb) {
+        status_msg("Rejoining Wi-Fi…");
+        Serial.printf("[net] hard recover (force=%d wifi=%d streak=%u)\n", force_rejoin ? 1 : 0,
+                      wifi_up ? 1 : 0, (unsigned)s_net_fail_streak);
+        for (int i = 0; i < 8; i++) {
+            s_host_gates[i].cool_until = 0;
+            s_host_gates[i].fails = 0;
+            s_host_gates[i].ip_ms = 0;
+        }
+        s_wifi_rejoin_cb(12000);
+        s_net_fail_streak = 0;
+        delay(250);
+    }
+
+    dma_tls_reserve_release();
+    delay(20);
+    yield();
+    dma_tls_reserve_hold();
+    s_net_abort = false;
 }
 
 static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_t connect_ms, uint32_t io_ms) {
@@ -304,7 +510,13 @@ static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_
     dma_tls_reserve_release();
 
     char last_tlserr[72] = {0};
+    // Two attempts — matches last known-good ADS-B/board path (v1.1.7).
     for (int attempt = 1; attempt <= 2; attempt++) {
+        if (s_net_abort) {
+            set_err("TLS aborted");
+            dma_tls_reserve_hold();
+            return nullptr;
+        }
         NetworkClientSecure *client = new NetworkClientSecure();
         if (!client) {
             set_err("No TLS client RAM");
@@ -312,6 +524,7 @@ static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_
             return nullptr;
         }
         client->setInsecure();
+        // Stream timeout is in seconds on NetworkClientSecure.
         client->setHandshakeTimeout((connect_ms + 999) / 1000);
         client->setTimeout((io_ms + 999) / 1000);
         Serial.printf("TLS connect %s:%u try %d (free=%u int-dma=%u largest=%u)\n", host, port, attempt,
@@ -331,7 +544,7 @@ static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_
         client->stop();
         delete client;
         s_tls_last_close_ms = millis();
-        if (attempt == 1) {
+        if (attempt < 2) {
             delay(fa ? 2000 : 400);
             yield();
         }
@@ -781,9 +994,16 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
                 client.setTimeout((io_ms + 999) / 1000);
             }
             if (n > 0) {
+                const size_t prev = len;
                 memcpy(g_http_buf + len, chunk, (size_t)n);
                 len += (size_t)n;
                 g_http_buf[len] = 0;
+                if (content_len > 0) {
+                    // Throttle UI: every ~4 KB or at completion.
+                    if (len == (size_t)content_len || (len / 4096) != (prev / 4096)) {
+                        http_progress(len, (size_t)content_len);
+                    }
+                }
                 delay(0);
             } else if (!client.connected()) {
                 break;
@@ -792,6 +1012,9 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
             } else {
                 delay(2);
             }
+        }
+        if (content_len > 0 && len > 0) {
+            http_progress(len, (size_t)content_len);
         }
     }
     if (keep_alive && content_len < 0 && !chunked) {
@@ -965,8 +1188,10 @@ bool https_get(const char *url, String *body, const char *user_agent, uint32_t c
         if (ok) {
             g_last_err[0] = 0;
             g_http_early_ok = nullptr;
+            net_note_success(host);
             return true;
         }
+        net_note_failure(host);
         if (strcmp(g_last_err, "HTTP redirect") != 0 || !g_redirect_loc[0]) {
             g_http_early_ok = nullptr;
             return false;
@@ -1315,8 +1540,11 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
         snprintf(url, sizeof(url), kSrc[idx].fmt, lat, lon, dist);
         // nullptr body → fill g_http_buf only (no second PSRAM String copy).
         // force_close=true: Hosted Wi‑Fi + sticky keep-alive was stalling after
-        // handshake (HTTP header timeout) and then breaking DNS.
+        // handshake (HTTP header timeout) and then breaking DNS / board.
         if (!https_get(url, nullptr, kUa, 8000, 25000, nullptr, true)) {
+            if (s_net_abort) {
+                return -1;
+            }
             continue;
         }
         size_t blen = 0;
@@ -1339,6 +1567,10 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
 
     if (any_ok) {
         return best_empty;
+    }
+    // Both hosts failed — Hosted DNS often needs a rejoin after FA/plate thrash.
+    if (s_net_fail_streak >= 2) {
+        net_stack_recover();
     }
     return -1;
 }
@@ -1793,8 +2025,12 @@ static int adsb_solo(const char *path_fmt_lol, const char *path_fmt_fi, const ch
     char url[160];
     bool any_ok = false;
     for (int src = 0; src < 2; src++) {
+        if (s_net_abort) {
+            return -1;
+        }
         snprintf(url, sizeof(url), src == 0 ? path_fmt_lol : path_fmt_fi, key);
-        if (!https_get(url, nullptr, kUa, 8000, 20000)) {
+        // Same force_close path as radar poll — keep-alive stalls Hosted Wi‑Fi.
+        if (!https_get(url, nullptr, kUa, 8000, 20000, nullptr, true)) {
             continue;
         }
         size_t blen = 0;
@@ -5286,7 +5522,8 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
     // One page: https://www.flightaware.com/live/airport/KATL
     // Arrivals column ← En Route (airborne inbound; Arrivals table is already landed).
     // Departures column ← Departures (left gate; Scheduled are still on the ground).
-    // Settle TLS after FA flight-plan thrash; ensure body buffer is alive.
+    // Keep this path simple (v1.1.7): force-rejoin/DNS probes before GET were
+    // dropping STA mid-open and made the board less reliable than track thrash alone.
     net_tls_reset();
     delay(80);
     if (!ensure_http_buf()) {
@@ -5698,12 +5935,31 @@ bool net_fetch_plate_manifest(char icaos[][8], int max_n, int *out_n) {
     }
     char url[220];
     snprintf(url, sizeof(url), "%s/manifest.json", FR_SD_DATA_BASE_URL);
-    if (!https_get(url, nullptr, nullptr, 8000, 15000, "application/json", true)) {
+    status_msg("Fetching plate list...");
+    net_ensure_wifi(8000);
+    delay(120);
+    bool got = false;
+    for (int attempt = 1; attempt <= 2 && !got; attempt++) {
+        if (attempt > 1) {
+            Serial.println("[plate] manifest retry");
+            net_tls_reset();
+            delay(300);
+        }
+        got = https_get(url, nullptr, kUaBrowser, 5000, 15000, "*/*", true);
+    }
+    if (!got) {
+        Serial.printf("[plate] manifest GET fail: %s\n", g_last_err);
         return false;
     }
     size_t blen = 0;
     const char *body = (const char *)net_http_body(&blen);
     if (!body || blen < 8) {
+        set_err("Plate manifest empty");
+        return false;
+    }
+    // Reject HTML error pages (GitHub rate-limit / soft 404).
+    if (body[0] == '<' || strncmp(body, "<!DOCTYPE", 9) == 0) {
+        set_err("Plate manifest not JSON");
         return false;
     }
     JsonDocument doc;
@@ -5764,5 +6020,6 @@ bool net_fetch_plate_manifest(char icaos[][8], int max_n, int *out_n) {
     if (out_n) {
         *out_n = n;
     }
+    Serial.printf("[plate] manifest %d plates\n", n);
     return n > 0;
 }

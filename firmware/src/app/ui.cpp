@@ -23,6 +23,54 @@
 #include <time.h>
 
 static SharedState *g_state = nullptr;
+
+/** Montserrat LVGL fonts are mostly ASCII — UTF-8 extras draw as empty/box. Map to '-' / "...". */
+void ui_font_sanitize(char *dst, size_t dst_len, const char *src) {
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    dst[0] = 0;
+    if (!src) {
+        return;
+    }
+    size_t o = 0;
+    const unsigned char *p = (const unsigned char *)src;
+    while (*p && o + 1 < dst_len) {
+        if (*p < 0x80) {
+            dst[o++] = (char)(*p++);
+            continue;
+        }
+        // U+2026 ellipsis UTF-8: E2 80 A6 → "..."
+        if (p[0] == 0xE2 && p[1] == 0x80 && p[2] == 0xA6 && o + 3 < dst_len) {
+            dst[o++] = '.';
+            dst[o++] = '.';
+            dst[o++] = '.';
+            p += 3;
+            continue;
+        }
+        // Skip continuation / lead bytes of this codepoint, emit '-'.
+        if ((*p & 0xF8) == 0xF0) {
+            p += 4;
+        } else if ((*p & 0xF0) == 0xE0) {
+            p += 3;
+        } else if ((*p & 0xE0) == 0xC0) {
+            p += 2;
+        } else {
+            p++;
+        }
+        dst[o++] = '-';
+    }
+    dst[o] = 0;
+}
+
+static void ui_label_set_text_safe(lv_obj_t *lab, const char *msg) {
+    if (!lab) {
+        return;
+    }
+    char buf[192];
+    ui_font_sanitize(buf, sizeof(buf), msg ? msg : "");
+    lv_label_set_text(lab, buf);
+}
 #ifdef BOARD_CROWPANEL_P4
 // 1024x600: square scope sized to the panel height, side rail stays on the right.
 static constexpr lv_coord_t kRadarPlot = 580;
@@ -67,6 +115,12 @@ static lv_obj_t *plates_panel = nullptr;
 static lv_obj_t *plates_list = nullptr;
 static lv_obj_t *plates_preview = nullptr;
 static lv_obj_t *plates_status = nullptr;
+static lv_obj_t *plates_log = nullptr;
+static lv_obj_t *plates_log_lbl = nullptr;
+#define PLATES_LOG_LINES 10
+#define PLATES_LOG_LINE_LEN 72
+static char s_plates_log[PLATES_LOG_LINES][PLATES_LOG_LINE_LEN];
+static int s_plates_log_n = 0;
 static lv_obj_t *plates_ta = nullptr;
 static lv_obj_t *plates_add_ta = nullptr;
 static lv_obj_t *plates_add_hits = nullptr;
@@ -1929,11 +1983,12 @@ static void leave_follow_for_home() {
 static void update_adsb_clicked(lv_event_t *e) {
     LV_UNUSED(e);
     if (radar_status) {
-        lv_label_set_text(radar_status, s_follow ? "Updating ADS-B + schedule…" : "Resetting network…");
+        lv_label_set_text(radar_status, "Resetting network…");
     }
     // Break in-flight FA/FS HTTPS (Loading route…) so recover can run this loop.
     net_abort_request();
-    // Drop hung FA / board / plate scrapes that lock TLS, then force a clean ADS-B poll.
+    // Drop hung FA / board / plate / schedule scrapes that lock TLS, then force ADS-B.
+    // Do NOT queue FlightStats here — that made Update ADS-B hang for tens of seconds.
     if (g_state) {
         __sync_fetch_and_and(
             (uint32_t *)&g_state->requests,
@@ -1941,12 +1996,7 @@ static void update_adsb_clicked(lv_event_t *e) {
               UI_REQ_FETCH_PLATE | UI_REQ_UPDATE_PLATES | UI_REQ_FETCH_PLATE_RADIOS |
               UI_REQ_TRACK_FLIGHT | UI_REQ_REFRESH_SCHEDULE));
     }
-    uint32_t req = UI_REQ_NET_RECOVER | UI_REQ_REFRESH_TRAFFIC | UI_REQ_REFRESH_AIRPORTS;
-    // While tracking, also refresh FlightStats Sch/Act/Est (merged into existing dep/arr).
-    if (s_follow && (s_follow_label[0] || s_follow_fi.flight[0])) {
-        req |= UI_REQ_REFRESH_SCHEDULE;
-    }
-    request(req);
+    request(UI_REQ_NET_RECOVER | UI_REQ_REFRESH_TRAFFIC | UI_REQ_REFRESH_AIRPORTS);
 }
 
 static void capture_home_from_cfg() {
@@ -5187,13 +5237,19 @@ static void plates_fill_info_table() {
             snprintf(id, sizeof(id), "%s", r->le);
         }
         snprintf(val, sizeof(val), "%d ft", r->len_ft);
-        lv_table_set_cell_value(plates_info_tbl, row, 0, id);
-        lv_table_set_cell_value(plates_info_tbl, row, 1, val);
+        char id_s[16], val_s[24];
+        ui_font_sanitize(id_s, sizeof(id_s), id);
+        ui_font_sanitize(val_s, sizeof(val_s), val);
+        lv_table_set_cell_value(plates_info_tbl, row, 0, id_s);
+        lv_table_set_cell_value(plates_info_tbl, row, 1, val_s);
         row++;
     }
     for (int k = 0; k < freq_n; k++) {
-        lv_table_set_cell_value(plates_info_tbl, row, 0, flbl[k]);
-        lv_table_set_cell_value(plates_info_tbl, row, 1, ffreq[k]);
+        char lb[24], fq[24];
+        ui_font_sanitize(lb, sizeof(lb), flbl[k] ? flbl[k] : "");
+        ui_font_sanitize(fq, sizeof(fq), ffreq[k] ? ffreq[k] : "");
+        lv_table_set_cell_value(plates_info_tbl, row, 0, lb);
+        lv_table_set_cell_value(plates_info_tbl, row, 1, fq);
         row++;
     }
 }
@@ -5720,6 +5776,17 @@ static void hide_plates_panel(lv_event_t *e) {
     LV_UNUSED(e);
     plates_hide_keyboard();
     s_plates_search_pending = false;
+    // Closing the window kills any in-flight Update Plates work.
+    if (g_state && (faa_plates_bulk_active() || faa_plates_pending() ||
+                    (g_state->requests & (UI_REQ_FETCH_PLATE | UI_REQ_UPDATE_PLATES)))) {
+        net_abort_request();
+        faa_plates_cancel();
+        __sync_fetch_and_and((uint32_t *)&g_state->requests,
+                             ~(uint32_t)(UI_REQ_FETCH_PLATE | UI_REQ_UPDATE_PLATES));
+        ui_plates_log_line("", "Downloads cancelled");
+        ui_label_set_text_safe(plates_status, "Downloads cancelled");
+        ui_set_status("Plate downloads cancelled");
+    }
     if (plates_panel) {
         lv_obj_add_flag(plates_panel, LV_OBJ_FLAG_HIDDEN);
     }
@@ -5751,15 +5818,39 @@ static void goto_plates(lv_event_t *e) {
     plates_request_city_refresh();
 }
 
+static void plates_log_render_locked(void) {
+    if (!plates_log_lbl) {
+        return;
+    }
+    char buf[PLATES_LOG_LINES * PLATES_LOG_LINE_LEN + 16];
+    size_t pos = 0;
+    buf[0] = 0;
+    for (int i = 0; i < s_plates_log_n; i++) {
+        const int n = snprintf(buf + pos, sizeof(buf) - pos, "%s%s", i ? "\n" : "", s_plates_log[i]);
+        if (n < 0) {
+            break;
+        }
+        pos += (size_t)n;
+        if (pos >= sizeof(buf) - 1) {
+            break;
+        }
+    }
+    lv_label_set_text(plates_log_lbl, buf);
+    if (plates_log) {
+        lv_obj_scroll_to_y(plates_log, LV_COORD_MAX, LV_ANIM_OFF);
+    }
+}
+
 static void plates_update_clicked(lv_event_t *e) {
     LV_UNUSED(e);
     if (!g_state) {
         return;
     }
-    if (plates_status) {
-        lv_label_set_text(plates_status, "Downloading plates → onboard storage…");
-    }
-    ui_set_status("Updating plates…");
+    net_abort_clear();
+    ui_plates_log_clear();
+    ui_plates_log_line("", "Download plates/*.frpl by ICAO");
+    ui_label_set_text_safe(plates_status, "Downloading plate files...");
+    ui_set_status("Downloading plates...");
     request(UI_REQ_UPDATE_PLATES);
 }
 
@@ -7190,6 +7281,13 @@ static void board_load_icao(const char *icao) {
     if (WiFi.status() == WL_CONNECTED && time(nullptr) < 1700000000) {
         configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
     }
+    // Stop in-flight track FA enrich — it was running before the board GET and
+    // leaving Hosted DNS dead (board worked until track was combined with it).
+    net_abort_request();
+    __sync_fetch_and_and((uint32_t *)&g_state->requests,
+                         ~(UI_REQ_FETCH_FLIGHT_INFO | UI_REQ_REFRESH_SCHEDULE |
+                           UI_REQ_FETCH_ROUTE_FLIGHTS | UI_REQ_FETCH_PLATE |
+                           UI_REQ_UPDATE_PLATES | UI_REQ_FETCH_PLATE_RADIOS));
     xSemaphoreTake(g_state->mutex, portMAX_DELAY);
     strncpy(g_state->pending_board_icao, icao, sizeof(g_state->pending_board_icao) - 1);
     g_state->pending_board_icao[sizeof(g_state->pending_board_icao) - 1] = 0;
@@ -9175,7 +9273,7 @@ static void format_follow_airport(char *out, size_t n, const char *icao, const c
     out[0] = 0;
     // Prefer short ICAO so Dep/Arr always fit; append a short name when short enough.
     if (icao && icao[0] && name && name[0] && strlen(name) <= 18) {
-        snprintf(out, n, "%s · %s", icao, name);
+        snprintf(out, n, "%s - %s", icao, name);
     } else if (icao && icao[0]) {
         snprintf(out, n, "%s", icao);
     } else if (name && name[0]) {
@@ -9884,13 +9982,14 @@ static void build_radar() {
     constexpr lv_coord_t kPlatesFiltH = 36;
     constexpr lv_coord_t kPlatesListY = kPlatesFiltY + kPlatesFiltH + 8;
     constexpr lv_coord_t kPlatesListH = 448;
-    // Preview diagram; runway lengths + freqs in table below; city status under that.
+    // Preview diagram; runway/freq + status/log stretch to same bottom as the plate list.
     constexpr lv_coord_t kPlatesPrevW = 280;
     constexpr lv_coord_t kPlatesPrevX = kPlatesListX + kPlatesListW + 10; // 358
     constexpr lv_coord_t kPlatesPrevY = 72;
-    constexpr lv_coord_t kPlatesInfoH = 130;
-    constexpr lv_coord_t kPlatesInfoY = kPlatesPrevY + kPlatesPrevW + 6;
-    constexpr lv_coord_t kPlatesCityY = kPlatesInfoY + kPlatesInfoH + 4;
+    constexpr lv_coord_t kPlatesBottom = kPlatesListY + kPlatesListH; // align with list bottom
+    constexpr lv_coord_t kPlatesCityY = kPlatesPrevY + kPlatesPrevW + 2;
+    constexpr lv_coord_t kPlatesInfoY = kPlatesCityY + 18;
+    constexpr lv_coord_t kPlatesInfoH = kPlatesBottom - kPlatesInfoY;
     constexpr lv_coord_t kPlatesUpdX = kPlatesPrevX + kPlatesPrevW + 10; // 648
     constexpr lv_coord_t kPlatesUpdW = 270;
     constexpr lv_coord_t kPlatesUpdH = 40;
@@ -9900,8 +9999,10 @@ static void build_radar() {
     constexpr lv_coord_t kPlatesAddTaY = kPlatesRemY + kPlatesUpdH + 8;
     constexpr lv_coord_t kPlatesAddBtnY = kPlatesAddTaY + kPlatesAddH + 8;
     constexpr lv_coord_t kPlatesAddHitsY = kPlatesAddBtnY + kPlatesAddH + 8;
-    constexpr lv_coord_t kPlatesAddHitsH = 80;
-    constexpr lv_coord_t kPlatesStatusY = kPlatesAddHitsY + kPlatesAddHitsH + 8;
+    constexpr lv_coord_t kPlatesAddHitsH = 56;
+    constexpr lv_coord_t kPlatesStatusY = kPlatesAddHitsY + kPlatesAddHitsH + 6;
+    constexpr lv_coord_t kPlatesLogY = kPlatesStatusY + 22;
+    constexpr lv_coord_t kPlatesLogH = kPlatesBottom - kPlatesLogY;
 
     // Filter search above the left plates list.
     plates_ta = lv_textarea_create(plates_panel);
@@ -10012,8 +10113,31 @@ static void build_radar() {
     lv_obj_set_style_text_color(plates_status, COL_GREEN, 0);
     lv_obj_set_style_text_font(plates_status, &lv_font_montserrat_12, 0);
     lv_obj_set_width(plates_status, kPlatesUpdW);
-    lv_label_set_long_mode(plates_status, LV_LABEL_LONG_WRAP);
+    lv_label_set_long_mode(plates_status, LV_LABEL_LONG_CLIP);
     lv_obj_align(plates_status, LV_ALIGN_TOP_LEFT, kPlatesUpdX, kPlatesStatusY);
+
+    // Scrollable download log (~10 lines) under the one-line status.
+    plates_log = lv_obj_create(plates_panel);
+    lv_obj_set_size(plates_log, kPlatesUpdW, kPlatesLogH);
+    lv_obj_align(plates_log, LV_ALIGN_TOP_LEFT, kPlatesUpdX, kPlatesLogY);
+    lv_obj_set_style_bg_color(plates_log, lv_color_hex(0x0A120C), 0);
+    lv_obj_set_style_bg_opa(plates_log, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(plates_log, COL_BTN_BORDER, 0);
+    lv_obj_set_style_border_width(plates_log, 1, 0);
+    lv_obj_set_style_radius(plates_log, 4, 0);
+    lv_obj_set_style_pad_all(plates_log, 4, 0);
+    lv_obj_add_flag(plates_log, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(plates_log, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(plates_log, LV_SCROLLBAR_MODE_AUTO);
+    plates_log_lbl = lv_label_create(plates_log);
+    lv_label_set_text(plates_log_lbl, "");
+    lv_obj_set_style_text_color(plates_log_lbl, COL_GREEN, 0);
+    lv_obj_set_style_text_font(plates_log_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_width(plates_log_lbl, kPlatesUpdW - 12);
+    lv_label_set_long_mode(plates_log_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_align(plates_log_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+    s_plates_log_n = 0;
+    memset(s_plates_log, 0, sizeof(s_plates_log));
 
     {
         // Same letter + number pad layout as Track Flight.
@@ -11171,6 +11295,65 @@ void ui_notify_plate_radios(bool ok) {
     lvgl_port_unlock();
 }
 
+void ui_plates_log_clear(void) {
+    lvgl_port_lock(-1);
+    s_plates_log_n = 0;
+    memset(s_plates_log, 0, sizeof(s_plates_log));
+    if (plates_log_lbl) {
+        lv_label_set_text(plates_log_lbl, "");
+    }
+    lvgl_port_unlock();
+}
+
+void ui_plates_log_line(const char *icao, const char *msg) {
+    char raw[PLATES_LOG_LINE_LEN];
+    char line[PLATES_LOG_LINE_LEN];
+    if (icao && icao[0]) {
+        snprintf(raw, sizeof(raw), "%s %s", icao, msg ? msg : "");
+    } else {
+        snprintf(raw, sizeof(raw), "%s", msg ? msg : "");
+    }
+    ui_font_sanitize(line, sizeof(line), raw);
+    lvgl_port_lock(-1);
+    if (s_plates_log_n < PLATES_LOG_LINES) {
+        strncpy(s_plates_log[s_plates_log_n], line, PLATES_LOG_LINE_LEN - 1);
+        s_plates_log[s_plates_log_n][PLATES_LOG_LINE_LEN - 1] = 0;
+        s_plates_log_n++;
+    } else {
+        memmove(s_plates_log[0], s_plates_log[1],
+                sizeof(s_plates_log[0]) * (size_t)(PLATES_LOG_LINES - 1));
+        strncpy(s_plates_log[PLATES_LOG_LINES - 1], line, PLATES_LOG_LINE_LEN - 1);
+        s_plates_log[PLATES_LOG_LINES - 1][PLATES_LOG_LINE_LEN - 1] = 0;
+    }
+    plates_log_render_locked();
+    lvgl_port_unlock();
+}
+
+void ui_notify_plate_download(const char *icao, int pct, int index, int total) {
+    char msg[96];
+    if (icao && icao[0]) {
+        if (total > 0) {
+            snprintf(msg, sizeof(msg), "Downloading %s from internet %d%%  (%d/%d)", icao, pct, index,
+                     total);
+        } else {
+            snprintf(msg, sizeof(msg), "Downloading %s from internet %d%%", icao, pct);
+        }
+    } else {
+        snprintf(msg, sizeof(msg), "Downloading plates… %d%%", pct);
+    }
+    // Radar status (throttled) + plates panel label (fresher). Log box gets start/OK/FAIL only.
+    ui_set_status(msg);
+    static uint32_t s_plates_prog_ms = 0;
+    const uint32_t now = millis();
+    if (s_plates_prog_ms != 0 && (now - s_plates_prog_ms) < 200 && pct < 100 && pct > 0) {
+        return;
+    }
+    s_plates_prog_ms = now;
+    lvgl_port_lock(-1);
+    ui_label_set_text_safe(plates_status, msg);
+    lvgl_port_unlock();
+}
+
 void ui_notify_plates_updated(bool ok, const char *msg) {
     char pack[48][8];
     int pack_n = 0;
@@ -11206,8 +11389,22 @@ void ui_notify_plates_updated(bool ok, const char *msg) {
             plates_load_preview(s_plates_prev_icao);
         }
     }
-    if (plates_status) {
-        lv_label_set_text(plates_status, msg ? msg : (ok ? "Plates updated" : "Plate update failed"));
+    {
+        char summary[PLATES_LOG_LINE_LEN];
+        ui_font_sanitize(summary, sizeof(summary),
+                         msg ? msg : (ok ? "Plates updated" : "Plate update failed"));
+        ui_label_set_text_safe(plates_status, summary);
+        if (s_plates_log_n < PLATES_LOG_LINES) {
+            strncpy(s_plates_log[s_plates_log_n], summary, PLATES_LOG_LINE_LEN - 1);
+            s_plates_log[s_plates_log_n][PLATES_LOG_LINE_LEN - 1] = 0;
+            s_plates_log_n++;
+        } else {
+            memmove(s_plates_log[0], s_plates_log[1],
+                    sizeof(s_plates_log[0]) * (size_t)(PLATES_LOG_LINES - 1));
+            strncpy(s_plates_log[PLATES_LOG_LINES - 1], summary, PLATES_LOG_LINE_LEN - 1);
+            s_plates_log[PLATES_LOG_LINES - 1][PLATES_LOG_LINE_LEN - 1] = 0;
+        }
+        plates_log_render_locked();
     }
     if (radar_plot) {
         lv_obj_invalidate(radar_plot);
@@ -11517,9 +11714,11 @@ void ui_set_status(const char *msg) {
     if (!msg) {
         return;
     }
+    char safe[160];
+    ui_font_sanitize(safe, sizeof(safe), msg);
     if (g_state) {
         xSemaphoreTake(g_state->mutex, portMAX_DELAY);
-        strncpy(g_state->status, msg, sizeof(g_state->status) - 1);
+        strncpy(g_state->status, safe, sizeof(g_state->status) - 1);
         g_state->status[sizeof(g_state->status) - 1] = 0;
         xSemaphoreGive(g_state->mutex);
     }
@@ -11531,7 +11730,7 @@ void ui_set_status(const char *msg) {
     s_status_lv_ms = now;
     lvgl_port_lock(-1);
     if (radar_status) {
-        lv_label_set_text(radar_status, msg);
+        lv_label_set_text(radar_status, safe);
     }
     lvgl_port_unlock();
 }

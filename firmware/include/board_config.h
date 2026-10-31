@@ -51,6 +51,7 @@
 // Raw GitHub base for SD Card Setup → Update Data (plates + airport/runway DBs).
 // Push firmware/sd_pack/fr_data to this path on GitHub, then the panel can reinstall
 // after a format or new card. Override in platformio build_flags if the repo differs.
+// Plate pack directory on GitHub — Update Plates GETs plates/ICAO.frpl when not already on SPIFFS.
 #ifndef FR_SD_DATA_BASE_URL
 #define FR_SD_DATA_BASE_URL \
     "https://raw.githubusercontent.com/dbvandy/FlightRadar/main/firmware/sd_pack/fr_data"

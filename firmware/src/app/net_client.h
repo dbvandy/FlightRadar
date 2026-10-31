@@ -10,12 +10,20 @@ void net_init_buffers();
 void net_arm_tls_dma_after_wifi();
 /** Drop any sticky TLS session (call before a heavy FA fetch / after abort). */
 void net_tls_reset();
-/** Hard reset hung HTTPS/TLS/FA buffer so ADS-B can run again (Update ADS-B). */
-void net_stack_recover();
+/** Soft/hard reset hung HTTPS/TLS so ADS-B can run again (Update ADS-B).
+ *  Soft: close TLS + shrink buffers. Hard (Wi‑Fi down or fail streak): rejoin STA.
+ *  force_rejoin: always drop+rejoin STA (needed when Hosted DNS is -54 but WL_CONNECTED). */
+void net_stack_recover(bool force_rejoin = false);
 /** Ask in-flight HTTPS (FA/FS) to bail so Update ADS-B / recover can run. */
 void net_abort_request();
 void net_abort_clear();
 bool net_abort_requested();
+/** Optional: rejoin STA with saved credentials (set from main). Returns true if associated. */
+void net_set_wifi_rejoin_callback(bool (*cb)(uint32_t timeout_ms));
+/** True if Wi‑Fi is associated; otherwise tries rejoin callback once. */
+bool net_ensure_wifi(uint32_t timeout_ms = 10000);
+/** Clear per-host cool-downs (call before Update Plates). */
+void net_host_gates_clear(void);
 
 // body may be nullptr to keep the payload only in the internal fixed buffer.
 // early_ok: optional stop-as-soon-as-usable predicate (airport board markers, etc.).
@@ -26,6 +34,8 @@ bool https_get(const char *url, String *body, const char *user_agent = nullptr,
 const uint8_t *net_http_body(size_t *len_out);
 const char *net_last_error();
 void net_set_status_callback(void (*cb)(const char *msg));
+/** Optional body-download progress (got/total bytes). Cleared after each https_get. */
+void net_set_http_progress_callback(void (*cb)(size_t got, size_t total));
 
 /** Civil TZ offset seconds east of UTC from lat/lon, with US/Canada + EU DST.
  *  when_utc==0 uses current time. */

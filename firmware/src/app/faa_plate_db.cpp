@@ -13,6 +13,7 @@
 #include "board_config.h"
 #include "lvgl_v8_port.h"
 #include "net_client.h"
+#include "ui.h"
 
 #define FRPL_MAGIC "FRPL"
 #define FRPL_MAX_BYTES (512u * 1024u)
@@ -51,7 +52,28 @@ static int s_req_n = 0;
 static bool s_ready = false;
 static bool s_bulk_update = false;
 static bool s_fs_ready = false;
+static int s_bulk_total = 0;
+static int s_bulk_done = 0;
+static int s_bulk_ok = 0;
+static int s_bulk_fail = 0;
+static char s_bulk_cur[8] = {0};
 static SemaphoreHandle_t s_mu = nullptr;
+
+static void plate_progress_ui(const char *icao, int pct) {
+    const int total = s_bulk_total > 0 ? s_bulk_total : 1;
+    // s_bulk_done = completed; current download is done+1 until the file finishes.
+    int idx = s_bulk_done + 1;
+    if (idx > total) {
+        idx = total;
+    }
+    if (pct < 0) {
+        pct = 0;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    ui_notify_plate_download(icao, pct, idx, total);
+}
 
 /** Flat SPIFFS path — survives reboot; only written by Update Plates. */
 static void plate_fs_path(const char *icao, char *out, size_t out_len) {
@@ -446,12 +468,12 @@ void faa_plate_request(const char *icao) {
     plate_unlock();
 }
 
-/** Clear PSRAM + SPIFFS, then queue every ICAO for download (Update Plates only). */
+/** Clear PSRAM + queue downloads. Do NOT wipe SPIFFS upfront — a mid-pack TLS
+ *  failure used to erase every plate and leave procedural “low-res” diagrams. */
 void faa_plates_queue_refresh(const char icaos[][8], int n) {
     if (!icaos || n <= 0) {
         return;
     }
-    plate_fs_wipe_all();
     lvgl_port_lock(-1);
     plate_lock();
     s_neg_n = 0;
@@ -463,6 +485,11 @@ void faa_plates_queue_refresh(const char icaos[][8], int n) {
     }
     s_ready = false;
     s_bulk_update = true;
+    s_bulk_total = 0;
+    s_bulk_done = 0;
+    s_bulk_ok = 0;
+    s_bulk_fail = 0;
+    s_bulk_cur[0] = 0;
     for (int i = 0; i < n && s_req_n < PLATE_REQ_QUEUE; i++) {
         char key[8];
         normalize_icao(icaos[i], key, sizeof(key));
@@ -484,9 +511,34 @@ void faa_plates_queue_refresh(const char icaos[][8], int n) {
         s_req_n++;
     }
     const int queued = s_req_n;
+    s_bulk_total = queued;
+    s_bulk_done = 0;
     plate_unlock();
     lvgl_port_unlock();
-    Serial.printf("[plate] refresh queued %d (SPIFFS wiped)\n", queued);
+    Serial.printf("[plate] refresh queued %d (SPIFFS kept until overwrite)\n", queued);
+}
+
+void faa_plates_queue_pack_dir(void) {
+    char icaos[PLATE_REQ_QUEUE][8];
+    int n = 0;
+    for (int i = 0; i < AIRPORT_PLATE_COUNT && n < PLATE_REQ_QUEUE; i++) {
+        strncpy(icaos[n], kAirportPlates[i].icao, 7);
+        icaos[n][7] = 0;
+        n++;
+    }
+    faa_plates_queue_refresh(icaos, n);
+}
+
+void faa_plates_cancel(void) {
+    lvgl_port_lock(-1);
+    plate_lock();
+    s_req_n = 0;
+    memset(s_req, 0, sizeof(s_req));
+    s_bulk_update = false;
+    s_bulk_cur[0] = 0;
+    plate_unlock();
+    lvgl_port_unlock();
+    Serial.println("[plate] downloads cancelled");
 }
 
 bool faa_plates_bulk_active(void) {
@@ -504,6 +556,20 @@ bool faa_plates_bulk_finished(void) {
     }
     plate_unlock();
     return done;
+}
+
+void faa_plates_bulk_stats(int *ok_n, int *fail_n, int *total_n) {
+    plate_lock();
+    if (ok_n) {
+        *ok_n = s_bulk_ok;
+    }
+    if (fail_n) {
+        *fail_n = s_bulk_fail;
+    }
+    if (total_n) {
+        *total_n = s_bulk_total;
+    }
+    plate_unlock();
 }
 
 const lv_img_dsc_t *faa_plate_lookup(const char *icao) {
@@ -535,19 +601,36 @@ bool faa_plate_load_local(const char *icao) {
     return true;
 }
 
-/** Download ICAO.frpl from GitHub into a fresh PSRAM buffer. */
+/** Download ICAO.frpl from the GitHub pack directory into PSRAM. One try — no CDN hammer. */
 static bool load_frpl_http(const char *icao, FrplHeader *out_hdr, uint8_t **out_pixels) {
     *out_pixels = nullptr;
     if (!icao || !icao[0] || !out_hdr) {
         return false;
     }
-    char url[220];
+    plate_progress_ui(icao, 0);
+    static char s_prog_icao[8];
+    strncpy(s_prog_icao, icao, sizeof(s_prog_icao) - 1);
+    s_prog_icao[sizeof(s_prog_icao) - 1] = 0;
+    net_set_http_progress_callback([](size_t got, size_t total) {
+        int pct = 0;
+        if (total > 0) {
+            pct = (int)((got * 100u) / total);
+        }
+        plate_progress_ui(s_prog_icao, pct);
+    });
+    char url[240];
     snprintf(url, sizeof(url), "%s/plates/%s.frpl", FR_SD_DATA_BASE_URL, icao);
-    // force_close: plate fetch is a one-shot binary; don't keep TLS sticky for ADS-B.
-    if (!https_get(url, nullptr, nullptr, 8000, 25000, "application/octet-stream", true)) {
+    ui_plates_log_line(icao, "GET...");
+    ui_set_status(icao);
+    // Single attempt, short connect — retries were blocking airport board / ADS-B for minutes.
+    const bool ok_get =
+        https_get(url, nullptr, nullptr, 5000, 25000, "application/octet-stream", true);
+    net_set_http_progress_callback(nullptr);
+    if (!ok_get) {
         Serial.printf("[plate] GET fail %s: %s\n", icao, net_last_error());
         return false;
     }
+    plate_progress_ui(icao, 100);
     size_t blen = 0;
     const uint8_t *body = net_http_body(&blen);
     if (!body || blen < sizeof(FrplHeader)) {
@@ -575,6 +658,10 @@ static bool load_frpl_http(const char *icao, FrplHeader *out_hdr, uint8_t **out_
 }
 
 bool faa_plates_service(void) {
+    if (net_abort_requested()) {
+        faa_plates_cancel();
+        return false;
+    }
     char key[8] = {0};
     plate_lock();
     if (s_req_n <= 0) {
@@ -592,27 +679,79 @@ bool faa_plates_service(void) {
         plate_unlock();
         return false;
     }
+    strncpy(s_bulk_cur, key, sizeof(s_bulk_cur) - 1);
+    s_bulk_cur[sizeof(s_bulk_cur) - 1] = 0;
     plate_unlock();
 
     FrplHeader hdr{};
     uint8_t *pixels = nullptr;
-    const bool ok = load_frpl_http(key, &hdr, &pixels);
+    if (net_abort_requested()) {
+        faa_plates_cancel();
+        return false;
+    }
+    // Prefer SPIFFS (already on unit from flash or a prior Update) — skip network.
+    bool from_fs = load_frpl_fs(key, &hdr, &pixels);
+    bool ok = from_fs && pixels;
+    if (ok) {
+        ui_plates_log_line(key, "OK local SPIFFS");
+    } else {
+        ui_plates_log_line(key[0] ? key : "????", "starting download");
+        ok = load_frpl_http(key, &hdr, &pixels);
+    }
+    if (net_abort_requested()) {
+        if (pixels) {
+            heap_caps_free(pixels);
+        }
+        faa_plates_cancel();
+        return false;
+    }
     if (!ok || !pixels) {
         plate_lock();
         neg_add(key);
+        s_bulk_done++;
+        s_bulk_fail++;
+        const int fails = s_bulk_fail;
         plate_unlock();
         Serial.printf("[plate] miss %s\n", key);
+        char reason[64];
+        snprintf(reason, sizeof(reason), "FAIL %s (%d/%d)",
+                 net_last_error()[0] ? net_last_error() : "download", s_bulk_done,
+                 s_bulk_total > 0 ? s_bulk_total : 1);
+        ui_plates_log_line(key, reason);
+        ui_set_status(reason);
         net_tls_reset();
+        // Two network misses in a row → stop the pack so board/ADS-B can run again.
+        if (fails >= 2) {
+            ui_plates_log_line("", "Stopping pack (net unhealthy)");
+            faa_plates_cancel();
+        }
         return false;
     }
 
-    plate_fs_save(key, &hdr, pixels);
+    const bool saved = plate_fs_save(key, &hdr, pixels);
     if (!slot_install(key, &hdr, pixels)) {
         heap_caps_free(pixels);
+        plate_lock();
+        s_bulk_done++;
+        s_bulk_fail++;
+        plate_unlock();
+        ui_plates_log_line(key, "FAIL install to PSRAM");
         return false;
     }
 
-    Serial.printf("[plate] stored %s (%ux%u %u B)\n", key, (unsigned)hdr.w, (unsigned)hdr.h,
-                  (unsigned)hdr.data_size);
+    plate_lock();
+    s_bulk_done++;
+    s_bulk_ok++;
+    plate_unlock();
+    {
+        char okmsg[72];
+        snprintf(okmsg, sizeof(okmsg), "OK saved%s (%d/%d)", saved ? "" : " (RAM only)", s_bulk_done,
+                 s_bulk_total > 0 ? s_bulk_total : 1);
+        ui_plates_log_line(key, okmsg);
+    }
+    ui_notify_plate_download(key, 100, s_bulk_done, s_bulk_total > 0 ? s_bulk_total : 1);
+    Serial.printf("[plate] stored %s (%ux%u %u B) spiffs=%d\n", key, (unsigned)hdr.w, (unsigned)hdr.h,
+                  (unsigned)hdr.data_size, saved ? 1 : 0);
+    delay(150);
     return true;
 }
