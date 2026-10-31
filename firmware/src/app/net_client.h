@@ -10,10 +10,15 @@ void net_init_buffers();
 void net_arm_tls_dma_after_wifi();
 /** Drop any sticky TLS session (call before a heavy FA fetch / after abort). */
 void net_tls_reset();
-/** Soft/hard reset hung HTTPS/TLS so ADS-B can run again (Update ADS-B).
- *  Soft: close TLS + shrink buffers. Hard (Wi‑Fi down or fail streak): rejoin STA.
- *  force_rejoin: always drop+rejoin STA (needed when Hosted DNS is -54 but WL_CONNECTED). */
+/** Drop hung HTTPS/TLS so ADS-B can run again (Update ADS-B).
+ *  Closes TLS, re-pins public DNS, and clears the address cache.
+ *  Rejoins STA only when the link is down, force_rejoin is set, or failures keep stacking.
+ *  A single DNS miss does not drop Wi-Fi. */
 void net_stack_recover(bool force_rejoin = false);
+/** Install 1.1.1.1 / 8.8.8.8 / 9.9.9.9 without touching the DHCP address. */
+void net_pin_dns();
+/** Forget sticky host addresses (call after joining a different network). */
+void net_dns_cache_clear();
 /** Ask in-flight HTTPS (FA/FS) to bail so Update ADS-B / recover can run. */
 void net_abort_request();
 void net_abort_clear();
@@ -86,7 +91,7 @@ bool net_build_airport_board_from_traffic(const char *icao, const Aircraft *ac, 
                                           AirportBoardRow *dep, int dep_max, int *dep_n, char *label,
                                           size_t label_len, float *out_lat = nullptr,
                                           float *out_lon = nullptr);
-/** Arrivals/departures from FlightAware live/airport/{ICAO} (enroute + departures tables). */
+/** Arrivals/departures from live ADS-B within 40 nm. No FlightAware page. */
 bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max, int *arr_n,
                              AirportBoardRow *dep, int dep_max, int *dep_n, char *label, size_t label_len,
                              float *out_lat = nullptr, float *out_lon = nullptr);

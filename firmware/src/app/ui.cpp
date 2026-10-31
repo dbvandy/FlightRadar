@@ -418,6 +418,11 @@ static lv_obj_t *make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb, v
 
 static void request(uint32_t r) {
     if (g_state) {
+        // Scan and Connect must interrupt a hung page fetch. Otherwise the
+        // settings buttons sit behind a 40s FlightAware read and look dead.
+        if (r & (UI_REQ_WIFI_SCAN | UI_REQ_WIFI_CONNECT)) {
+            net_abort_request();
+        }
         __sync_fetch_and_or((uint32_t *)&g_state->requests, r);
     }
 }
@@ -5953,20 +5958,30 @@ static void wifi_item_clicked(lv_event_t *e) {
         ssid = lv_list_get_btn_text(wifi_list, btn);
     }
     strncpy(g_state->pending_ssid, ssid, sizeof(g_state->pending_ssid) - 1);
-    // Keep password masked when picking a new network.
+    g_state->pending_ssid[sizeof(g_state->pending_ssid) - 1] = 0;
+    const bool saved = g_state->cfg.wifi_ssid[0] && strcmp(g_state->cfg.wifi_ssid, g_state->pending_ssid) == 0;
+    // Keep password masked when picking a network.
     if (wifi_show_pw_cb) {
         lv_obj_clear_state(wifi_show_pw_cb, LV_STATE_CHECKED);
     }
     if (wifi_ta) {
         lv_textarea_set_password_mode(wifi_ta, true);
         lv_textarea_set_password_show_time(wifi_ta, 0);
-        lv_textarea_set_text(wifi_ta, "");
+        // Re-tapping the saved network used to wipe the password, so Connect
+        // joined with an empty key and failed.
+        lv_textarea_set_text(wifi_ta, saved ? g_state->cfg.wifi_pass : "");
     }
-    lv_obj_clear_flag(wifi_kb, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(wifi_kb);
-    lv_keyboard_set_textarea(wifi_kb, wifi_ta);
+    if (!saved) {
+        lv_obj_clear_flag(wifi_kb, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(wifi_kb);
+        lv_keyboard_set_textarea(wifi_kb, wifi_ta);
+    }
     char msg[80];
-    snprintf(msg, sizeof(msg), "Password for %s", ssid);
+    if (saved) {
+        snprintf(msg, sizeof(msg), "Saved password for %s — tap Connect", ssid);
+    } else {
+        snprintf(msg, sizeof(msg), "Password for %s", ssid);
+    }
     lv_label_set_text(wifi_status, msg);
 }
 
@@ -5980,6 +5995,7 @@ static void wifi_connect_clicked(lv_event_t *e) {
     }
     lv_label_set_text(wifi_status, "Connecting...");
     lv_obj_add_flag(wifi_kb, LV_OBJ_FLAG_HIDDEN);
+    ui_show_wifi_joining(g_state->pending_ssid);
     request(UI_REQ_WIFI_CONNECT);
 }
 
@@ -7293,7 +7309,7 @@ static void board_load_icao(const char *icao) {
     g_state->pending_board_icao[sizeof(g_state->pending_board_icao) - 1] = 0;
     xSemaphoreGive(g_state->mutex);
     if (board_status) {
-        lv_label_set_text(board_status, "Loading FlightAware board...");
+        lv_label_set_text(board_status, "Loading live board...");
     }
     if (board_title_lbl) {
         char t[64];
@@ -10701,7 +10717,13 @@ void ui_notify_wifi_scan_done() {
         lv_obj_add_event_cb(btn, wifi_item_clicked, LV_EVENT_CLICKED, g_state->wifi_names[i]);
     }
     char msg[48];
-    snprintf(msg, sizeof(msg), "%d networks", n);
+    if (n < 0) {
+        snprintf(msg, sizeof(msg), "Scan failed — tap Scan");
+    } else if (n == 0) {
+        snprintf(msg, sizeof(msg), "No networks found");
+    } else {
+        snprintf(msg, sizeof(msg), "%d networks", n);
+    }
     lv_label_set_text(wifi_status, msg);
     refresh_wifi_connected_lbl();
     lvgl_port_unlock();

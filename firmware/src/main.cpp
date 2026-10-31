@@ -59,65 +59,154 @@ static void set_status_unlocked(const char *msg) {
 // Forward — defined with PSRAM scratch helpers below.
 static bool ensure_net_scratch();
 
-static bool wifi_connect_sta(const char *ssid, const char *pass, uint32_t timeout_ms) {
-    WiFi.mode(WIFI_STA);
+static bool wifi_ssid_is(const char *ssid) {
+    if (!ssid || !ssid[0] || WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+    const String cur = WiFi.SSID();
+    return cur.equals(ssid);
+}
+
+// force=false keeps a healthy association and only refreshes DNS.
+// Never call WiFi.config() after DHCP — on ESP-Hosted that clears DNS (error -54)
+// and is what made scans, boards, and ADS-B drop together.
+static bool wifi_connect_sta(const char *ssid, const char *pass, uint32_t timeout_ms, bool force) {
+    if (!ssid || !ssid[0]) {
+        return false;
+    }
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
     WiFi.setHostname("flight-radar");
-    // Drop existing STA first — Hosted DNS -54 often leaves WL_CONNECTED true;
-    // WiFi.begin() alone then no-ops and never refreshes DNS (board/ADS-B stay dead).
-    if (WiFi.status() == WL_CONNECTED) {
-        WiFi.disconnect(false, false);
-        delay(250);
-    }
-    WiFi.begin(ssid, pass);
-    const uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < timeout_ms) {
-        delay(200);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        // Keep DHCP address; pin public DNS (Hosted stack sometimes wedges on ISP DNS).
-        WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), IPAddress(8, 8, 8, 8),
-                    IPAddress(1, 1, 1, 1));
-        // After WiFi is up: only LARGE allocs prefer PSRAM. Small TLS/AES DMA
-        // buffers must stay internal. enable(64) broke WiFi; enable(4096) is safe.
+    if (!force && wifi_ssid_is(ssid)) {
+        net_pin_dns();
         heap_caps_malloc_extmem_enable(4096);
-        // Multiple servers — clocks stay blank until time(nullptr) passes ~2023.
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
         ensure_net_scratch();
         net_arm_tls_dma_after_wifi();
+        Serial.printf("[wifi] already on %s  %s\n", ssid, WiFi.localIP().toString().c_str());
+        return true;
     }
-    return WiFi.status() == WL_CONNECTED;
+    if (WiFi.getMode() != WIFI_STA) {
+        WiFi.mode(WIFI_STA);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(false, false);
+        delay(150);
+    }
+    WiFi.begin(ssid, pass ? pass : "");
+    const uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < timeout_ms) {
+        delay(100);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("[wifi] join failed %s\n", ssid);
+        return false;
+    }
+    delay(80);  // let the DHCP address settle before pinning resolvers
+    // Public DNS only. Do not pass the leased IP back into WiFi.config().
+    net_pin_dns();
+    net_dns_cache_clear();
+    heap_caps_malloc_extmem_enable(4096);
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+    ensure_net_scratch();
+    net_arm_tls_dma_after_wifi();
+    Serial.printf("[wifi] joined %s  %s\n", ssid, WiFi.localIP().toString().c_str());
+    return true;
 }
 
 static void handle_wifi_scan() {
     ui_set_status("Scanning Wi-Fi...");
+    net_abort_clear();
+    net_tls_reset();
     char restore_ssid[33] = {0};
     char restore_pass[65] = {0};
-    const bool was_up = (WiFi.status() == WL_CONNECTED);
-    if (was_up || g_state.cfg.wifi_ssid[0]) {
+    if (g_state.cfg.wifi_ssid[0]) {
         strncpy(restore_ssid, g_state.cfg.wifi_ssid, sizeof(restore_ssid) - 1);
         strncpy(restore_pass, g_state.cfg.wifi_pass, sizeof(restore_pass) - 1);
+        restore_ssid[sizeof(restore_ssid) - 1] = 0;
+        restore_pass[sizeof(restore_pass) - 1] = 0;
     }
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(false, false);
-    delay(80);
-    const int n = WiFi.scanNetworks(false, false);
+    if (WiFi.getMode() != WIFI_STA) {
+        WiFi.mode(WIFI_STA);
+    }
+    WiFi.setSleep(false);
+    // Scan while associated so DHCP and DNS stay up. Fall back to a
+    // disconnect-scan only if the hosted radio refuses an associated scan.
+    int n = WiFi.scanNetworks(false, false);
+    bool dropped = false;
+    if (n < 0 && WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[wifi] associated scan failed (%d) — retry offline\n", n);
+        WiFi.disconnect(false, false);
+        dropped = true;
+        delay(120);
+        n = WiFi.scanNetworks(false, false);
+    }
+
+    char names[FR_MAX_WIFI][33];
+    int rssi[FR_MAX_WIFI];
+    int count = 0;
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            const String ssid = WiFi.SSID(i);
+            if (ssid.length() == 0) {
+                continue;
+            }
+            const int sig = WiFi.RSSI(i);
+            int found = -1;
+            for (int j = 0; j < count; j++) {
+                if (strcmp(names[j], ssid.c_str()) == 0) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                if (sig > rssi[found]) {
+                    rssi[found] = sig;
+                }
+                continue;
+            }
+            if (count >= FR_MAX_WIFI) {
+                continue;
+            }
+            strncpy(names[count], ssid.c_str(), 32);
+            names[count][32] = 0;
+            rssi[count] = sig;
+            count++;
+        }
+        for (int a = 0; a < count; a++) {
+            for (int b = a + 1; b < count; b++) {
+                if (rssi[b] > rssi[a]) {
+                    const int sig = rssi[a];
+                    rssi[a] = rssi[b];
+                    rssi[b] = sig;
+                    char tmp[33];
+                    memcpy(tmp, names[a], sizeof(tmp));
+                    memcpy(names[a], names[b], sizeof(tmp));
+                    memcpy(names[b], tmp, sizeof(tmp));
+                }
+            }
+        }
+    }
+    WiFi.scanDelete();
+
     xSemaphoreTake(g_state.mutex, portMAX_DELAY);
-    g_state.wifi_count = 0;
-    for (int i = 0; i < n && g_state.wifi_count < FR_MAX_WIFI; i++) {
-        strncpy(g_state.wifi_names[g_state.wifi_count], WiFi.SSID(i).c_str(), 32);
-        g_state.wifi_names[g_state.wifi_count][32] = 0;
-        g_state.wifi_rssi[g_state.wifi_count] = WiFi.RSSI(i);
-        g_state.wifi_count++;
+    g_state.wifi_count = n < 0 ? -1 : count;
+    if (count > 0) {
+        memcpy(g_state.wifi_names, names, sizeof(names));
+        memcpy(g_state.wifi_rssi, rssi, sizeof(rssi));
     }
     xSemaphoreGive(g_state.mutex);
     ui_notify_wifi_scan_done();
-    // Scan drops STA — rejoin so ADS-B keeps working after the list fills.
-    if (restore_ssid[0]) {
-        const bool ok = wifi_connect_sta(restore_ssid, restore_pass, 15000);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        net_pin_dns();
+        g_state.wifi_connected = true;
+        ui_set_status(count > 0 ? "Scan done" : "Scan done — no networks");
+    } else if (dropped && restore_ssid[0]) {
+        const bool ok = wifi_connect_sta(restore_ssid, restore_pass, 15000, true);
         g_state.wifi_connected = ok;
-        if (ok) {
-            ui_set_status("Scan done — Wi-Fi restored");
-        }
+        ui_set_status(ok ? "Scan done — Wi-Fi restored" : "Scan done — Wi-Fi down");
+    } else {
+        g_state.wifi_connected = false;
     }
 }
 
@@ -132,7 +221,11 @@ static void handle_wifi_connect() {
     g_state.wifi_connecting = true;
     xSemaphoreGive(g_state.mutex);
 
-    const bool ok = wifi_connect_sta(ssid, pass, 20000);
+    net_abort_clear();
+    net_tls_reset();
+    // Explicit Connect always reassociates. A stuck "connected" STA with dead
+    // DNS does not recover if we only pin resolvers and leave the session up.
+    const bool ok = wifi_connect_sta(ssid, pass, 20000, true);
     xSemaphoreTake(g_state.mutex, portMAX_DELAY);
     g_state.wifi_connecting = false;
     g_state.wifi_connected = ok;
@@ -148,7 +241,11 @@ static void handle_wifi_connect() {
     }
     char msg[96];
     strncpy(msg, g_state.status, sizeof(msg) - 1);
+    msg[sizeof(msg) - 1] = 0;
     xSemaphoreGive(g_state.mutex);
+    lvgl_port_lock(-1);
+    ui_hide_wifi_joining();
+    lvgl_port_unlock();
     ui_notify_wifi_result(ok, msg);
 }
 
@@ -883,8 +980,6 @@ static void handle_airport_board() {
     // Clear sticky abort left by Update ADS-B / track FA thrash so board can run.
     net_abort_clear();
 
-    // FlightAware live/airport/{ICAO} — Ident/Type/From|To/Depart/Arrive in one page.
-    // Do not fall back to local ADS-B (wrong columns + misleading "No traffic near airport").
     const bool ok = net_fetch_airport_board(icao, s_arr, FR_MAX_BOARD_ROWS, &an, s_dep, FR_MAX_BOARD_ROWS, &dn,
                                             label, sizeof(label), &board_lat, &board_lon);
 
@@ -1497,7 +1592,7 @@ static void net_task(void *arg) {
             handle_weather();
         }
         // Airport board BEFORE track FA enrich — combining them put FlightAware
-        // flight-plan scrapes ahead of live/airport and wedged Hosted DNS (-54).
+        // flight-plan scrapes ahead of the airport board and wedged Hosted DNS (-54).
         if (req & UI_REQ_FETCH_AIRPORT_BOARD) {
             // New board tap wins over a queued track start this tick.
             if (req & UI_REQ_TRACK_FLIGHT) {
@@ -1672,6 +1767,26 @@ static void net_task(void *arg) {
                 last_traffic = millis();
             }
         }
+        // Link watchdog. A DNS miss must not come through here — only a real drop,
+        // and only after it has stayed down so a scan blip cannot force a rejoin.
+        if (!g_state.wifi_connecting && g_state.cfg.wifi_ssid[0]) {
+            static uint32_t link_down_ms = 0;
+            if (WiFi.status() == WL_CONNECTED) {
+                g_state.wifi_connected = true;
+                link_down_ms = 0;
+            } else {
+                g_state.wifi_connected = false;
+                if (link_down_ms == 0) {
+                    link_down_ms = millis();
+                } else if (millis() - link_down_ms > 10000u) {
+                    ui_set_status("Wi-Fi dropped — rejoining");
+                    const bool ok =
+                        wifi_connect_sta(g_state.cfg.wifi_ssid, g_state.cfg.wifi_pass, 12000, true);
+                    g_state.wifi_connected = ok;
+                    link_down_ms = millis();
+                }
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
@@ -1778,7 +1893,7 @@ void setup() {
         if (!g_state.cfg.wifi_ssid[0]) {
             return false;
         }
-        const bool ok = wifi_connect_sta(g_state.cfg.wifi_ssid, g_state.cfg.wifi_pass, timeout_ms);
+        const bool ok = wifi_connect_sta(g_state.cfg.wifi_ssid, g_state.cfg.wifi_pass, timeout_ms, true);
         g_state.wifi_connected = ok;
         return ok;
     });
@@ -1795,7 +1910,7 @@ void setup() {
             snprintf(st, sizeof(st), "Joining \"%s\" network", g_state.cfg.wifi_ssid);
             ui_set_status(st);
         }
-        const bool ok = wifi_connect_sta(g_state.cfg.wifi_ssid, g_state.cfg.wifi_pass, 15000);
+        const bool ok = wifi_connect_sta(g_state.cfg.wifi_ssid, g_state.cfg.wifi_pass, 15000, true);
         g_state.wifi_connected = ok;
         lvgl_port_lock(-1);
         ui_hide_wifi_joining();

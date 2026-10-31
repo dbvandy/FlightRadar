@@ -8,6 +8,9 @@
 #include <WiFiClient.h>
 #include <NetworkClientSecure.h>
 #include <esp_heap_caps.h>
+#include <esp_netif.h>
+#include <lwip/dns.h>
+#include <lwip/ip_addr.h>
 #include <ArduinoJson.h>
 #include <cctype>
 #include <cstring>
@@ -233,10 +236,32 @@ void net_arm_tls_dma_after_wifi() {
     dma_tls_reserve_hold();
 }
 
+// Sets the protected connect timeout, then connects to a resolved address
+// with the real hostname as SNI. connect(host) would call hostByName again.
+class SniTlsClient : public NetworkClientSecure {
+public:
+    int connect_sni(const IPAddress &ip, uint16_t port, const char *host, int32_t timeout_ms) {
+        if (timeout_ms < 3000) {
+            timeout_ms = 3000;
+        }
+        _timeout = (int)timeout_ms;
+        return connect(ip, port, host, _CA_cert, _cert, _private_key);
+    }
+    // Library path: resolve the name itself. Used when an anycast IP handshake
+    // was reset (FlightAware / Cloudflare) but the hostname session still works.
+    int connect_name(const char *host, uint16_t port, int32_t timeout_ms) {
+        if (timeout_ms < 3000) {
+            timeout_ms = 3000;
+        }
+        _timeout = (int)timeout_ms;
+        return NetworkClientSecure::connect(host, port, timeout_ms);
+    }
+};
+
 // Sticky TLS session — full handshakes every ADS-B poll thrash internal DMA RAM
 // (esp-aes descriptors) once LVGL/airports have fragmented the heap. Keep-alive
 // reuses one session on the preferred host; FA pages use force_close.
-static NetworkClientSecure *g_tls = nullptr;
+static SniTlsClient *g_tls = nullptr;
 static char g_tls_host[80] = "";
 static uint16_t g_tls_port = 0;
 // Set on every tls_close so the next handshake can wait for stack teardown.
@@ -353,19 +378,63 @@ static void host_gate_fail(const char *host) {
     if (g->fails < 250) {
         g->fails++;
     }
+    // A bad address must not be reused. The next try resolves again.
+    g->ip = IPAddress();
+    g->ip_ms = 0;
     // GitHub plate pack: never cool — one TLS blip would skip the whole Update Plates run.
     if (host_is_github(host)) {
         g->cool_until = 0;
         return;
     }
-    // Cool 15s after first fail, 45s after repeated fails.
-    g->cool_until = millis() + (g->fails >= 3 ? 45000u : 15000u);
+    // First miss is immediate. Later misses back off briefly so a dead name
+    // cannot pin the net task, and a live page is not locked out for 45s.
+    uint32_t cool = 0;
+    if (g->fails == 2) {
+        cool = 4000;
+    } else if (g->fails >= 3) {
+        cool = 12000;
+    }
+    g->cool_until = cool ? millis() + cool : 0;
 }
 
 void net_host_gates_clear(void) {
     for (int i = 0; i < 8; i++) {
         s_host_gates[i].cool_until = 0;
         s_host_gates[i].fails = 0;
+    }
+}
+
+void net_dns_cache_clear() {
+    for (int i = 0; i < 8; i++) {
+        s_host_gates[i].ip = IPAddress();
+        s_host_gates[i].ip_ms = 0;
+        s_host_gates[i].cool_until = 0;
+        s_host_gates[i].fails = 0;
+    }
+}
+
+void net_pin_dns() {
+    esp_netif_dns_info_t info{};
+    info.ip.type = ESP_IPADDR_TYPE_V4;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    const uint8_t ips[3][4] = {{1, 1, 1, 1}, {8, 8, 8, 8}, {9, 9, 9, 9}};
+    const esp_netif_dns_type_t slot[3] = {ESP_NETIF_DNS_MAIN, ESP_NETIF_DNS_BACKUP, ESP_NETIF_DNS_FALLBACK};
+    bool was_empty = true;
+    const ip_addr_t *cur = dns_getserver(0);
+    if (cur && !ip_addr_isany(cur)) {
+        was_empty = false;
+    }
+    for (int i = 0; i < 3; i++) {
+        ip_addr_t lw{};
+        IP_ADDR4(&lw, ips[i][0], ips[i][1], ips[i][2], ips[i][3]);
+        info.ip.u_addr.ip4.addr = ip_2_ip4(&lw)->addr;
+        if (netif) {
+            esp_netif_set_dns_info(netif, slot[i], &info);
+        }
+        dns_setserver(i, &lw);
+    }
+    if (was_empty) {
+        Serial.println("[net] DNS pinned 1.1.1.1 / 8.8.8.8 / 9.9.9.9");
     }
 }
 
@@ -383,6 +452,76 @@ static bool host_gate_allowed(const char *host) {
     return false;
 }
 
+// One lookup at a time (net task). Generation ignores a callback that lands
+// after we already gave up, so it cannot write a dead stack address.
+static volatile uint32_t s_dns_gen = 0;
+static volatile bool s_dns_done = false;
+static volatile bool s_dns_ok = false;
+static ip_addr_t s_dns_addr;
+
+static void dns_found_cb(const char *name, const ip_addr_t *ipaddr, void *arg) {
+    (void)name;
+    const uint32_t gen = (uint32_t)(uintptr_t)arg;
+    if (gen != s_dns_gen) {
+        return;
+    }
+    if (ipaddr && !ip_addr_isany(ipaddr)) {
+        s_dns_addr = *ipaddr;
+        s_dns_ok = true;
+    }
+    __sync_synchronize();
+    s_dns_done = true;
+}
+
+static bool ipaddr_to_arduino(const ip_addr_t *a, IPAddress *out) {
+    if (!a || !out || ip_addr_isany(a)) {
+        return false;
+    }
+    const ip4_addr_t *v4 = ip_2_ip4(a);
+    *out = IPAddress(ip4_addr1(v4), ip4_addr2(v4), ip4_addr3(v4), ip4_addr4(v4));
+    return (bool)(*out);
+}
+
+/** Bounded lookup. WiFi.hostByName has no timeout and stalls the net task on DNS -54. */
+static bool dns_lookup(const char *host, IPAddress *out, uint32_t timeout_ms) {
+    if (!host || !host[0] || !out) {
+        return false;
+    }
+    IPAddress literal;
+    if (literal.fromString(host)) {
+        *out = literal;
+        return true;
+    }
+    s_dns_gen++;
+    const uint32_t gen = s_dns_gen;
+    s_dns_done = false;
+    s_dns_ok = false;
+    ip_addr_t addr{};
+    const err_t err = dns_gethostbyname(host, &addr, dns_found_cb, (void *)(uintptr_t)gen);
+    if (err == ERR_OK) {
+        return ipaddr_to_arduino(&addr, out);
+    }
+    if (err != ERR_INPROGRESS) {
+        Serial.printf("[net] DNS %s err %d\n", host, (int)err);
+        return false;
+    }
+    const uint32_t start = millis();
+    while (!s_dns_done && (millis() - start) < timeout_ms) {
+        if (s_net_abort) {
+            s_dns_gen++;  // drop a late callback
+            return false;
+        }
+        delay(20);
+    }
+    if (!s_dns_done || !s_dns_ok) {
+        s_dns_gen++;
+        Serial.printf("[net] DNS timeout %s (%u ms)\n", host, (unsigned)timeout_ms);
+        return false;
+    }
+    __sync_synchronize();
+    return ipaddr_to_arduino(&s_dns_addr, out);
+}
+
 /** Pre-resolve DNS quickly; fails fast instead of sitting in TLS connect. */
 static bool net_dns_preflight(const char *host, IPAddress *out_ip) {
     if (out_ip) {
@@ -392,7 +531,7 @@ static bool net_dns_preflight(const char *host, IPAddress *out_ip) {
         return false;
     }
     NetHostGate *g = host_gate(host);
-    if (g && g->ip_ms && g->ip && (millis() - g->ip_ms) < 180000u) {
+    if (g && g->ip_ms && g->ip && (millis() - g->ip_ms) < 120000u) {
         if (out_ip) {
             *out_ip = g->ip;
         }
@@ -402,13 +541,14 @@ static bool net_dns_preflight(const char *host, IPAddress *out_ip) {
         set_err("DNS: Wi-Fi down");
         return false;
     }
+    net_pin_dns();
     IPAddress ip;
-    // hostByName on Hosted can block a long time on -54 — still better than TLS timeout.
-    const bool ok = WiFi.hostByName(host, ip);
+    const bool ok = dns_lookup(host, &ip, 4000);
     if (!ok || !ip) {
-        host_gate_fail(host);
-        set_err("DNS failed");
-        Serial.printf("[net] DNS fail %s\n", host);
+        if (!s_net_abort) {
+            set_err("DNS failed");
+            Serial.printf("[net] DNS fail %s\n", host);
+        }
         return false;
     }
     host_gate_ok(host, ip);
@@ -432,6 +572,10 @@ static void net_note_success(const char *host) {
 }
 
 static void net_note_failure(const char *host) {
+    // User asked for a scan/connect, or a redirect hop. Neither is a dead host.
+    if (s_net_abort) {
+        return;
+    }
     if (s_net_fail_streak < 1000) {
         s_net_fail_streak++;
     }
@@ -453,31 +597,31 @@ bool net_abort_requested() {
 }
 
 void net_stack_recover(bool force_rejoin) {
-    // Trip in-flight reads, drop TLS, shrink FA buffer — do NOT touch WiFi.config /
-    // WiFi.mode here except via the rejoin callback. Serial showed Req_GetWifiMode
-    // / STA enable failures when config/mode ran mid-flight.
+    // Trip in-flight reads, drop TLS, shrink FA buffer. Do not call WiFi.config()
+    // or WiFi.mode() here — that is what cleared Hosted DNS (error -54).
     s_net_abort = true;
     tls_close();
     s_tls_last_was_fa = false;
     http_buf_shrink_default();
+    net_pin_dns();
+    net_dns_cache_clear();
     delay(30);
     yield();
 
     const bool wifi_up = (WiFi.status() == WL_CONNECTED);
-    // Hosted DNS -54 leaves WL_CONNECTED true — force_rejoin is required for board.
-    const bool need_rejoin = force_rejoin || !wifi_up || s_net_fail_streak >= 2;
+    // Rejoin only when the link is actually down or failures keep stacking.
+    // One DNS miss used to drop STA and take the board and ADS-B with it.
+    const bool need_rejoin = force_rejoin || !wifi_up || s_net_fail_streak >= 4;
     if (need_rejoin && s_wifi_rejoin_cb) {
         status_msg("Rejoining Wi-Fi…");
         Serial.printf("[net] hard recover (force=%d wifi=%d streak=%u)\n", force_rejoin ? 1 : 0,
                       wifi_up ? 1 : 0, (unsigned)s_net_fail_streak);
-        for (int i = 0; i < 8; i++) {
-            s_host_gates[i].cool_until = 0;
-            s_host_gates[i].fails = 0;
-            s_host_gates[i].ip_ms = 0;
-        }
         s_wifi_rejoin_cb(12000);
         s_net_fail_streak = 0;
-        delay(250);
+        delay(200);
+        net_pin_dns();
+    } else {
+        s_net_fail_streak = 0;
     }
 
     dma_tls_reserve_release();
@@ -488,6 +632,7 @@ void net_stack_recover(bool force_rejoin) {
 }
 
 static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_t connect_ms, uint32_t io_ms) {
+    (void)io_ms;
     if (g_tls && g_tls->connected() && g_tls_port == port && strcmp(g_tls_host, host) == 0) {
         return g_tls;
     }
@@ -496,9 +641,14 @@ static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_
         set_err("TLS Wi-Fi down");
         return nullptr;
     }
-    // Long settle only after / before FlightAware — ADS-B must stay snappy.
+    IPAddress ip;
+    if (!net_dns_preflight(host, &ip)) {
+        return nullptr;
+    }
+    // Short settle after a FlightAware close so the hosted radio can finish
+    // tearing the last TLS session down. ADS-B stays on the short path.
     const bool fa = host_is_flightaware(host) || s_tls_last_was_fa;
-    const uint32_t settle_ms = fa ? 1500u : 200u;
+    const uint32_t settle_ms = fa ? 400u : 80u;
     if (s_tls_last_close_ms) {
         const uint32_t since = millis() - s_tls_last_close_ms;
         if (since < settle_ms) {
@@ -510,27 +660,41 @@ static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_
     dma_tls_reserve_release();
 
     char last_tlserr[72] = {0};
-    // Two attempts — matches last known-good ADS-B/board path (v1.1.7).
     for (int attempt = 1; attempt <= 2; attempt++) {
         if (s_net_abort) {
             set_err("TLS aborted");
             dma_tls_reserve_hold();
             return nullptr;
         }
-        NetworkClientSecure *client = new NetworkClientSecure();
+        if (attempt > 1) {
+            // First address may be stale. Resolve once more before the retry.
+            if (!net_dns_preflight(host, &ip)) {
+                dma_tls_reserve_hold();
+                return nullptr;
+            }
+        }
+        SniTlsClient *client = new SniTlsClient();
         if (!client) {
             set_err("No TLS client RAM");
             dma_tls_reserve_hold();
             return nullptr;
         }
         client->setInsecure();
-        // Stream timeout is in seconds on NetworkClientSecure.
-        client->setHandshakeTimeout((connect_ms + 999) / 1000);
-        client->setTimeout((io_ms + 999) / 1000);
-        Serial.printf("TLS connect %s:%u try %d (free=%u int-dma=%u largest=%u)\n", host, port, attempt,
+        // Our parser is HTTP/1.1. Without this, Cloudflare (FlightAware) can
+        // answer with HTTP/2 and the board sits in "header timeout".
+        static const char *kAlpnHttp11[] = {"http/1.1", nullptr};
+        client->setAlpnProtocols(kAlpnHttp11);
+        // setHandshakeTimeout() multiplies by 1000, so this argument is seconds.
+        const uint32_t hs_s = connect_ms < 8000 ? 8 : (connect_ms + 999) / 1000;
+        client->setHandshakeTimeout(hs_s);
+        const bool fa_name = host_is_flightaware(host) && attempt > 1;
+        Serial.printf("TLS connect %s (%s):%u try %d%s (free=%u int-dma=%u largest=%u)\n", host,
+                      ip.toString().c_str(), port, attempt, fa_name ? " via name" : "",
                       (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_free_size(kDmaInternal),
                       (unsigned)heap_caps_get_largest_free_block(kDmaInternal));
-        if (client->connect(host, port, (int32_t)connect_ms)) {
+        const bool opened = fa_name ? client->connect_name(host, port, (int32_t)connect_ms)
+                                    : client->connect_sni(ip, port, host, (int32_t)connect_ms);
+        if (opened) {
             g_tls = client;
             strncpy(g_tls_host, host, sizeof(g_tls_host) - 1);
             g_tls_host[sizeof(g_tls_host) - 1] = 0;
@@ -544,8 +708,14 @@ static NetworkClientSecure *tls_acquire(const char *host, uint16_t port, uint32_
         client->stop();
         delete client;
         s_tls_last_close_ms = millis();
-        if (attempt < 2) {
-            delay(fa ? 2000 : 400);
+        // Drop the address so the retry does not stick to a black-hole IP.
+        NetHostGate *g = host_gate(host);
+        if (g) {
+            g->ip = IPAddress();
+            g->ip_ms = 0;
+        }
+        if (attempt < 2 && !s_net_abort) {
+            delay(fa ? 500 : 200);
             yield();
         }
     }
@@ -678,6 +848,19 @@ static int http_read_exact(Client &client, char *dst, int n, uint32_t idle_ms, u
 
 static bool (*g_http_early_ok)(const char *buf, size_t len) = nullptr;
 
+// Cloudflare's "Just a moment" page is small and has no board tables.
+// Keep reading a real FlightAware page; bail as soon as the interstitial is obvious.
+static bool http_body_blocked(const char *buf, size_t len) {
+    if (!g_http_early_ok || !buf || len < 80 || len > 12000) {
+        return false;
+    }
+    if (strstr(buf, "id=\"enroute-board\"") || strstr(buf, "id=\"departures-board\"")) {
+        return false;
+    }
+    return strstr(buf, "Just a moment") != nullptr || strstr(buf, "cf-mitigated") != nullptr ||
+           strstr(buf, "Attention Required") != nullptr;
+}
+
 // When a page-specific early_ok is set (FA board), NEVER keep a partial just
 // because we hit 64 KB — arrivals sit ~68 KB in and departures ~83 KB; a 64 KB
 // stall left the dep column empty. Generic downloads still use the 64 KB floor.
@@ -792,6 +975,7 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
         }
     }
     size_t push_n = 0;
+    size_t push_i = 0;
     if (chunked) {
         if (pre_len > kPushbackCap) {
             set_err("HTTP chunk prefetch large");
@@ -809,9 +993,8 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
         const uint32_t idle_ms = io_ms > 30000 ? 30000 : io_ms;
 
         auto take_byte = [&](uint8_t *out) -> bool {
-            if (push_n > 0) {
-                *out = (uint8_t)pushback[0];
-                memmove(pushback, pushback + 1, --push_n);
+            if (push_i < push_n) {
+                *out = (uint8_t)pushback[push_i++];
                 return true;
             }
             if (http_read_exact(client, (char *)out, 1, idle_ms, &start, abs_deadline) != 1) {
@@ -822,11 +1005,11 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
 
         auto take_bytes = [&](char *dst, int n) -> bool {
             int filled = 0;
-            if (push_n > 0) {
-                int take = (int)push_n < n ? (int)push_n : n;
-                memcpy(dst, pushback, (size_t)take);
-                memmove(pushback, pushback + take, push_n - (size_t)take);
-                push_n -= (size_t)take;
+            if (push_i < push_n) {
+                int have = (int)(push_n - push_i);
+                int take = have < n ? have : n;
+                memcpy(dst, pushback + push_i, (size_t)take);
+                push_i += (size_t)take;
                 filled = take;
             }
             if (filled < n) {
@@ -850,6 +1033,7 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
                     goto body_done;
                 }
                 set_err("HTTP body deadline");
+                g_http_len = len;
                 return false;
             }
             // Chunk-size line.
@@ -865,6 +1049,7 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
                         goto body_done;
                     }
                     set_err("HTTP chunk size timeout");
+                    g_http_len = len;
                     return false;
                 }
                 if (b == '\n') {
@@ -928,10 +1113,16 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
                 }
                 Serial.printf("HTTP chunk data timeout at %u KB\n", (unsigned)(len / 1024));
                 set_err("HTTP chunk data timeout");
+                g_http_len = len;
                 return false;
             }
             len += (size_t)csz;
             g_http_buf[len] = 0;
+            if (http_body_blocked(g_http_buf, len)) {
+                set_err("FlightAware blocked");
+                g_http_len = len;
+                return false;
+            }
             if ((len / 16384) != ((len - (size_t)csz) / 16384)) {
                 char st[40];
                 snprintf(st, sizeof(st), "Download %u KB…", (unsigned)(len / 1024));
@@ -998,6 +1189,15 @@ static bool read_http_body(Client &client, String *body, uint32_t io_ms, bool ke
                 memcpy(g_http_buf + len, chunk, (size_t)n);
                 len += (size_t)n;
                 g_http_buf[len] = 0;
+                if (http_body_blocked(g_http_buf, len)) {
+                    set_err("FlightAware blocked");
+                    g_http_len = len;
+                    return false;
+                }
+                if (g_http_early_ok && g_http_early_ok(g_http_buf, len)) {
+                    Serial.printf("HTTP early-complete at %u KB\n", (unsigned)(len / 1024));
+                    break;
+                }
                 if (content_len > 0) {
                     // Throttle UI: every ~4 KB or at completion.
                     if (len == (size_t)content_len || (len / 4096) != (prev / 4096)) {
@@ -1097,6 +1297,7 @@ bool https_get(const char *url, String *body, const char *user_agent, uint32_t c
     const char *ua = user_agent ? user_agent : kUa;
     const char *acc = (accept && accept[0]) ? accept : "application/json";
     g_http_early_ok = early_ok;
+    g_http_len = 0;
 
     for (int hop = 0; hop < 6; hop++) {
         if (s_net_abort) {
@@ -1129,6 +1330,9 @@ bool https_get(const char *url, String *body, const char *user_agent, uint32_t c
             }
             NetworkClientSecure *client = tls_acquire(host, port, connect_ms, io_ms);
             if (!client) {
+                if (!s_net_abort && strcmp(g_last_err, "Host cooling down") != 0) {
+                    net_note_failure(host);
+                }
                 g_http_early_ok = nullptr;
                 return false;
             }
@@ -1171,10 +1375,20 @@ bool https_get(const char *url, String *body, const char *user_agent, uint32_t c
                 }
             }
         } else {
+            IPAddress ip;
+            if (!net_dns_preflight(host, &ip)) {
+                if (!s_net_abort && strcmp(g_last_err, "Host cooling down") != 0) {
+                    net_note_failure(host);
+                }
+                g_http_early_ok = nullptr;
+                return false;
+            }
             WiFiClient client;
             client.setTimeout((io_ms + 999) / 1000);
-            if (!client.connect(host, port, (int32_t)connect_ms)) {
+            if (!client.connect(ip, port, (int32_t)connect_ms)) {
                 set_err("TCP connect failed");
+                net_note_failure(host);
+                g_http_early_ok = nullptr;
                 return false;
             }
             client.printf("GET %s HTTP/1.0\r\n", path);
@@ -1191,8 +1405,11 @@ bool https_get(const char *url, String *body, const char *user_agent, uint32_t c
             net_note_success(host);
             return true;
         }
-        net_note_failure(host);
-        if (strcmp(g_last_err, "HTTP redirect") != 0 || !g_redirect_loc[0]) {
+        // A 30x is not a dead host. Counting it used to cool FlightAware/FlightStats
+        // and the next page load was skipped.
+        const bool redirect = strcmp(g_last_err, "HTTP redirect") == 0 && g_redirect_loc[0];
+        if (!redirect) {
+            net_note_failure(host);
             g_http_early_ok = nullptr;
             return false;
         }
@@ -1569,7 +1786,7 @@ int net_fetch_aircraft(float lat, float lon, float range_nm, Aircraft *out, size
         return best_empty;
     }
     // Both hosts failed — Hosted DNS often needs a rejoin after FA/plate thrash.
-    if (s_net_fail_streak >= 2) {
+    if (!s_net_abort && s_net_fail_streak >= 4) {
         net_stack_recover();
     }
     return -1;
@@ -4424,7 +4641,7 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
         snprintf(hist_url, sizeof(hist_url), "https://www.flightaware.com%s", hist_path);
         Serial.printf("FlightAware history %s\n", hist_path);
         status_msg("FlightAware filed route...");
-        if (https_get(hist_url, nullptr, kUaBrowser, 10000, 90000, "text/html,application/xhtml+xml,*/*",
+        if (https_get(hist_url, nullptr, kUaBrowser, 10000, 40000, "text/html,application/xhtml+xml,*/*",
                       true)) {
             size_t hlen = 0;
             const char *hhtml = http_body_buf(&hlen);
@@ -4482,7 +4699,7 @@ bool net_fetch_flight_plan(const char *callsign, FlightInfo *fi, FlightTrackPt *
                 if (hist_path[0] == '/') {
                     char hist_url[192];
                     snprintf(hist_url, sizeof(hist_url), "https://www.flightaware.com%s", hist_path);
-                    if (https_get(hist_url, nullptr, kUaBrowser, 10000, 90000,
+                    if (https_get(hist_url, nullptr, kUaBrowser, 10000, 40000,
                                   "text/html,application/xhtml+xml,*/*", true)) {
                         size_t hlen = 0;
                         const char *hhtml = http_body_buf(&hlen);
@@ -4639,389 +4856,7 @@ int net_tz_offset_for_ll(float lat, float lon, time_t when_utc) {
     return off;
 }
 
-// ---- FlightAware airport board HTML parse ----
-
-static void fa_html_unescape_nbsp(char *s) {
-    if (!s) {
-        return;
-    }
-    char *d = s;
-    for (char *p = s; *p;) {
-        if (p[0] == '&' && strncmp(p, "&nbsp;", 6) == 0) {
-            *d++ = ' ';
-            p += 6;
-        } else {
-            *d++ = *p++;
-        }
-    }
-    *d = 0;
-}
-
-static void fa_strip_tags_to(const char *in, char *out, size_t out_len) {
-    if (!out || out_len == 0) {
-        return;
-    }
-    size_t o = 0;
-    bool in_tag = false;
-    for (const char *p = in ? in : ""; *p && o + 1 < out_len; p++) {
-        if (*p == '<') {
-            in_tag = true;
-            continue;
-        }
-        if (*p == '>') {
-            in_tag = false;
-            continue;
-        }
-        if (in_tag) {
-            continue;
-        }
-        out[o++] = *p;
-    }
-    out[o] = 0;
-    fa_html_unescape_nbsp(out);
-    char *w = out;
-    bool sp = false;
-    for (char *p = out; *p; p++) {
-        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
-            if (!sp && w != out) {
-                *w++ = ' ';
-                sp = true;
-            }
-        } else {
-            *w++ = *p;
-            sp = false;
-        }
-    }
-    *w = 0;
-    trim_inplace(out);
-}
-
-static bool fa_parse_clock_hm(const char *s, int *hh_out, int *mm_out) {
-    if (!s || !hh_out || !mm_out) {
-        return false;
-    }
-    int h = 0, m = 0;
-    char ap = 0;
-    if (sscanf(s, "%d:%d%c", &h, &m, &ap) < 2) {
-        return false;
-    }
-    if (h < 0 || h > 23 || m < 0 || m > 59) {
-        return false;
-    }
-    if (ap == 'p' || ap == 'P') {
-        if (h < 12) {
-            h += 12;
-        }
-    } else if (ap == 'a' || ap == 'A') {
-        if (h == 12) {
-            h = 0;
-        }
-    }
-    *hh_out = h;
-    *mm_out = m;
-    return true;
-}
-
-static bool fa_parse_hist_dep_epoch(const char *href, uint32_t *epoch_out) {
-    if (!href || !epoch_out) {
-        return false;
-    }
-    const char *p = strstr(href, "/history/");
-    if (!p) {
-        return false;
-    }
-    p += 9;
-    int y = 0, mo = 0, d = 0, hh = 0, mm = 0;
-    if (sscanf(p, "%4d%2d%2d/%2d%2dZ", &y, &mo, &d, &hh, &mm) != 5) {
-        return false;
-    }
-    if (y < 2020 || mo < 1 || mo > 12 || d < 1 || d > 31) {
-        return false;
-    }
-    struct tm t {};
-    t.tm_year = y - 1900;
-    t.tm_mon = mo - 1;
-    t.tm_mday = d;
-    t.tm_hour = hh;
-    t.tm_min = mm;
-    t.tm_sec = 0;
-    time_t e = mktime(&t);
-    if (e < 0) {
-        return false;
-    }
-    *epoch_out = (uint32_t)e;
-    return true;
-}
-
-static void fa_board_fill_progress(AirportBoardRow *row, bool prefer_complete) {
-    if (!row || !row->valid) {
-        return;
-    }
-    const time_t now = time(nullptr);
-    if (now < 1700000000) {
-        row->progress_pct = prefer_complete ? 100 : 0;
-        return;
-    }
-    if (!row->dep_epoch) {
-        row->progress_pct = prefer_complete ? 100 : 0;
-        return;
-    }
-    uint32_t arr = row->arr_epoch;
-    if (!arr || arr <= row->dep_epoch) {
-        arr = row->dep_epoch + 2u * 3600u;
-        row->arr_epoch = arr;
-    }
-    if ((uint32_t)now <= row->dep_epoch) {
-        row->progress_pct = 0;
-        return;
-    }
-    if ((uint32_t)now >= arr) {
-        row->progress_pct = 100;
-        return;
-    }
-    const uint32_t span = arr - row->dep_epoch;
-    const uint32_t el = (uint32_t)now - row->dep_epoch;
-    row->progress_pct = (int)((el * 100u) / span);
-    if (row->progress_pct > 99) {
-        row->progress_pct = 99;
-    }
-}
-
-static int fa_parse_airport_board_section(const char *html, const char *board_id, AirportBoardRow *out,
-                                          int out_max, bool landed_bias) {
-    if (!html || !board_id || !out || out_max <= 0) {
-        return 0;
-    }
-    char needle[48];
-    snprintf(needle, sizeof(needle), "id=\"%s\"", board_id);
-    const char *sec = strstr(html, needle);
-    if (!sec) {
-        return 0;
-    }
-    sec += strlen(needle);
-
-    const char *sec_end = nullptr;
-    static const char *kNext[] = {"id=\"arrivals-board\"",   "id=\"departures-board\"",
-                                  "id=\"enroute-board\"",    "id=\"scheduled-board\"",
-                                  "id=\"arrivals-departures", nullptr};
-    for (int i = 0; kNext[i]; i++) {
-        if (strstr(kNext[i], board_id)) {
-            continue;
-        }
-        const char *nx = strstr(sec, kNext[i]);
-        if (nx && (!sec_end || nx < sec_end)) {
-            sec_end = nx;
-        }
-    }
-    if (!sec_end) {
-        sec_end = sec + strlen(sec);
-    }
-
-    int n = 0;
-    const char *p = sec;
-    while (n < out_max && p < sec_end) {
-        if ((n & 7) == 7) {
-            vTaskDelay(1);
-        }
-        const char *tr = strstr(p, "id=\"Row_");
-        if (!tr || tr >= sec_end) {
-            break;
-        }
-        const char *tr_end = strstr(tr, "</tr>");
-        if (!tr_end || tr_end >= sec_end) {
-            break;
-        }
-        const size_t tlen = (size_t)(tr_end - tr);
-        static char rowbuf[1600];
-        if (tlen >= sizeof(rowbuf)) {
-            p = tr_end + 5;
-            continue;
-        }
-        memcpy(rowbuf, tr, tlen);
-        rowbuf[tlen] = 0;
-
-        AirportBoardRow row{};
-        const char *fl = strstr(rowbuf, "/live/flight/");
-        if (fl) {
-            const char *href0 = fl;
-            fl += strlen("/live/flight/");
-            size_t fi = 0;
-            while (fl[fi] && fl[fi] != '/' && fl[fi] != '"' && fi + 1 < sizeof(row.flight)) {
-                row.flight[fi] = (char)toupper((unsigned char)fl[fi]);
-                fi++;
-            }
-            row.flight[fi] = 0;
-            char hist[120];
-            size_t hi = 0;
-            const char *hp = href0;
-            while (*hp && *hp != '"' && hi + 1 < sizeof(hist)) {
-                hist[hi++] = *hp++;
-            }
-            hist[hi] = 0;
-            fa_parse_hist_dep_epoch(hist, &row.dep_epoch);
-            const char *slash = strrchr(hist, '/');
-            if (slash && slash > hist) {
-                const char *slash2 = slash - 1;
-                while (slash2 > hist && *slash2 != '/') {
-                    slash2--;
-                }
-                if (*slash2 == '/') {
-                    char a[8] = {0}, b[8] = {0};
-                    if (sscanf(slash2, "/%7[^/]/%7s", a, b) == 2) {
-                        const bool dep_side = strstr(board_id, "depart") != nullptr ||
-                                              strstr(board_id, "scheduled") != nullptr;
-                        copy_trunc(row.other_apt, sizeof(row.other_apt), dep_side ? b : a);
-                    }
-                }
-            }
-        }
-        const char *tp = strstr(rowbuf, "/live/aircrafttype/");
-        if (tp) {
-            tp += strlen("/live/aircrafttype/");
-            size_t ti = 0;
-            while (tp[ti] && tp[ti] != '"' && tp[ti] != '<' && ti + 1 < sizeof(row.type)) {
-                row.type[ti] = (char)toupper((unsigned char)tp[ti]);
-                ti++;
-            }
-            row.type[ti] = 0;
-        }
-        const char *hint = strstr(rowbuf, "class=\"hint\"");
-        if (hint) {
-            const char *title = strstr(hint, "title=\"");
-            if (title) {
-                title += 7;
-                char raw[80];
-                size_t ri = 0;
-                while (title[ri] && title[ri] != '"' && ri + 1 < sizeof(raw)) {
-                    raw[ri] = title[ri];
-                    ri++;
-                }
-                raw[ri] = 0;
-                // "Fort Lauderdale Intl (Fort Lauderdale, FL) - FLL" → city in parens.
-                char *lp = strchr(raw, '(');
-                char *rp = lp ? strchr(lp, ')') : nullptr;
-                if (lp && rp && rp > lp + 1) {
-                    *rp = 0;
-                    copy_trunc(row.other_name, sizeof(row.other_name), lp + 1);
-                    trim_inplace(row.other_name);
-                } else {
-                    char *dash = strstr(raw, " - ");
-                    if (dash) {
-                        *dash = 0;
-                    }
-                    copy_trunc(row.other_name, sizeof(row.other_name), raw);
-                }
-            }
-        }
-        // Live progress bar: style="width: N%"
-        bool have_bar = false;
-        const char *pf = strstr(rowbuf, "track-panel-progress-fill");
-        if (pf) {
-            const char *w = strstr(pf, "width:");
-            if (w) {
-                int pct = atoi(w + 6);
-                if (pct < 0) {
-                    pct = 0;
-                }
-                if (pct > 100) {
-                    pct = 100;
-                }
-                row.progress_pct = pct;
-                have_bar = true;
-            }
-        }
-        if (!row.other_apt[0]) {
-            const char *ap = nullptr;
-            for (const char *q = rowbuf; (q = strstr(q, "/live/airport/")) != nullptr; q += 14) {
-                ap = q;
-            }
-            if (ap) {
-                ap += strlen("/live/airport/");
-                size_t ai = 0;
-                while (ap[ai] && ap[ai] != '"' && ai + 1 < sizeof(row.other_apt)) {
-                    row.other_apt[ai] = (char)toupper((unsigned char)ap[ai]);
-                    ai++;
-                }
-                row.other_apt[ai] = 0;
-            }
-        }
-
-        char dep_disp[24] = {0}, arr_disp[24] = {0};
-        int dep_hh = -1, dep_mm = -1, arr_hh = -1, arr_mm = -1;
-        int td_i = 0;
-        const char *td = rowbuf;
-        while ((td = strstr(td, "<td")) != nullptr) {
-            const char *tdc = strchr(td, '>');
-            if (!tdc) {
-                break;
-            }
-            tdc++;
-            const char *tde = strstr(tdc, "</td>");
-            if (!tde) {
-                break;
-            }
-            char cell[96];
-            size_t clen = (size_t)(tde - tdc);
-            if (clen >= sizeof(cell)) {
-                clen = sizeof(cell) - 1;
-            }
-            memcpy(cell, tdc, clen);
-            cell[clen] = 0;
-            char plain[96];
-            fa_strip_tags_to(cell, plain, sizeof(plain));
-            if (td_i == 3 && plain[0]) {
-                copy_trunc(dep_disp, sizeof(dep_disp), plain);
-                fa_parse_clock_hm(plain, &dep_hh, &dep_mm);
-            } else if (td_i == 5 && plain[0]) {
-                copy_trunc(arr_disp, sizeof(arr_disp), plain);
-                fa_parse_clock_hm(plain, &arr_hh, &arr_mm);
-            }
-            td_i++;
-            td = tde + 5;
-        }
-        copy_trunc(row.dep_time, sizeof(row.dep_time), dep_disp);
-        copy_trunc(row.arr_time, sizeof(row.arr_time), arr_disp);
-
-        if (row.dep_epoch && dep_hh >= 0 && arr_hh >= 0) {
-            int dep_m = dep_hh * 60 + dep_mm;
-            int arr_m = arr_hh * 60 + arr_mm;
-            int dur = arr_m - dep_m;
-            if (dur < 15) {
-                dur += 24 * 60;
-            }
-            if (dur > 15 && dur < 20 * 60) {
-                row.arr_epoch = row.dep_epoch + (uint32_t)dur * 60u;
-            }
-        }
-
-        if (row.flight[0]) {
-            row.valid = true;
-            if (!have_bar) {
-                fa_board_fill_progress(&row, landed_bias);
-            }
-            out[n++] = row;
-        }
-        p = tr_end + 5;
-    }
-    return n;
-}
-
-static bool fa_board_body_ok(const char *buf, size_t len) {
-    // FA order on live/airport/{ICAO}:
-    //   arrivals → departures (~70–90 KB) → enroute (~100–120 KB) → scheduled (~125 KB+)
-    // We need enroute + departures. Stopping at arrivals-board (~50–70 KB) left both
-    // parsers empty ("FA board: no flights"). scheduled-board means enroute is complete.
-    if (!buf || len < 80 * 1024) {
-        return false;
-    }
-    if (strstr(buf, "id=\"scheduled-board\"") != nullptr) {
-        return true;
-    }
-    const char *en = strstr(buf, "id=\"enroute-board\"");
-    const char *dep = strstr(buf, "id=\"departures-board\"");
-    // Enough bytes after enroute marker for a full inbound table (~20 rows).
-    return en && dep && (size_t)(buf + len - en) > 12 * 1024;
-}
+// Airport board rows come from ADS-B near the field. No FlightAware page scrape.
 
 static void board_resolve_ll(const char *code, float *lat, float *lon) {
     if (!lat || !lon || !code || !code[0]) {
@@ -5093,131 +4928,40 @@ static void board_fmt_local_hm(char *out, size_t out_len, float apt_lat, float a
     snprintf(out, out_len, "%02d:%02d", t.tm_hour, t.tm_min);
 }
 
-static void board_apply_other_city(AirportBoardRow *rows, int n) {
-    if (!rows || n <= 0) {
-        return;
+static bool board_nearest_apt(float lat, float lon, const char *skip, float max_nm, char *icao,
+                               size_t icao_len) {
+    if (!icao || icao_len == 0 || !kAptDb || K_APT_DB_COUNT == 0 || max_nm <= 0.0f) {
+        return false;
     }
-    char icaos[FR_MAX_BOARD_ROWS][8];
-    char cities[FR_MAX_BOARD_ROWS][28];
-    int nu = 0;
-    for (int i = 0; i < n && nu < FR_MAX_BOARD_ROWS; i++) {
-        if (!rows[i].other_apt[0] || rows[i].other_name[0]) {
+    icao[0] = 0;
+    const float coslat = cosf(lat * 0.0174532925f);
+    const float c = (coslat < 0.2f) ? 0.2f : coslat;
+    float best2 = max_nm * max_nm;
+    const char *best = nullptr;
+    const int pad = (int)lroundf(max_nm / 0.6f) + 3;
+    const int lat0 = (int)lroundf(lat * 100.0f);
+    const int lon0 = (int)lroundf(lon * 100.0f);
+    for (size_t i = 0; i < K_APT_DB_COUNT; i++) {
+        const AptRec &a = kAptDb[i];
+        if (abs((int)a.lat_c - lat0) > pad || abs((int)a.lon_c - lon0) > pad) {
             continue;
         }
-        bool seen = false;
-        for (int j = 0; j < nu; j++) {
-            if (strcasecmp(icaos[j], rows[i].other_apt) == 0) {
-                seen = true;
-                break;
-            }
-        }
-        if (!seen) {
-            copy_trunc(icaos[nu], sizeof(icaos[nu]), rows[i].other_apt);
-            cities[nu][0] = 0;
-            nu++;
-        }
-    }
-    if (nu <= 0) {
-        return;
-    }
-    status_msg("Board cities...");
-    net_fetch_airport_cities(icaos, cities, nu);
-    for (int i = 0; i < n; i++) {
-        if (!rows[i].other_apt[0] || rows[i].other_name[0]) {
+        if (skip && skip[0] && strcasecmp(a.icao, skip) == 0) {
             continue;
         }
-        for (int j = 0; j < nu; j++) {
-            if (strcasecmp(icaos[j], rows[i].other_apt) == 0 && cities[j][0]) {
-                copy_trunc(rows[i].other_name, sizeof(rows[i].other_name), cities[j]);
-                break;
-            }
-        }
-        if (!rows[i].other_name[0]) {
-            // Fallback: show the airport code rather than blank / distance.
-            copy_trunc(rows[i].other_name, sizeof(rows[i].other_name), rows[i].other_apt);
+        const float dlat = (a.lat_c / 100.0f - lat) * 60.0f;
+        const float dlon = (a.lon_c / 100.0f - lon) * 60.0f * c;
+        const float d2 = dlat * dlat + dlon * dlon;
+        if (d2 < best2) {
+            best2 = d2;
+            best = a.icao;
         }
     }
-}
-
-static void board_enrich_row_route_times(AirportBoardRow *row, bool inbound, const char *board_icao,
-                                         float apt_lat, float apt_lon, const Aircraft &ac, float dst_nm) {
-    if (!row || !row->flight[0]) {
-        return;
+    if (!best || !best[0]) {
+        return false;
     }
-
-    char origin[8] = {0}, dest[8] = {0};
-    if (net_fetch_route(row->flight, origin, sizeof(origin), dest, sizeof(dest))) {
-        const char *other = nullptr;
-        if (inbound) {
-            if (apt_codes_match(dest, board_icao)) {
-                other = origin;
-            } else if (apt_codes_match(origin, board_icao)) {
-                other = dest;
-            } else {
-                other = origin;
-            }
-        } else {
-            if (apt_codes_match(origin, board_icao)) {
-                other = dest;
-            } else if (apt_codes_match(dest, board_icao)) {
-                other = origin;
-            } else {
-                other = dest;
-            }
-        }
-        if (other && other[0]) {
-            copy_trunc(row->other_apt, sizeof(row->other_apt), other);
-        }
-    }
-
-    // FlightStats: scheduled / estimated dep + arr (and city names).
-    FlightInfo fi{};
-    if (net_fetch_flight_schedule(row->flight, &fi) && fi.schedule_ok) {
-        if (!row->other_apt[0]) {
-            const char *other = inbound ? fi.origin : fi.dest;
-            if (other && other[0]) {
-                copy_trunc(row->other_apt, sizeof(row->other_apt), other);
-            }
-        }
-        if (!row->other_name[0]) {
-            const char *nm = inbound ? fi.origin_name : fi.dest_name;
-            if (nm && nm[0]) {
-                city_from_facility(nm, row->other_name, sizeof(row->other_name));
-            }
-        }
-        copy_trunc(row->dep_time, sizeof(row->dep_time), fi.dep_time);
-        // Prefer actual wheels-up when airborne; else estimated; else scheduled (already in dep_time).
-        if (fi.dep_act[0]) {
-            copy_trunc(row->dep_est, sizeof(row->dep_est), fi.dep_act);
-        } else {
-            copy_trunc(row->dep_est, sizeof(row->dep_est), fi.dep_est);
-        }
-        copy_trunc(row->arr_time, sizeof(row->arr_time), fi.arr_time);
-        copy_trunc(row->arr_est, sizeof(row->arr_est), fi.arr_est);
-        if (fi.dep_act_epoch) {
-            row->dep_epoch = fi.dep_act_epoch;
-        }
-        if (fi.arr_est_epoch) {
-            row->arr_epoch = fi.arr_est_epoch;
-        } else if (fi.arr_act_epoch) {
-            row->arr_epoch = fi.arr_act_epoch;
-        }
-    }
-
-    // ETA fallback when schedule missing (still better than altitude / GS placeholders).
-    if (!row->arr_est[0] && !row->arr_time[0] && ac.gs_kts > 40.0f) {
-        float rem_nm = dst_nm;
-        if (!inbound && row->other_apt[0]) {
-            float olat = 0, olon = 0;
-            if (net_lookup_airport(row->other_apt, &olat, &olon, nullptr) ||
-                net_lookup_airport_iata(row->other_apt, nullptr, 0, &olat, &olon)) {
-                float east = 0, north = 0;
-                ll_to_nm(ac.lat, ac.lon, olat, olon, &east, &north);
-                rem_nm = sqrtf(east * east + north * north);
-            }
-        }
-        board_fmt_local_hm(row->arr_est, sizeof(row->arr_est), apt_lat, apt_lon, rem_nm / ac.gs_kts);
-    }
+    copy_trunc(icao, icao_len, best);
+    return true;
 }
 
 static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_lon, const Aircraft *acs,
@@ -5253,17 +4997,32 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
             }
         }
         copy_trunc(row->type, sizeof(row->type), ac.type);
-        // TO/FROM + DEP/ARR filled by enrichment (city + schedule). Do not stuff nm/alt/GS.
+        const float ray = inbound ? ac.track_deg + 180.0f : ac.track_deg;
+        const float rad = ray * 0.0174532925f;
+        const float ahead = dst_nm < 15.0f ? 50.0f : dst_nm;
+        const float east_nm = sinf(rad) * ahead;
+        const float north_nm = cosf(rad) * ahead;
+        const float plat = ac.lat + north_nm / 60.0f;
+        const float clat = cosf(ac.lat * 0.0174532925f);
+        const float plon = ac.lon + east_nm / (60.0f * ((clat < 0.2f) ? 0.2f : clat));
+        char other[8] = {0};
+        if (board_nearest_apt(plat, plon, code, 40.0f, other, sizeof(other))) {
+            copy_trunc(row->other_apt, sizeof(row->other_apt), other);
+        } else {
+            snprintf(row->other_name, sizeof(row->other_name), "%d nm", (int)lroundf(dst_nm));
+        }
+        if (inbound && ac.gs_kts > 40.0f) {
+            board_fmt_local_hm(row->arr_est, sizeof(row->arr_est), apt_lat, apt_lon, dst_nm / ac.gs_kts);
+        }
         int pct = inbound ? (int)lroundf(100.0f - dst_nm * 2.5f) : (int)lroundf(dst_nm * 2.5f);
         if (pct < 0) {
             pct = 0;
         }
-        if (pct > 100) {
-            pct = 100;
+        if (pct > 99) {
+            pct = 99;
         }
         row->progress_pct = pct;
         row->valid = row->flight[0] != 0;
-        (void)dst_nm;
     };
 
     struct Cand {
@@ -5310,88 +5069,22 @@ static bool board_fill_from_aircraft(const char *code, float apt_lat, float apt_
     }
 
     int na = 0, nd = 0;
-    // Remember aircraft index + distance for enrichment (ETA / route).
-    int arr_ac_idx[FR_MAX_BOARD_ROWS];
-    float arr_dst[FR_MAX_BOARD_ROWS];
-    int dep_ac_idx[FR_MAX_BOARD_ROWS];
-    float dep_dst[FR_MAX_BOARD_ROWS];
     for (int k = 0; k < nc; k++) {
         const Aircraft &ac = acs[cands[k].idx];
         if (cands[k].inbound) {
             if (na < arr_max && na < FR_MAX_BOARD_ROWS) {
                 fill_row(&arr[na], ac, cands[k].dst, true);
                 if (arr[na].valid) {
-                    arr_ac_idx[na] = cands[k].idx;
-                    arr_dst[na] = cands[k].dst;
                     na++;
                 }
             }
         } else if (nd < dep_max && nd < FR_MAX_BOARD_ROWS) {
             fill_row(&dep[nd], ac, cands[k].dst, false);
             if (dep[nd].valid) {
-                dep_ac_idx[nd] = cands[k].idx;
-                dep_dst[nd] = cands[k].dst;
                 nd++;
             }
         }
     }
-
-    // Cap schedule lookups so a busy hub doesn't thrash TLS for minutes.
-    static constexpr int kBoardSchedMax = 8;
-    const int n_sched_arr = na < kBoardSchedMax ? na : kBoardSchedMax;
-    const int n_sched_dep = nd < kBoardSchedMax ? nd : kBoardSchedMax;
-    for (int i = 0; i < n_sched_arr; i++) {
-        char st[40];
-        snprintf(st, sizeof(st), "Board arr %d/%d…", i + 1, n_sched_arr);
-        status_msg(st);
-        board_enrich_row_route_times(&arr[i], true, code, apt_lat, apt_lon, acs[arr_ac_idx[i]], arr_dst[i]);
-    }
-    for (int i = 0; i < n_sched_dep; i++) {
-        char st[40];
-        snprintf(st, sizeof(st), "Board dep %d/%d…", i + 1, n_sched_dep);
-        status_msg(st);
-        board_enrich_row_route_times(&dep[i], false, code, apt_lat, apt_lon, acs[dep_ac_idx[i]], dep_dst[i]);
-    }
-    // Remaining rows: hexdb route only (city batch covers names).
-    for (int i = n_sched_arr; i < na; i++) {
-        char origin[8] = {0}, dest[8] = {0};
-        if (net_fetch_route(arr[i].flight, origin, sizeof(origin), dest, sizeof(dest))) {
-            const char *other = nullptr;
-            if (apt_codes_match(dest, code)) {
-                other = origin;
-            } else if (apt_codes_match(origin, code)) {
-                other = dest;
-            } else if (origin[0]) {
-                other = origin;
-            }
-            if (other && other[0]) {
-                copy_trunc(arr[i].other_apt, sizeof(arr[i].other_apt), other);
-            }
-        }
-        if (!arr[i].arr_est[0] && acs[arr_ac_idx[i]].gs_kts > 40.0f) {
-            board_fmt_local_hm(arr[i].arr_est, sizeof(arr[i].arr_est), apt_lat, apt_lon,
-                               arr_dst[i] / acs[arr_ac_idx[i]].gs_kts);
-        }
-    }
-    for (int i = n_sched_dep; i < nd; i++) {
-        char origin[8] = {0}, dest[8] = {0};
-        if (net_fetch_route(dep[i].flight, origin, sizeof(origin), dest, sizeof(dest))) {
-            const char *other = nullptr;
-            if (apt_codes_match(origin, code)) {
-                other = dest;
-            } else if (apt_codes_match(dest, code)) {
-                other = origin;
-            } else if (dest[0]) {
-                other = dest;
-            }
-            if (other && other[0]) {
-                copy_trunc(dep[i].other_apt, sizeof(dep[i].other_apt), other);
-            }
-        }
-    }
-
-    board_apply_other_city(arr, na);
-    board_apply_other_city(dep, nd);
 
     if (arr_n) {
         *arr_n = na;
@@ -5518,80 +5211,28 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
 
     float lat = 0, lon = 0;
     board_resolve_ll(code, &lat, &lon);
-
-    // One page: https://www.flightaware.com/live/airport/KATL
-    // Arrivals column ← En Route (airborne inbound; Arrivals table is already landed).
-    // Departures column ← Departures (left gate; Scheduled are still on the ground).
-    // Keep this path simple (v1.1.7): force-rejoin/DNS probes before GET were
-    // dropping STA mid-open and made the board less reliable than track thrash alone.
-    net_tls_reset();
-    delay(80);
-    if (!ensure_http_buf()) {
-        set_err(g_last_err[0] ? g_last_err : "No HTTP buffer");
+    if (fabsf(lat) + fabsf(lon) < 0.01f) {
+        set_err("Airport not in DB");
         return false;
     }
-    status_msg("FlightAware board...");
-    char url[96];
-    snprintf(url, sizeof(url), "https://www.flightaware.com/live/airport/%s", code);
-    auto fa_board_get = [&]() -> bool {
-        return https_get(url, nullptr, kUaBrowser, 8000, 35000, "text/html,application/xhtml+xml,*/*",
-                         true, fa_board_body_ok);
-    };
-    if (!fa_board_get()) {
-        Serial.printf("FA board fetch fail %s: %s — retry\n", code, g_last_err);
-        net_abort_clear();
-        net_tls_reset();
-        delay(120);
-        if (!fa_board_get()) {
-            Serial.printf("FA board fetch fail %s: %s\n", code, g_last_err);
-            set_err(g_last_err[0] ? g_last_err : "FA board fetch failed");
-            return false;
-        }
-    }
-    size_t blen = 0;
-    const char *html = http_body_buf(&blen);
-    if (!html || blen < 800) {
-        set_err("FA board empty");
+
+    status_msg("Live traffic...");
+    static Aircraft s_board_ac[FR_MAX_AIRCRAFT];
+    memset(s_board_ac, 0, sizeof(s_board_ac));
+    const int n_ac = net_fetch_aircraft(lat, lon, 40.0f, s_board_ac, FR_MAX_AIRCRAFT);
+    if (n_ac < 0) {
+        set_err(g_last_err[0] ? g_last_err : "Traffic fetch failed");
         return false;
     }
-    Serial.printf("FA board %s body %u KB\n", code, (unsigned)(blen / 1024));
-
-    // En Route = airborne inbound; Departures = left gate.
-    int na = fa_parse_airport_board_section(html, "enroute-board", arr, arr_max, false);
-    int nd = fa_parse_airport_board_section(html, "departures-board", dep, dep_max, false);
-    Serial.printf("FA board parse enroute=%d departures=%d (html has en=%d dep=%d sch=%d)\n", na, nd,
-                  strstr(html, "id=\"enroute-board\"") ? 1 : 0,
-                  strstr(html, "id=\"departures-board\"") ? 1 : 0,
-                  strstr(html, "id=\"scheduled-board\"") ? 1 : 0);
-    // Drop completed legs (progress bar at 100%).
-    auto drop_done = [](AirportBoardRow *rows, int n) -> int {
-        int w = 0;
-        for (int i = 0; i < n; i++) {
-            if (rows[i].progress_pct >= 100) {
-                continue;
-            }
-            if (w != i) {
-                rows[w] = rows[i];
-            }
-            w++;
-        }
-        return w;
-    };
-    na = drop_done(arr, na);
-    nd = drop_done(dep, nd);
-
-    if (na <= 0 && nd <= 0) {
-        set_err("FA board: no flights");
+    if (!board_fill_from_aircraft(code, lat, lon, s_board_ac, n_ac, arr, arr_max, arr_n, dep, dep_max,
+                                  dep_n)) {
+        set_err("No traffic near airport");
         return false;
     }
-    if (arr_n) {
-        *arr_n = na;
-    }
-    if (dep_n) {
-        *dep_n = nd;
-    }
+    const int na = arr_n ? *arr_n : 0;
+    const int nd = dep_n ? *dep_n : 0;
     if (label_out && label_len) {
-        snprintf(label_out, label_len, "%s (FA)", code);
+        snprintf(label_out, label_len, "%s (live)", code);
     }
     if (out_lat) {
         *out_lat = lat;
@@ -5617,10 +5258,7 @@ bool net_fetch_airport_board(const char *icao, AirportBoardRow *arr, int arr_max
     s_cache_lat = lat;
     s_cache_lon = lon;
     s_cache_ms = millis();
-    Serial.printf("FA board %s: %d arr / %d dep\n", code, na, nd);
-    // Large FA HTML thrash Hosted Wi-Fi DNS/TLS; settle before the next poll/track.
-    net_tls_reset();
-    delay(750);
+    Serial.printf("Live board %s: %d arr / %d dep\n", code, na, nd);
     return true;
 }
 
@@ -5871,45 +5509,18 @@ bool net_fetch_route_flights(const char *dep_icao, const char *arr_icao, Airport
         snprintf(label_out, label_len, "%s to %s", dep, arr);
     }
 
-    // File-scope scratch buffers (net task is single-threaded for these fetches).
-    static AirportBoardRow s_route_board_arr[FR_MAX_BOARD_ROWS];
-    static AirportBoardRow s_route_board_dep[FR_MAX_BOARD_ROWS];
     static AirportBoardRow s_route_ff[FR_MAX_BOARD_ROWS];
 
     int n = 0;
-    int an = 0, dn = 0;
-    char lab[48] = {0};
 
-    status_msg("Route: departures...");
-    if (net_fetch_airport_board(dep, s_route_board_arr, FR_MAX_BOARD_ROWS, &an, s_route_board_dep,
-                                FR_MAX_BOARD_ROWS, &dn, lab, sizeof(lab))) {
-        for (int i = 0; i < dn && n < out_max; i++) {
-            if (apt_codes_match(s_route_board_dep[i].other_apt, arr)) {
-                n = route_push_unique(out, n, out_max, s_route_board_dep[i]);
-            }
-        }
-    }
-
-    status_msg("Route: arrivals...");
-    an = 0;
-    dn = 0;
-    if (net_fetch_airport_board(arr, s_route_board_arr, FR_MAX_BOARD_ROWS, &an, s_route_board_dep,
-                                FR_MAX_BOARD_ROWS, &dn, lab, sizeof(lab))) {
-        for (int i = 0; i < an && n < out_max; i++) {
-            if (apt_codes_match(s_route_board_arr[i].other_apt, dep)) {
-                n = route_push_unique(out, n, out_max, s_route_board_arr[i]);
-            }
-        }
-    }
-
-    // Primary source for scheduled + estimated times (FA.findflight.flights JSON).
+    // City-pair list. Airport-board traffic is not mixed in.
     status_msg("Route: findflight...");
     char enc_d[16], enc_a[16];
     url_encode(dep, enc_d, sizeof(enc_d));
     url_encode(arr, enc_a, sizeof(enc_a));
     char url[192];
     snprintf(url, sizeof(url), "https://www.flightaware.com/live/findflight/%s/%s", enc_d, enc_a);
-    if (https_get(url, nullptr, kUaBrowser, 10000, 90000, "text/html,application/xhtml+xml,*/*", true)) {
+    if (https_get(url, nullptr, kUaBrowser, 10000, 40000, "text/html,application/xhtml+xml,*/*", true)) {
         size_t blen = 0;
         const char *html = http_body_buf(&blen);
         if (html && blen > 200) {
